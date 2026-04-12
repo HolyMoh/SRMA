@@ -671,6 +671,26 @@
                 </div>
             </div>
 
+            <!-- State breakdown & retry actions -->
+            <div class="card" id="stateBreakdownCard" style="display:none">
+                <div class="card-header">
+                    <h3>Paper State Breakdown</h3>
+                    <button class="btn btn-outline btn-sm" id="btnRefreshStates">Refresh</button>
+                </div>
+                <div id="stateBreakdownGrid" class="card-grid" style="margin-bottom:16px"></div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">
+                    Papers across all state machine stages. Use the buttons below to requeue papers that didn't reach COMPLETE.
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-warning" id="btnRetryManualFromUpload">Retry Manual Required</button>
+                    <button class="btn btn-warning" id="btnRetryFailedFromUpload">Retry Failed</button>
+                    <button class="btn btn-danger" id="btnResetRetryAll">Reset &amp; Retry All</button>
+                </div>
+                <div style="font-size:11px;color:var(--text-secondary);margin-top:8px">
+                    <strong>Reset &amp; Retry All</strong> requeues every FAILED and MANUAL_REQUIRED paper, plus rescues any that got stuck in intermediate states (NORMALIZED, ENRICHED, IDENTITY_ASSIGNED). COMPLETE papers are left alone.
+                </div>
+            </div>
+
             <!-- Deduplication report -->
             <div class="card" id="dedupReport" style="display:none">
                 <div class="card-header"><h3>Deduplication Report</h3></div>
@@ -1300,12 +1320,99 @@ async function handleUpload(file) {
         }
 
         document.getElementById('uploadResults').style.display = 'block';
+        await loadStateBreakdown();
         toast('Upload complete: ' + data.ready_for_retrieval_count + ' papers ready', 'success');
     } catch (err) {
         document.getElementById('uploadProgress').style.display = 'none';
         toast('Upload failed: ' + err.message, 'error');
     }
 }
+
+/* ------------------------------------------------------------------
+   State breakdown (Upload panel)
+   ------------------------------------------------------------------ */
+async function loadStateBreakdown() {
+    try {
+        const s = await GET('/api/run/status');
+        const counts = s.state_counts || {};
+        document.getElementById('stateBreakdownCard').style.display = 'block';
+
+        const stateOrder = [
+            ['INGESTED', 'badge-neutral'],
+            ['NORMALIZED', 'badge-info'],
+            ['ENRICHED', 'badge-info'],
+            ['IDENTITY_ASSIGNED', 'badge-info'],
+            ['READY_FOR_RETRIEVAL', 'badge-info'],
+            ['RETRIEVING', 'badge-info'],
+            ['RETRIEVED', 'badge-info'],
+            ['VALIDATING', 'badge-info'],
+            ['VALIDATED', 'badge-success'],
+            ['COMPLETE', 'badge-success'],
+            ['FAILED', 'badge-danger'],
+            ['MANUAL_REQUIRED', 'badge-warning'],
+            ['DUPLICATE', 'badge-neutral'],
+        ];
+
+        const grid = document.getElementById('stateBreakdownGrid');
+        grid.innerHTML = '';
+        let totalShown = 0;
+        stateOrder.forEach(function(entry) {
+            const st = entry[0];
+            const badgeClass = entry[1];
+            const n = counts[st] || 0;
+            if (n === 0 && ['INGESTED','NORMALIZED','ENRICHED','IDENTITY_ASSIGNED','DUPLICATE'].indexOf(st) >= 0) return;
+            totalShown += n;
+            const card = document.createElement('div');
+            card.className = 'metric-card';
+            card.innerHTML = '<div class="metric-value">' + n + '</div>' +
+                             '<div class="metric-label"><span class="badge ' + badgeClass + '">' + st + '</span></div>';
+            grid.appendChild(card);
+        });
+
+        // Show any zero-count states that we hid as a summary
+        const hiddenZero = ['INGESTED','NORMALIZED','ENRICHED','IDENTITY_ASSIGNED','DUPLICATE']
+            .filter(function(st) { return (counts[st] || 0) > 0; });
+        if (hiddenZero.length) {
+            // Already shown above — no-op
+        }
+
+        // Enable/disable buttons based on counts
+        document.getElementById('btnRetryManualFromUpload').disabled = (counts.MANUAL_REQUIRED || 0) === 0;
+        document.getElementById('btnRetryFailedFromUpload').disabled = (counts.FAILED || 0) === 0;
+        const rescuable = (counts.FAILED||0) + (counts.MANUAL_REQUIRED||0) +
+                          (counts.NORMALIZED||0) + (counts.ENRICHED||0) + (counts.IDENTITY_ASSIGNED||0);
+        document.getElementById('btnResetRetryAll').disabled = rescuable === 0;
+    } catch (err) {
+        toast('Failed to load state breakdown: ' + err.message, 'error');
+    }
+}
+
+document.getElementById('btnRefreshStates').addEventListener('click', loadStateBreakdown);
+
+document.getElementById('btnRetryManualFromUpload').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/retry', { retry_type: 'manual' });
+        toast(data.papers_reset + ' MANUAL_REQUIRED papers queued', 'success');
+        await loadStateBreakdown();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnRetryFailedFromUpload').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/retry', { retry_type: 'failed' });
+        toast(data.papers_reset + ' FAILED papers queued', 'success');
+        await loadStateBreakdown();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnResetRetryAll').addEventListener('click', async function() {
+    if (!confirm('Reset all FAILED, MANUAL_REQUIRED, and stuck intermediate-state papers back to READY_FOR_RETRIEVAL?\n\nCOMPLETE papers will NOT be affected.')) return;
+    try {
+        const data = await POST('/api/reset-and-retry-all');
+        toast(data.papers_reset + ' papers reset to READY_FOR_RETRIEVAL', 'success');
+        await loadStateBreakdown();
+    } catch (err) { toast(err.message, 'error'); }
+});
 
 document.getElementById('btnStartAfterUpload').addEventListener('click', async function() {
     try {
