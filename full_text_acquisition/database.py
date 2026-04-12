@@ -1663,3 +1663,536 @@ class Database:
         if row and row[0]:
             return row[0]
         return None
+
+    # -----------------------------------------------------------------------
+    # Audit log
+    # -----------------------------------------------------------------------
+
+    async def log_audit(self, entry: AuditLogEntry) -> int:
+        """Insert an audit log entry. Returns the row id."""
+
+        async def _do_insert(
+            conn: aiosqlite.Connection, e: AuditLogEntry
+        ) -> int:
+            d = e.to_dict()
+            # Remove id — auto-incremented
+            d.pop("id", None)
+            # Ensure timestamp
+            if not d.get("timestamp"):
+                d["timestamp"] = datetime.now(timezone.utc).isoformat()
+            # Convert cache_hit bool
+            d["cache_hit"] = int(d.get("cache_hit", False))
+
+            columns = ", ".join(d.keys())
+            placeholders = ", ".join("?" for _ in d)
+            cursor = await conn.execute(
+                f"INSERT INTO audit_log ({columns}) VALUES ({placeholders})",
+                tuple(d.values()),
+            )
+            await conn.commit()
+            return cursor.lastrowid or 0
+
+        return await self._enqueue_write(_do_insert, entry)
+
+    async def get_audit_log_for_paper(
+        self, canonical_id: str, limit: int = 100
+    ) -> List[AuditLogEntry]:
+        """Fetch audit log entries for a specific paper."""
+        rows = await self.read_all(
+            "SELECT * FROM audit_log WHERE canonical_id = ? "
+            "ORDER BY timestamp ASC LIMIT ?",
+            (canonical_id, limit),
+        )
+        return [self._row_to_audit_entry(row) for row in rows]
+
+    async def get_audit_log_for_run(
+        self, run_id: str, limit: int = 5000
+    ) -> List[AuditLogEntry]:
+        """Fetch all audit log entries for a specific run."""
+        rows = await self.read_all(
+            "SELECT * FROM audit_log WHERE run_id = ? "
+            "ORDER BY timestamp ASC LIMIT ?",
+            (run_id, limit),
+        )
+        return [self._row_to_audit_entry(row) for row in rows]
+
+    async def get_audit_log_recent(
+        self, limit: int = 200
+    ) -> List[AuditLogEntry]:
+        """Fetch the most recent audit log entries across all runs."""
+        rows = await self.read_all(
+            "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [self._row_to_audit_entry(row) for row in rows]
+
+    async def export_audit_log_jsonl(
+        self, run_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Export audit log entries as list of dicts (for JSONL serialization).
+
+        Filtered by run_id if provided, otherwise all entries.
+        """
+        if run_id:
+            rows = await self.read_all(
+                "SELECT * FROM audit_log WHERE run_id = ? ORDER BY timestamp ASC",
+                (run_id,),
+            )
+        else:
+            rows = await self.read_all(
+                "SELECT * FROM audit_log ORDER BY timestamp ASC"
+            )
+        return [self._row_to_audit_entry(row).to_dict() for row in rows]
+
+    def _row_to_audit_entry(self, row: aiosqlite.Row) -> AuditLogEntry:
+        """Convert a database row to an AuditLogEntry."""
+        return AuditLogEntry(
+            id=row["id"],
+            timestamp=row["timestamp"],
+            canonical_id=row["canonical_id"],
+            run_id=row["run_id"],
+            tier=row["tier"],
+            method=row["method"],
+            url_attempted=row["url_attempted"],
+            http_status=row["http_status"],
+            content_type_received=row["content_type_received"],
+            outcome=row["outcome"],
+            failure_code=row["failure_code"],
+            execution_time_ms=row["execution_time_ms"],
+            retry_count=row["retry_count"],
+            cache_hit=bool(row["cache_hit"]),
+            details=row["details"],
+            exception_type=row["exception_type"],
+            exception_message=row["exception_message"],
+            exception_traceback=row["exception_traceback"],
+        )
+
+    # -----------------------------------------------------------------------
+    # API cache
+    # -----------------------------------------------------------------------
+
+    async def get_cached_response(
+        self, doi: str, api_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a cached API response if it exists and is not expired.
+
+        Returns the parsed JSON response dict, or None.
+        """
+        row = await self.read_one(
+            "SELECT response_json, expires_at FROM api_cache "
+            "WHERE doi = ? AND api_name = ?",
+            (doi, api_name),
+        )
+        if row is None:
+            return None
+
+        # Check expiry
+        expires_at = row["expires_at"]
+        if expires_at:
+            try:
+                expiry = datetime.fromisoformat(expires_at)
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= expiry:
+                    return None
+            except (ValueError, TypeError):
+                return None
+
+        try:
+            return json.loads(row["response_json"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    async def set_cached_response(
+        self,
+        doi: str,
+        api_name: str,
+        response: Dict[str, Any],
+        ttl_days: int = 7,
+    ) -> bool:
+        """Store an API response in the cache with a TTL."""
+
+        async def _do_cache(
+            conn: aiosqlite.Connection,
+            d: str,
+            api: str,
+            resp: Dict[str, Any],
+            ttl: int,
+        ) -> bool:
+            now = datetime.now(timezone.utc)
+            expires = now + timedelta(days=ttl)
+            response_str = json.dumps(resp)
+
+            cursor = await conn.execute(
+                "INSERT OR REPLACE INTO api_cache "
+                "(doi, api_name, response_json, cached_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (d, api, response_str, now.isoformat(), expires.isoformat()),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(
+            _do_cache, doi, api_name, response, ttl_days
+        )
+
+    async def clear_expired_cache(self) -> int:
+        """Delete all expired cache entries. Returns count deleted."""
+
+        async def _do_clear(conn: aiosqlite.Connection) -> int:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = await conn.execute(
+                "DELETE FROM api_cache WHERE expires_at IS NOT NULL "
+                "AND expires_at < ?",
+                (now,),
+            )
+            await conn.commit()
+            return cursor.rowcount
+
+        return await self._enqueue_write(_do_clear)
+
+    async def clear_all_cache(self) -> int:
+        """Delete all cache entries. Returns count deleted."""
+
+        async def _do_clear_all(conn: aiosqlite.Connection) -> int:
+            cursor = await conn.execute("DELETE FROM api_cache")
+            await conn.commit()
+            return cursor.rowcount
+
+        return await self._enqueue_write(_do_clear_all)
+
+    async def get_cache_stats(self) -> Dict[str, Any]:
+        """Return cache statistics: total entries, expired count, by API."""
+        total = await self.read_scalar("SELECT COUNT(*) FROM api_cache") or 0
+        now = datetime.now(timezone.utc).isoformat()
+        expired = await self.read_scalar(
+            "SELECT COUNT(*) FROM api_cache "
+            "WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now,),
+        ) or 0
+        by_api_rows = await self.read_all(
+            "SELECT api_name, COUNT(*) as cnt FROM api_cache GROUP BY api_name"
+        )
+        by_api = {row[0]: row[1] for row in by_api_rows}
+
+        return {
+            "total_entries": total,
+            "expired_entries": expired,
+            "active_entries": total - expired,
+            "by_api": by_api,
+        }
+
+    # -----------------------------------------------------------------------
+    # Publisher cooldowns
+    # -----------------------------------------------------------------------
+
+    async def get_publisher_cooldown(
+        self, publisher: str
+    ) -> Optional[PublisherCooldown]:
+        """Fetch the cooldown record for a publisher."""
+        row = await self.read_one(
+            "SELECT * FROM publisher_cooldowns WHERE publisher = ?",
+            (publisher,),
+        )
+        if row is None:
+            return None
+        return PublisherCooldown(
+            publisher=row["publisher"],
+            failure_count=row["failure_count"],
+            success_count=row["success_count"],
+            failure_rate=row["failure_rate"],
+            cooldown_until=row["cooldown_until"],
+            extended_count=row["extended_count"],
+            last_updated=row["last_updated"],
+        )
+
+    async def record_publisher_attempt(
+        self,
+        publisher: str,
+        success: bool,
+        cooldown_failure_threshold: float,
+        cooldown_window_size: int,
+        cooldown_minutes: int,
+    ) -> PublisherCooldown:
+        """Record a Tier 2 attempt for a publisher and update cooldown state.
+
+        Maintains a rolling window of the last N attempts.
+        If failure rate exceeds threshold, sets a cooldown.
+        If still failing after cooldown expiry + retry, extends cooldown.
+        """
+
+        async def _do_record(
+            conn: aiosqlite.Connection,
+            pub: str,
+            ok: bool,
+            threshold: float,
+            window: int,
+            cd_mins: int,
+        ) -> PublisherCooldown:
+            now = datetime.now(timezone.utc)
+            now_str = now.isoformat()
+
+            # Fetch or create
+            cursor = await conn.execute(
+                "SELECT * FROM publisher_cooldowns WHERE publisher = ?",
+                (pub,),
+            )
+            row = await cursor.fetchone()
+
+            if row is None:
+                fc = 0 if ok else 1
+                sc = 1 if ok else 0
+                rate = 0.0 if ok else 1.0
+                await conn.execute(
+                    "INSERT INTO publisher_cooldowns "
+                    "(publisher, failure_count, success_count, failure_rate, "
+                    "cooldown_until, extended_count, last_updated) "
+                    "VALUES (?, ?, ?, ?, NULL, 0, ?)",
+                    (pub, fc, sc, rate, now_str),
+                )
+                await conn.commit()
+                return PublisherCooldown(
+                    publisher=pub,
+                    failure_count=fc,
+                    success_count=sc,
+                    failure_rate=rate,
+                    cooldown_until=None,
+                    extended_count=0,
+                    last_updated=now_str,
+                )
+
+            # Update rolling counts within window
+            failure_count = row[1]  # failure_count
+            success_count = row[2]  # success_count
+            old_rate = row[3]       # failure_rate
+            cooldown_until = row[4]
+            extended_count = row[5]
+
+            total = failure_count + success_count
+
+            if ok:
+                success_count += 1
+            else:
+                failure_count += 1
+
+            # Keep within rolling window
+            total_new = failure_count + success_count
+            if total_new > window:
+                # Proportionally reduce to window size
+                scale = window / total_new
+                failure_count = max(0, int(failure_count * scale))
+                success_count = max(0, int(success_count * scale))
+                # Ensure at least the current result is counted
+                if ok and success_count == 0:
+                    success_count = 1
+                if not ok and failure_count == 0:
+                    failure_count = 1
+
+            total_capped = failure_count + success_count
+            rate = failure_count / total_capped if total_capped > 0 else 0.0
+
+            # Cooldown logic
+            new_cooldown_until = cooldown_until
+            new_extended = extended_count
+
+            if rate > threshold:
+                # Check if already in cooldown
+                if cooldown_until:
+                    try:
+                        expiry = datetime.fromisoformat(cooldown_until)
+                        if expiry.tzinfo is None:
+                            expiry = expiry.replace(tzinfo=timezone.utc)
+                        if now >= expiry:
+                            # Cooldown expired but still failing — extend
+                            new_extended = min(extended_count + 1, 5)
+                            extension = min(
+                                cd_mins * (2 ** new_extended),
+                                MAX_COOLDOWN_MINUTES,
+                            )
+                            new_cooldown_until = (
+                                now + timedelta(minutes=extension)
+                            ).isoformat()
+                    except (ValueError, TypeError):
+                        # Malformed date, set fresh cooldown
+                        new_cooldown_until = (
+                            now + timedelta(minutes=cd_mins)
+                        ).isoformat()
+                        new_extended = 0
+                else:
+                    # Fresh cooldown
+                    new_cooldown_until = (
+                        now + timedelta(minutes=cd_mins)
+                    ).isoformat()
+                    new_extended = 0
+            else:
+                # Rate below threshold, clear cooldown
+                new_cooldown_until = None
+                new_extended = 0
+
+            await conn.execute(
+                "UPDATE publisher_cooldowns SET "
+                "failure_count = ?, success_count = ?, failure_rate = ?, "
+                "cooldown_until = ?, extended_count = ?, last_updated = ? "
+                "WHERE publisher = ?",
+                (
+                    failure_count,
+                    success_count,
+                    rate,
+                    new_cooldown_until,
+                    new_extended,
+                    now_str,
+                    pub,
+                ),
+            )
+            await conn.commit()
+
+            return PublisherCooldown(
+                publisher=pub,
+                failure_count=failure_count,
+                success_count=success_count,
+                failure_rate=rate,
+                cooldown_until=new_cooldown_until,
+                extended_count=new_extended,
+                last_updated=now_str,
+            )
+
+        return await self._enqueue_write(
+            _do_record,
+            publisher,
+            success,
+            cooldown_failure_threshold,
+            cooldown_window_size,
+            cooldown_minutes,
+        )
+
+    async def get_active_cooldowns(self) -> List[PublisherCooldown]:
+        """Fetch all publishers currently in active cooldown."""
+        now = datetime.now(timezone.utc).isoformat()
+        rows = await self.read_all(
+            "SELECT * FROM publisher_cooldowns "
+            "WHERE cooldown_until IS NOT NULL AND cooldown_until > ?",
+            (now,),
+        )
+        return [
+            PublisherCooldown(
+                publisher=row["publisher"],
+                failure_count=row["failure_count"],
+                success_count=row["success_count"],
+                failure_rate=row["failure_rate"],
+                cooldown_until=row["cooldown_until"],
+                extended_count=row["extended_count"],
+                last_updated=row["last_updated"],
+            )
+            for row in rows
+        ]
+
+    async def force_publisher_cooldown(
+        self, publisher: str, cooldown_minutes: int
+    ) -> bool:
+        """Manually force a publisher into cooldown (from UI override)."""
+
+        async def _do_force(
+            conn: aiosqlite.Connection, pub: str, mins: int
+        ) -> bool:
+            now = datetime.now(timezone.utc)
+            until = (now + timedelta(minutes=mins)).isoformat()
+            cursor = await conn.execute(
+                "INSERT INTO publisher_cooldowns "
+                "(publisher, failure_count, success_count, failure_rate, "
+                "cooldown_until, extended_count, last_updated) "
+                "VALUES (?, 0, 0, 0.0, ?, 0, ?) "
+                "ON CONFLICT(publisher) DO UPDATE SET "
+                "cooldown_until = ?, last_updated = ?",
+                (pub, until, now.isoformat(), until, now.isoformat()),
+            )
+            await conn.commit()
+            return cursor.rowcount >= 1
+
+        success = await self._enqueue_write(
+            _do_force, publisher, cooldown_minutes
+        )
+        if success:
+            await self.log_audit(AuditLogEntry(
+                outcome="MANUAL_COOLDOWN_OVERRIDE",
+                details=json.dumps({
+                    "publisher": publisher,
+                    "cooldown_minutes": cooldown_minutes,
+                }),
+            ))
+        return success
+
+    async def reset_publisher_cooldown(self, publisher: str) -> bool:
+        """Clear cooldown for a specific publisher."""
+
+        async def _do_reset(
+            conn: aiosqlite.Connection, pub: str
+        ) -> bool:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = await conn.execute(
+                "UPDATE publisher_cooldowns SET "
+                "cooldown_until = NULL, extended_count = 0, "
+                "failure_count = 0, success_count = 0, "
+                "failure_rate = 0.0, last_updated = ? "
+                "WHERE publisher = ?",
+                (now, pub),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_reset, publisher)
+
+    # -----------------------------------------------------------------------
+    # Supplements
+    # -----------------------------------------------------------------------
+
+    async def insert_supplement(self, supplement: SupplementFile) -> bool:
+        """Insert a supplement file record."""
+
+        async def _do_insert(
+            conn: aiosqlite.Connection, s: SupplementFile
+        ) -> bool:
+            d = s.to_dict()
+            columns = ", ".join(d.keys())
+            placeholders = ", ".join("?" for _ in d)
+            cursor = await conn.execute(
+                f"INSERT OR REPLACE INTO supplements ({columns}) "
+                f"VALUES ({placeholders})",
+                tuple(d.values()),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_insert, supplement)
+
+    async def get_supplements_for_paper(
+        self, canonical_id: str
+    ) -> List[SupplementFile]:
+        """Fetch all supplement files for a paper."""
+        rows = await self.read_all(
+            "SELECT * FROM supplements WHERE canonical_id = ? "
+            "ORDER BY supplement_index ASC",
+            (canonical_id,),
+        )
+        return [
+            SupplementFile(
+                canonical_id=row["canonical_id"],
+                supplement_index=row["supplement_index"],
+                filename=row["filename"],
+                file_path=row["file_path"],
+                file_extension=row["file_extension"],
+                file_size_bytes=row["file_size_bytes"],
+                sha256_checksum=row["sha256_checksum"],
+                validation_status=row["validation_status"],
+                source_url=row["source_url"],
+                downloaded_at=row["downloaded_at"],
+            )
+            for row in rows
+        ]
+
+    async def get_supplement_count(self, canonical_id: str) -> int:
+        """Return count of supplements for a paper."""
+        count = await self.read_scalar(
+            "SELECT COUNT(*) FROM supplements WHERE canonical_id = ?",
+            (canonical_id,),
+        )
+        return count or 0
