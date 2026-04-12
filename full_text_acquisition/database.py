@@ -21,6 +21,8 @@ import aiosqlite
 from full_text_acquisition.models import (
     CURRENT_CONFIG_VERSION,
     DEFAULT_CONFIG,
+    OCR_BACKPRESSURE_WEIGHT,
+    STANDARD_BACKPRESSURE_WEIGHT,
     VALID_TRANSITIONS,
     AuditLogEntry,
     ApiCacheEntry,

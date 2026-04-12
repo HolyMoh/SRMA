@@ -1208,8 +1208,7 @@ const state = {
     resultsLimit: 100,
     resultsTotalCount: 0,
     sseSource: null,
-    statusPollInterval: null,
-    lastStatusCounts: null,
+    lastCountersSnap: null,
     enrichmentSseSource: null,
     enrichmentInProgress: false,
 };
@@ -1270,9 +1269,9 @@ function switchPanel(name) {
     document.querySelectorAll('.panel').forEach(function(p) {
         p.classList.toggle('active', p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1));
     });
+    // Unified SSE is always on; individual panels only trigger one-shot loads
     if (name === 'results') loadResults();
     if (name === 'settings') loadSettings();
-    if (name === 'health') startSSE();
     if (name === 'run') loadRuns();
     if (name === 'sso') loadSsoStatus();
 }
@@ -1454,7 +1453,7 @@ function stopEnrichmentSSE() {
    ------------------------------------------------------------------ */
 async function loadStateBreakdown() {
     try {
-        const s = await GET('/api/run/status');
+        const s = await GET('/api/stream/snapshot');
         const counts = s.state_counts || {};
         document.getElementById('stateBreakdownCard').style.display = 'block';
 
@@ -1647,68 +1646,165 @@ document.getElementById('btnRerunWizard').addEventListener('click', async functi
 });
 
 /* ------------------------------------------------------------------
-   Health Dashboard — SSE
-   ------------------------------------------------------------------ */
+   Unified SSE — single source of truth for ALL live updates
+   ------------------------------------------------------------------
+
+   /api/stream delivers:
+       - Health metrics (success rate, queue depths, cache rate, etc.)
+       - State counts (every PaperState → count)
+       - Worker pool (running/paused, counters, run_id)
+       - Enrichment status (in_progress + counters)
+
+   The frontend treats this as the only authority for live state;
+   POST endpoints (start/pause/resume/cancel/retry/override) still
+   exist for actions, but the SSE stream is what updates the UI.
+*/
 function startSSE() {
     if (state.sseSource) return;
-    state.sseSource = new EventSource('/api/health/stream');
+    state.sseSource = new EventSource('/api/stream');
     state.sseSource.onmessage = function(event) {
         try {
             const m = JSON.parse(event.data);
             if (m.error) return;
-            document.getElementById('hSuccessRate').textContent = (m.retrieval_success_rate * 100).toFixed(1) + '%';
-            document.getElementById('hAvgAttempts').textContent = m.avg_attempts_per_paper.toFixed(1);
-            document.getElementById('hAvgTime').textContent = (m.avg_retrieval_time_ms / 1000).toFixed(1) + 's';
-            document.getElementById('hCacheRate').textContent = (m.cache_hit_rate * 100).toFixed(1) + '%';
-            document.getElementById('hTotal').textContent = m.total_papers;
-            document.getElementById('hCompleted').textContent = m.completed_papers;
-            document.getElementById('hFailed').textContent = m.failed_papers;
-            document.getElementById('hManual').textContent = m.manual_required_papers;
-            document.getElementById('hRetrievalQueue').textContent = m.retrieval_queue_depth;
-            document.getElementById('hValidationQueue').textContent = m.validation_queue_depth;
-            document.getElementById('hBackpressure').textContent = m.backpressure_weighted_depth + ' / ' + m.backpressure_threshold;
-            document.getElementById('hDiskSpace').textContent = formatBytes(m.disk_space_remaining_bytes);
-            document.getElementById('sidebarWorkers').textContent = 'Workers: ' + m.retrieval_workers_active + 'R / ' + m.validation_workers_active + 'V';
-
-            // Run panel progress
-            if (state.runState === 'running') {
-                const total = m.total_papers || 1;
-                const done = m.completed_papers + m.failed_papers + m.manual_required_papers;
-                const pct = Math.round((done / total) * 100);
-                document.getElementById('runProgressBar').style.width = pct + '%';
-                document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
-                document.getElementById('runProgressPercent').textContent = pct + '%';
-                document.getElementById('runCompleted').textContent = m.completed_papers;
-                document.getElementById('runFailed').textContent = m.failed_papers;
-                document.getElementById('runManual').textContent = m.manual_required_papers;
-                document.getElementById('runRetrieving').textContent = m.retrieval_workers_active;
-            }
-
-            // Cooldowns
-            const cdDiv = document.getElementById('healthCooldowns');
-            if (m.active_cooldowns && m.active_cooldowns.length) {
-                cdDiv.innerHTML = m.active_cooldowns.map(function(cd) {
-                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(cd.publisher) +
-                           '</span><span class="rate">' + (cd.failure_rate * 100).toFixed(0) + '% fail</span>' +
-                           '<span>' + Math.ceil(cd.time_remaining_s / 60) + 'm left</span>' +
-                           '<button class="btn btn-outline btn-sm" onclick="forceCooldownReset(\'' + escAttr(cd.publisher) + '\')">Reset</button></div>';
-                }).join('');
-            } else { cdDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No active cooldowns</div>'; }
-
-            // Paywalls
-            const pwDiv = document.getElementById('healthPaywalls');
-            const pws = m.paywall_counts_by_publisher;
-            if (pws && Object.keys(pws).length) {
-                pwDiv.innerHTML = Object.entries(pws).map(function(e) {
-                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(e[0]) + '</span><span>' + e[1] + ' detections</span></div>';
-                }).join('');
-            } else { pwDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No paywall events</div>'; }
-        } catch(e) {}
+            handleStreamEvent(m);
+        } catch (e) {
+            // Silently ignore malformed events
+        }
     };
     state.sseSource.onerror = function() {
         if (state.sseSource) { state.sseSource.close(); state.sseSource = null; }
-        setTimeout(function() { if (state.currentPanel === 'health') startSSE(); }, 5000);
+        // Reconnect after a delay — stream is authoritative, we must
+        // keep it alive as long as the page is open
+        setTimeout(function() { startSSE(); }, 3000);
     };
+}
+
+function stopSSE() {
+    if (state.sseSource) {
+        state.sseSource.close();
+        state.sseSource = null;
+    }
+}
+
+function handleStreamEvent(m) {
+    const wp = m.worker_pool || {};
+    const counters = wp.counters || {};
+
+    // --- Health Dashboard ---
+    document.getElementById('hSuccessRate').textContent = (m.retrieval_success_rate * 100).toFixed(1) + '%';
+    document.getElementById('hAvgAttempts').textContent = m.avg_attempts_per_paper.toFixed(1);
+    document.getElementById('hAvgTime').textContent = (m.avg_retrieval_time_ms / 1000).toFixed(1) + 's';
+    document.getElementById('hCacheRate').textContent = (m.cache_hit_rate * 100).toFixed(1) + '%';
+    document.getElementById('hTotal').textContent = m.total_papers;
+    document.getElementById('hCompleted').textContent = m.complete || m.completed_papers || 0;
+    document.getElementById('hFailed').textContent = m.failed || m.failed_papers || 0;
+    document.getElementById('hManual').textContent = m.manual_required || m.manual_required_papers || 0;
+    document.getElementById('hRetrievalQueue').textContent = m.ready_for_retrieval || m.retrieval_queue_depth || 0;
+    document.getElementById('hValidationQueue').textContent = m.retrieved || m.validation_queue_depth || 0;
+    document.getElementById('hBackpressure').textContent = m.backpressure_weighted_depth + ' / ' + m.backpressure_threshold;
+    document.getElementById('hDiskSpace').textContent = formatBytes(m.disk_space_remaining_bytes);
+
+    // --- Sidebar worker status ---
+    const retActive = wp.retrieval_workers_active || m.retrieval_workers_active || 0;
+    const valActive = wp.validation_workers_active || m.validation_workers_active || 0;
+    const paused = wp.paused || m.retrieval_workers_paused || false;
+    document.getElementById('sidebarWorkers').textContent =
+        'Workers: ' + retActive + 'R / ' + valActive + 'V' +
+        (paused ? ' (paused)' : '');
+
+    // --- Run panel: state reconciliation ---
+    // Reconcile runState from the authoritative worker_pool.running flag.
+    // This catches completions (workers exhausted the queue) and external
+    // cancellations without the UI needing to poll.
+    if (wp.running === true) {
+        const newState = wp.paused ? 'paused' : 'running';
+        if (state.runState !== newState) {
+            state.runState = newState;
+            updateRunButtons();
+        }
+        if (wp.run_id && state.runId !== wp.run_id) {
+            state.runId = wp.run_id;
+        }
+    } else if (wp.running === false && state.runState !== 'idle') {
+        // Workers have stopped — transition to idle
+        state.runState = 'idle';
+        updateRunButtons();
+        addLogEntry('Run finished (workers stopped)', 'info');
+    }
+
+    // --- Run panel: progress and counters ---
+    const complete = m.complete || 0;
+    const failed = m.failed || 0;
+    const manual = m.manual_required || 0;
+    const retrieving = m.retrieving || 0;
+    const total = m.total_papers || 1;
+    const done = complete + failed + manual;
+    const pct = Math.round((done / total) * 100);
+    document.getElementById('runProgressBar').style.width = pct + '%';
+    document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
+    document.getElementById('runProgressPercent').textContent = pct + '%';
+    document.getElementById('runCompleted').textContent = complete;
+    document.getElementById('runFailed').textContent = failed;
+    document.getElementById('runManual').textContent = manual;
+    document.getElementById('runRetrieving').textContent = retrieving;
+
+    // --- Activity log: emit entries on counter deltas ---
+    const snap = JSON.stringify({
+        r: counters.retrieved || 0,
+        f: counters.failed || 0,
+        m: counters.manual || 0,
+        v: counters.validated || 0,
+        vf: counters.val_failed || 0,
+        retQ: m.ready_for_retrieval || 0,
+        retG: retrieving,
+        valQ: m.retrieved || 0,
+        valG: m.validating || 0,
+    });
+    if (state.lastCountersSnap !== snap) {
+        const prev = state.lastCountersSnap ? JSON.parse(state.lastCountersSnap) : null;
+        state.lastCountersSnap = snap;
+        const now = JSON.parse(snap);
+        if (prev) {
+            if (now.r > prev.r) addLogEntry('Retrieved +' + (now.r - prev.r) + ' (queue: ' + now.retQ + ')', 'ok');
+            if (now.f > prev.f) addLogEntry('Failed +' + (now.f - prev.f), 'err');
+            if (now.m > prev.m) addLogEntry('Manual required +' + (now.m - prev.m), 'warn');
+            if (now.v > prev.v) addLogEntry('Validated +' + (now.v - prev.v), 'ok');
+            if (now.vf > prev.vf) addLogEntry('Validation failed +' + (now.vf - prev.vf), 'err');
+        } else if (state.runState === 'running') {
+            addLogEntry('Queue: retrieval=' + now.retQ + ' (active ' + now.retG + ') | validation=' + now.valQ + ' (active ' + now.valG + ')', 'info');
+        }
+    }
+
+    // --- Cooldowns ---
+    const cdDiv = document.getElementById('healthCooldowns');
+    if (m.active_cooldowns && m.active_cooldowns.length) {
+        cdDiv.innerHTML = m.active_cooldowns.map(function(cd) {
+            return '<div class="cooldown-item"><span class="publisher">' + escHtml(cd.publisher) +
+                   '</span><span class="rate">' + (cd.failure_rate * 100).toFixed(0) + '% fail</span>' +
+                   '<span>' + Math.ceil(cd.time_remaining_s / 60) + 'm left</span>' +
+                   '<button class="btn btn-outline btn-sm" onclick="forceCooldownReset(\'' + escAttr(cd.publisher) + '\')">Reset</button></div>';
+        }).join('');
+    } else {
+        cdDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No active cooldowns</div>';
+    }
+
+    // --- Paywalls ---
+    const pwDiv = document.getElementById('healthPaywalls');
+    const pws = m.paywall_counts_by_publisher;
+    if (pws && Object.keys(pws).length) {
+        pwDiv.innerHTML = Object.entries(pws).map(function(e) {
+            return '<div class="cooldown-item"><span class="publisher">' + escHtml(e[0]) + '</span><span>' + e[1] + ' detections</span></div>';
+        }).join('');
+    } else {
+        pwDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No paywall events</div>';
+    }
+
+    // --- Enrichment: unlock Start Retrieval the moment the server
+    //     reports in_progress=false, without a separate round-trip ---
+    if (m.enrichment && state.enrichmentInProgress && !m.enrichment.in_progress) {
+        state.enrichmentInProgress = false;
+        setStartButtonEnrichmentLock(false);
+    }
 }
 
 window.forceCooldownReset = async function(pub) {
@@ -1767,101 +1863,35 @@ document.getElementById('btnStart').addEventListener('click', async function() {
         addLogEntry('Ready for retrieval: ' + data.ready_for_retrieval + ' papers', 'info');
         addLogEntry('Awaiting validation: ' + data.awaiting_validation + ' papers', 'info');
         addLogEntry('Workers spinning up...', 'info');
+        // SSE is the single source of truth — stream updates everything
         startSSE();
-        startStatusPoll();
         toast('Run started', 'success');
     } catch (err) { toast(err.message, 'error'); }
 });
 
-/* ------------------------------------------------------------------
-   Run status polling (independent of SSE)
-   ------------------------------------------------------------------ */
-function startStatusPoll() {
-    stopStatusPoll();
-    state.statusPollInterval = setInterval(pollRunStatus, 2500);
-    pollRunStatus();  // immediate first fetch
-}
-
-function stopStatusPoll() {
-    if (state.statusPollInterval) {
-        clearInterval(state.statusPollInterval);
-        state.statusPollInterval = null;
-    }
-}
-
-async function pollRunStatus() {
-    try {
-        const s = await GET('/api/run/status');
-        const wp = s.worker_pool || {};
-
-        // Update sidebar worker status
-        const retActive = wp.retrieval_workers_active || 0;
-        const valActive = wp.validation_workers_active || 0;
-        document.getElementById('sidebarWorkers').textContent =
-            'Workers: ' + retActive + 'R / ' + valActive + 'V' +
-            (wp.paused ? ' (paused)' : '');
-
-        // Update progress metric cards
-        document.getElementById('runCompleted').textContent = s.complete || 0;
-        document.getElementById('runFailed').textContent = s.failed || 0;
-        document.getElementById('runManual').textContent = s.manual_required || 0;
-        document.getElementById('runRetrieving').textContent = s.retrieving || 0;
-
-        // Progress bar
-        const done = (s.complete || 0) + (s.failed || 0) + (s.manual_required || 0);
-        const total = s.total_papers || 1;
-        const pct = Math.round((done / total) * 100);
-        document.getElementById('runProgressBar').style.width = pct + '%';
-        document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
-        document.getElementById('runProgressPercent').textContent = pct + '%';
-
-        // Emit log entry when counts change
-        const counters = wp.counters || {};
-        const snap = JSON.stringify({
-            r: counters.retrieved || 0,
-            f: counters.failed || 0,
-            m: counters.manual || 0,
-            v: counters.validated || 0,
-            vf: counters.val_failed || 0,
-            retQ: s.ready_for_retrieval,
-            retG: s.retrieving,
-            valQ: s.retrieved,
-            valG: s.validating,
-        });
-        if (state.lastStatusCounts !== snap) {
-            const prev = state.lastStatusCounts ? JSON.parse(state.lastStatusCounts) : null;
-            state.lastStatusCounts = snap;
-            const now = JSON.parse(snap);
-            if (prev) {
-                if (now.r > prev.r) addLogEntry('Retrieved +' + (now.r - prev.r) + ' (queue: ' + now.retQ + ')', 'ok');
-                if (now.f > prev.f) addLogEntry('Failed +' + (now.f - prev.f), 'err');
-                if (now.m > prev.m) addLogEntry('Manual required +' + (now.m - prev.m), 'warn');
-                if (now.v > prev.v) addLogEntry('Validated +' + (now.v - prev.v), 'ok');
-                if (now.vf > prev.vf) addLogEntry('Validation failed +' + (now.vf - prev.vf), 'err');
-            } else {
-                addLogEntry('Queue: retrieval=' + now.retQ + ' (active ' + now.retG + ') | validation=' + now.valQ + ' (active ' + now.valG + ')', 'info');
-            }
-        }
-
-        // Detect run completion
-        if (state.runState === 'running' && !wp.running) {
-            state.runState = 'idle';
-            updateRunButtons();
-            addLogEntry('Run finished', 'info');
-            stopStatusPoll();
-        }
-    } catch (err) {
-        // Ignore transient errors
-    }
-}
 document.getElementById('btnPause').addEventListener('click', async function() {
-    try { await POST('/api/run/pause'); state.runState = 'paused'; updateRunButtons(); addLogEntry('Run paused', 'warn'); toast('Paused', 'warning'); } catch (err) { toast(err.message, 'error'); }
+    try {
+        await POST('/api/run/pause');
+        // Don't flip state.runState here — the SSE event will reconcile it
+        // from the authoritative worker_pool.paused flag. We only log.
+        addLogEntry('Pause requested', 'warn');
+        toast('Pausing...', 'warning');
+    } catch (err) { toast(err.message, 'error'); }
 });
 document.getElementById('btnResume').addEventListener('click', async function() {
-    try { await POST('/api/run/resume'); state.runState = 'running'; updateRunButtons(); addLogEntry('Run resumed', 'info'); toast('Resumed', 'success'); } catch (err) { toast(err.message, 'error'); }
+    try {
+        await POST('/api/run/resume');
+        addLogEntry('Resume requested', 'info');
+        toast('Resuming...', 'success');
+    } catch (err) { toast(err.message, 'error'); }
 });
 document.getElementById('btnCancel').addEventListener('click', async function() {
-    try { const data = await POST('/api/run/cancel'); state.runState = 'idle'; updateRunButtons(); addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err'); toast('Cancelled', 'warning'); stopStatusPoll(); } catch (err) { toast(err.message, 'error'); }
+    try {
+        const data = await POST('/api/run/cancel');
+        // SSE will observe wp.running==false and transition to idle
+        addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err');
+        toast('Cancelled', 'warning');
+    } catch (err) { toast(err.message, 'error'); }
 });
 ['btnRetryFailed','btnRetryMismatch','btnRetryManual','btnRetryAll'].forEach(function(id) {
     const typeMap = { btnRetryFailed:'failed', btnRetryMismatch:'mismatch', btnRetryManual:'manual', btnRetryAll:'all_eligible' };
@@ -2037,7 +2067,9 @@ function formatBytes(b) {
         const s = await GET('/api/status');
         if (s.wizard_errors && s.wizard_errors.length) s.wizard_errors.forEach(function(e) { toast(e, 'warning'); });
         document.getElementById('sidebarOcr').textContent = 'OCR: ' + s.ocr_mode;
-        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); startSSE(); startStatusPoll(); }
+        // Always open the unified SSE stream — it drives the whole UI
+        startSSE();
+        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); }
 
         // Reconnect enrichment SSE if a background task is still running
         try {

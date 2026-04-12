@@ -48,6 +48,7 @@ from full_text_acquisition.database import Database
 from full_text_acquisition.models import (
     COLUMN_ALIASES,
     CURRENT_CONFIG_VERSION,
+    DEFAULT_BACKPRESSURE_THRESHOLD,
     DEFAULT_CACHE_TTL_DAYS,
     DEFAULT_CONFIG,
     AuditLogEntry,
@@ -1414,32 +1415,6 @@ async def list_runs(
     })
 
 
-@app.get("/api/run/status")
-async def run_status() -> JSONResponse:
-    """Return live worker pool status + state counts for frontend polling.
-
-    Independent of SSE — called every ~2s by the UI when a run is active.
-    """
-    db = _get_db()
-    wp = _get_worker_pool()
-
-    state_counts = await db.count_papers_by_state()
-    wp_status = wp.get_status()
-
-    return JSONResponse({
-        "worker_pool": wp_status,
-        "state_counts": state_counts,
-        "total_papers": sum(state_counts.values()),
-        "ready_for_retrieval": state_counts.get(PaperState.READY_FOR_RETRIEVAL.value, 0),
-        "retrieving": state_counts.get(PaperState.RETRIEVING.value, 0),
-        "retrieved": state_counts.get(PaperState.RETRIEVED.value, 0),
-        "validating": state_counts.get(PaperState.VALIDATING.value, 0),
-        "complete": state_counts.get(PaperState.COMPLETE.value, 0),
-        "failed": state_counts.get(PaperState.FAILED.value, 0),
-        "manual_required": state_counts.get(PaperState.MANUAL_REQUIRED.value, 0),
-    })
-
-
 @app.get("/api/run/{run_id}")
 async def get_run_detail(run_id: str) -> JSONResponse:
     """Get detailed information about a specific run."""
@@ -2178,51 +2153,108 @@ async def enrichment_stream(request: Request) -> StreamingResponse:
     )
 
 
-@app.get("/api/health/stream")
-async def health_stream(request: Request) -> StreamingResponse:
-    """Server-Sent Events stream for live health metrics.
+async def _build_stream_snapshot() -> Dict[str, Any]:
+    """Produce a single-event snapshot of the unified SSE payload.
 
-    Sends a health metrics JSON event every 3 seconds.
-    Connection closes when the client disconnects or shutdown is signaled.
+    Shared by /api/stream (streams it repeatedly) and /api/stream/snapshot
+    (returns it once). Having a single builder means the snapshot shape
+    is guaranteed to match the stream shape — no risk of drift.
     """
     config = _get_config()
     backpressure_threshold = config.get(
         "backpressure_threshold", DEFAULT_BACKPRESSURE_THRESHOLD
     )
 
+    db = _get_db()
+    metrics = await db.get_health_metrics(
+        backpressure_threshold=backpressure_threshold,
+    )
+    payload: Dict[str, Any] = metrics.model_dump()
+
+    state_counts = await db.count_papers_by_state()
+    payload["state_counts"] = state_counts
+    payload["total_papers"] = sum(state_counts.values())
+    payload["ready_for_retrieval"] = state_counts.get(PaperState.READY_FOR_RETRIEVAL.value, 0)
+    payload["retrieving"] = state_counts.get(PaperState.RETRIEVING.value, 0)
+    payload["retrieved"] = state_counts.get(PaperState.RETRIEVED.value, 0)
+    payload["validating"] = state_counts.get(PaperState.VALIDATING.value, 0)
+    payload["complete"] = state_counts.get(PaperState.COMPLETE.value, 0)
+    payload["failed"] = state_counts.get(PaperState.FAILED.value, 0)
+    payload["manual_required"] = state_counts.get(PaperState.MANUAL_REQUIRED.value, 0)
+
+    wp = app_state.get("worker_pool")
+    if wp is not None:
+        wp_status = wp.get_status()
+        payload["worker_pool"] = wp_status
+        payload["retrieval_workers_paused"] = wp_status.get("retrieval_paused", False)
+        payload["validation_workers_paused"] = wp_status.get("validation_paused", False)
+    else:
+        payload["worker_pool"] = {
+            "running": False, "paused": False,
+            "retrieval_workers_active": 0, "validation_workers_active": 0,
+            "counters": {}, "run_id": None,
+        }
+
+    enrichment = app_state.get("enrichment_status") or {}
+    payload["enrichment"] = {
+        "in_progress": bool(enrichment.get("in_progress")),
+        "total": enrichment.get("total", 0),
+        "completed": enrichment.get("completed", 0),
+        "enriched_count": enrichment.get("enriched_count", 0),
+        "failed_count": enrichment.get("failed_count", 0),
+    }
+    return payload
+
+
+@app.get("/api/stream/snapshot")
+async def stream_snapshot() -> JSONResponse:
+    """Single-event snapshot of the unified stream payload.
+
+    Useful for one-off UI fetches (e.g. the Upload-panel State Breakdown
+    Refresh button) without opening a full SSE connection. NOT polled
+    periodically — that would re-introduce the duplication this fix
+    eliminated.
+    """
+    return JSONResponse(await _build_stream_snapshot())
+
+
+@app.get("/api/stream")
+@app.get("/api/health/stream")  # Back-compat alias
+async def unified_stream(request: Request) -> StreamingResponse:
+    """Unified Server-Sent Events stream for ALL live run data.
+
+    Single source of truth for:
+      - Health metrics (success rate, queue depths, cache rate, etc.)
+      - Worker pool state (running/paused + counters for retrieved/
+        failed/manual/validated/val_failed)
+      - Full paper state counts (every PaperState → count)
+      - Backpressure state (weighted depth vs threshold, retrieval_paused)
+      - Disk space state
+      - Active publisher cooldowns
+
+    Emits one event every 2 seconds. Automatically closes on client
+    disconnect or shutdown. No separate polling endpoint is needed —
+    the frontend drives all UI updates from this single stream.
+    """
     async def event_generator() -> AsyncIterator[str]:
         shutdown_event: asyncio.Event = app_state.get(
             "shutdown_event", asyncio.Event()
         )
 
         while not shutdown_event.is_set():
-            # Check if client disconnected
             if await request.is_disconnected():
                 break
 
             try:
-                db = _get_db()
-                metrics = await db.get_health_metrics(
-                    backpressure_threshold=backpressure_threshold,
-                )
-
-                # Add worker pool status
-                wp = app_state.get("worker_pool")
-                if wp:
-                    wp_status = wp.get_status()
-                    metrics.retrieval_workers_paused = wp_status.get("retrieval_paused", False)
-                    metrics.validation_workers_paused = wp_status.get("validation_paused", False)
-
-                data = json.dumps(metrics.model_dump(), default=str)
-                yield f"data: {data}\n\n"
-
+                payload = await _build_stream_snapshot()
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
             except Exception as exc:
-                logger.debug("Health stream error: %s", exc)
-                yield f"data: {{\"error\": \"{exc}\"}}\n\n"
+                logger.debug("Unified stream error: %s", exc)
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
             try:
                 await asyncio.wait_for(
-                    shutdown_event.wait(), timeout=3.0
+                    shutdown_event.wait(), timeout=2.0
                 )
                 break  # Shutdown signaled
             except asyncio.TimeoutError:
