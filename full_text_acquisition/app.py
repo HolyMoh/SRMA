@@ -450,6 +450,29 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     }
     app_state["enrichment_task"] = None
 
+    # SSO session state — SERIALIZABLE SUBSET ONLY.
+    # Never includes credentials, cookies, page content, or screenshots.
+    # Only tracks progress and UI state.
+    app_state["sso_session"] = {
+        "active": False,
+        "phase": "idle",               # idle | waiting_login | downloading | paused_reauth | ended
+        "proxy_url": "",               # The EZproxy prefix in use
+        "login_url": "",               # Where we navigated the browser on Start
+        "started_at": None,
+        "login_detected_at": None,
+        "ended_at": None,
+        "queue_total": 0,
+        "queue_processed": 0,
+        "queue_succeeded": 0,
+        "queue_manual": 0,
+        "current_paper_id": None,
+        "current_paper_title": None,
+        "last_message": "",
+        "session_expired": False,
+    }
+    app_state["sso_task"] = None
+    app_state["sso_cancel_event"] = None
+
     logger.info(
         "Startup complete: %d interrupted resets, %d missing files reconciled",
         len(resets), len(missing),
@@ -1632,6 +1655,595 @@ async def sso_queue_count() -> JSONResponse:
 
 
 # ===========================================================================
+# SSO OVERHAUL — User-Controlled, System-Assisted
+# ===========================================================================
+#
+# Philosophy: the USER stays in full control of credentials. The SYSTEM
+# does all the mechanical work (URL construction, navigation, PDF
+# extraction, progress tracking). We never read, log, or store anything
+# the user types, and we never store cookies outside the Playwright
+# context (which is destroyed on session end).
+
+# Default EZproxy prefix. Overridden by config.sso_proxy_url if set.
+# UofT's EZproxy is the reference implementation.
+DEFAULT_EZPROXY_PREFIX = "https://myaccess.library.utoronto.ca/login?url="
+DEFAULT_EZPROXY_LOGIN_URL = "https://myaccess.library.utoronto.ca/login"
+# Well-known open-access DOI used to probe login state. PLOS ONE's first
+# article — publicly available, fast to load, and will resolve through
+# any functioning institutional proxy.
+SSO_LOGIN_PROBE_DOI = "10.1371/journal.pone.0000308"
+DEFAULT_SSO_INTER_PAPER_DELAY_S = 3.0
+SSO_LOGIN_POLL_INTERVAL_S = 3.0
+SSO_REAUTH_POLL_INTERVAL_S = 5.0
+
+
+def _ezproxy_prefix() -> str:
+    """Return the configured EZproxy prefix, or the UofT default.
+
+    Callers append the target article URL to this prefix.
+    """
+    raw = (_get_config().get("sso_proxy_url") or "").strip()
+    if not raw:
+        return DEFAULT_EZPROXY_PREFIX
+    # Normalize to "...login?url=" form: users may paste either
+    # `https://proxy.uni.edu` or `https://proxy.uni.edu/login?url=`.
+    if raw.endswith("?url=") or raw.endswith("url="):
+        return raw
+    raw_stripped = raw.rstrip("/")
+    if raw_stripped.endswith("/login"):
+        return f"{raw_stripped}?url="
+    return f"{raw_stripped}/login?url="
+
+
+def _ezproxy_login_url() -> str:
+    """Bare login URL (no ?url= suffix) — where Start SSO Session lands."""
+    prefix = _ezproxy_prefix()
+    if "?" in prefix:
+        return prefix.split("?", 1)[0]
+    return prefix
+
+
+def _build_ezproxy_url(article_url: str) -> str:
+    """Wrap an article URL with the EZproxy prefix."""
+    return f"{_ezproxy_prefix()}{article_url}"
+
+
+def _sso_test_url() -> str:
+    """EZproxy-wrapped URL of the login probe DOI."""
+    return _build_ezproxy_url(f"https://doi.org/{SSO_LOGIN_PROBE_DOI}")
+
+
+# ---------------------------------------------------------------------------
+# STEP 1 — Queue visibility
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/sso/queue")
+async def sso_queue(
+    run_id: Optional[str] = Query(default=None),
+) -> JSONResponse:
+    """List papers in the SSO queue (MANUAL_REQUIRED).
+
+    For each paper returns:
+        canonical_id, doi, title, first_author, year, journal,
+        publisher, last_failure_code, expected_ezproxy_url, doi_url
+
+    The expected_ezproxy_url is what the system will navigate the
+    browser to when it processes the paper.
+    """
+    db = _get_db()
+    papers = await db.get_manual_required_papers(run_id=run_id)
+
+    prefix = _ezproxy_prefix()
+    items: List[Dict[str, Any]] = []
+    for p in papers:
+        doi_url = f"https://doi.org/{p.doi}" if p.doi else None
+        ezproxy_url = f"{prefix}{doi_url}" if doi_url else None
+        items.append({
+            "canonical_id": p.canonical_id,
+            "doi": p.doi,
+            "doi_url": doi_url,
+            "title": p.title,
+            "first_author": p.first_author_lastname,
+            "year": p.year,
+            "journal": p.journal,
+            "publisher": p.publisher,
+            "last_failure_code": p.last_failure_code,
+            "expected_ezproxy_url": ezproxy_url,
+            "attempt_count": p.attempt_count,
+        })
+
+    return JSONResponse({
+        "total": len(items),
+        "proxy_prefix": prefix,
+        "login_url": _ezproxy_login_url(),
+        "papers": items,
+    })
+
+
+# ---------------------------------------------------------------------------
+# STEP 2 — Session initialization
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/sso/session/start")
+async def sso_session_start() -> JSONResponse:
+    """STEP 2 — Open the authenticated browser and begin the SSO flow.
+
+    Opens a headed Playwright Chromium window with stealth injected.
+    Navigates to the EZproxy bare login URL (no ?url= suffix).
+    Starts a background task that:
+      - Polls the browser (every 3s) for login completion
+      - Once detected, processes the SSO queue paper-by-paper
+      - Handles session expiry mid-queue (pause + wait for re-login)
+      - Emits live progress into app_state['sso_session'] for SSE
+
+    SECURITY:
+      - We navigate the browser; the USER types credentials.
+      - We never read input fields, cookies, or body text except for
+        structural detection (URL + known-paywall selectors).
+    """
+    bm: BrowserManager = app_state.get("browser_manager")
+    db: Database = _get_db()
+    engine: RetrievalEngine = _get_engine()
+    sso: Dict[str, Any] = app_state["sso_session"]
+
+    if bm is None or db is None or engine is None:
+        raise HTTPException(status_code=503, detail="System not initialized")
+
+    if sso.get("active"):
+        raise HTTPException(
+            status_code=409,
+            detail="An SSO session is already active. End it before starting a new one.",
+        )
+
+    login_url = _ezproxy_login_url()
+    proxy_prefix = _ezproxy_prefix()
+
+    try:
+        await bm.initiate_sso_login(login_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to open SSO login page: {exc}",
+        )
+
+    # Reset session state
+    cancel_event = asyncio.Event()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sso.update({
+        "active": True,
+        "phase": "waiting_login",
+        "proxy_url": proxy_prefix,
+        "login_url": login_url,
+        "started_at": now_iso,
+        "login_detected_at": None,
+        "ended_at": None,
+        "queue_total": 0,
+        "queue_processed": 0,
+        "queue_succeeded": 0,
+        "queue_manual": 0,
+        "current_paper_id": None,
+        "current_paper_title": None,
+        "last_message": "Browser opened. Log in with your institution credentials. We never see what you type.",
+        "session_expired": False,
+    })
+    app_state["sso_cancel_event"] = cancel_event
+
+    # Launch background worker (queue processing after login detection)
+    task = asyncio.create_task(
+        _sso_queue_processor(cancel_event),
+        name="sso-queue-processor",
+    )
+    app_state["sso_task"] = task
+
+    await db.log_audit(AuditLogEntry(
+        outcome="SSO_SESSION_STARTED",
+        details=json.dumps({
+            "login_url": login_url,
+            "proxy_prefix": proxy_prefix,
+        }),
+    ))
+
+    return JSONResponse({
+        "status": "session_started",
+        "login_url": login_url,
+        "proxy_prefix": proxy_prefix,
+        "message": sso["last_message"],
+    })
+
+
+@app.get("/api/sso/session/status")
+async def sso_session_status_detailed() -> JSONResponse:
+    """One-shot snapshot of the SSO session status.
+
+    The same data is pushed continuously via the unified SSE stream
+    (/api/stream → payload.sso). This endpoint exists for page-load
+    bootstrap and ad-hoc reads.
+    """
+    sso = dict(app_state.get("sso_session") or {})
+    # Never expose internal task handles
+    sso.pop("_internal", None)
+    return JSONResponse(sso)
+
+
+@app.post("/api/sso/session/end")
+async def sso_session_end() -> JSONResponse:
+    """STEP 4b — Close the SSO browser and save progress.
+
+    Destroys the Playwright persistent context. Papers not reached
+    before session end remain MANUAL_REQUIRED for the next session.
+    """
+    bm: BrowserManager = app_state.get("browser_manager")
+    sso = app_state["sso_session"]
+    cancel_event: Optional[asyncio.Event] = app_state.get("sso_cancel_event")
+    task: Optional[asyncio.Task] = app_state.get("sso_task")
+
+    if not sso.get("active"):
+        raise HTTPException(status_code=409, detail="No active SSO session")
+
+    # Signal the worker to stop
+    if cancel_event:
+        cancel_event.set()
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # Destroy browser context (security: no persistence outside session)
+    if bm is not None:
+        try:
+            await bm.destroy_persistent_context(reason="user_ended_session")
+        except Exception as exc:
+            logger.debug("Error destroying persistent context: %s", exc)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sso.update({
+        "active": False,
+        "phase": "ended",
+        "ended_at": now_iso,
+        "last_message": "Session ended. Browser closed.",
+        "current_paper_id": None,
+        "current_paper_title": None,
+    })
+    app_state["sso_task"] = None
+    app_state["sso_cancel_event"] = None
+
+    try:
+        await _get_db().log_audit(AuditLogEntry(
+            outcome="SSO_SESSION_ENDED",
+            details=json.dumps({
+                "queue_processed": sso.get("queue_processed", 0),
+                "queue_succeeded": sso.get("queue_succeeded", 0),
+                "queue_manual": sso.get("queue_manual", 0),
+            }),
+        ))
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "status": "session_ended",
+        "queue_processed": sso.get("queue_processed", 0),
+        "queue_succeeded": sso.get("queue_succeeded", 0),
+        "queue_manual": sso.get("queue_manual", 0),
+    })
+
+
+# ---------------------------------------------------------------------------
+# STEP 5 — Manual fallback helpers
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/sso/paper/{canonical_id}/mark-retrieved")
+async def sso_mark_retrieved(
+    canonical_id: str,
+    note: str = Query(default=""),
+) -> JSONResponse:
+    """User signals they manually obtained a paper's PDF.
+
+    Records an audit entry and sets user_override='MANUALLY_RETRIEVED'
+    on the paper. The paper stays in MANUAL_REQUIRED — it's still
+    not in the system's PDF store, but reviewers can see it's resolved.
+    """
+    db = _get_db()
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.update_paper_fields(
+        canonical_id,
+        user_override="MANUALLY_RETRIEVED",
+        override_reason=note or "User marked as manually retrieved outside the system",
+        override_timestamp=now_iso,
+    )
+    await db.log_audit(AuditLogEntry(
+        canonical_id=canonical_id,
+        outcome="MANUALLY_RETRIEVED",
+        details=json.dumps({"note": note or ""}),
+    ))
+
+    return JSONResponse({
+        "status": "marked",
+        "canonical_id": canonical_id,
+    })
+
+
+@app.get("/api/sso/manual-fallback")
+async def sso_manual_fallback() -> JSONResponse:
+    """List of papers still needing manual retrieval after SSO session ends."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+
+    prefix = _ezproxy_prefix()
+    items = []
+    for p in papers:
+        if p.user_override == "MANUALLY_RETRIEVED":
+            continue  # already resolved by user
+        doi_url = f"https://doi.org/{p.doi}" if p.doi else None
+        items.append({
+            "canonical_id": p.canonical_id,
+            "title": p.title,
+            "first_author": p.first_author_lastname,
+            "year": p.year,
+            "doi": p.doi,
+            "doi_url": doi_url,
+            "ezproxy_url": f"{prefix}{doi_url}" if doi_url else None,
+            "publisher": p.publisher,
+            "last_failure_code": p.last_failure_code,
+        })
+    return JSONResponse({"total": len(items), "papers": items})
+
+
+@app.get("/api/sso/manual-fallback/csv")
+async def sso_manual_fallback_csv() -> Any:
+    """CSV export of the manual-fallback list for external retrieval tracking."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+
+    prefix = _ezproxy_prefix()
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"sso_manual_fallback_{timestamp}.csv"
+    filepath = os.path.join(export_dir, filename)
+
+    with open(filepath, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "canonical_id", "title", "first_author", "year", "doi",
+            "doi_url", "ezproxy_url", "publisher", "last_failure_code",
+            "user_override",
+        ])
+        for p in papers:
+            doi_url = f"https://doi.org/{p.doi}" if p.doi else ""
+            w.writerow([
+                p.canonical_id, p.title, p.first_author_lastname,
+                p.year or "", p.doi or "", doi_url,
+                f"{prefix}{doi_url}" if doi_url else "",
+                p.publisher, p.last_failure_code or "",
+                p.user_override or "",
+            ])
+    return FileResponse(filepath, media_type="text/csv", filename=filename)
+
+
+# ---------------------------------------------------------------------------
+# STEP 3 — Background queue processor
+# ---------------------------------------------------------------------------
+
+
+async def _sso_queue_processor(cancel_event: asyncio.Event) -> None:
+    """Background task: detect login, then process SSO queue.
+
+    Phases:
+        waiting_login  → probe every 3s until browser is authenticated
+        downloading    → iterate MANUAL_REQUIRED papers
+        paused_reauth  → session expired mid-queue; poll for re-login
+        ended          → terminal
+
+    Per-paper loop:
+        1. Check session validity (if expired: enter paused_reauth)
+        2. Reset paper to READY_FOR_RETRIEVAL so engine.tier3 can run
+        3. Run engine.tier3_institutional_sso — this constructs the
+           EZproxy URL, navigates, applies publisher-specific PDF
+           extraction, downloads and atomically stores the PDF
+        4. On success: advance through validation pipeline → COMPLETE
+        5. On block/paywall: revert to MANUAL_REQUIRED with audit
+        6. Sleep configured inter-paper delay before next
+    """
+    bm: BrowserManager = app_state.get("browser_manager")
+    db: Database = app_state.get("db")
+    engine: RetrievalEngine = app_state.get("engine")
+    sso: Dict[str, Any] = app_state["sso_session"]
+    config = _get_config()
+    inter_paper_delay = float(
+        config.get("sso_inter_paper_delay_s", DEFAULT_SSO_INTER_PAPER_DELAY_S)
+    )
+
+    # --- Phase: waiting_login ---
+    sso["phase"] = "waiting_login"
+    sso["last_message"] = "Waiting for you to log in..."
+    login_detected = False
+    while not cancel_event.is_set() and not login_detected:
+        try:
+            result = await bm.probe_sso_login(_sso_test_url())
+            if result.get("authenticated"):
+                login_detected = True
+                sso["login_detected_at"] = datetime.now(timezone.utc).isoformat()
+                sso["last_message"] = "\u2713 Session active — starting downloads"
+                break
+        except Exception as exc:
+            logger.debug("SSO login probe error: %s", exc)
+
+        try:
+            await asyncio.wait_for(
+                cancel_event.wait(), timeout=SSO_LOGIN_POLL_INTERVAL_S
+            )
+            break  # cancelled
+        except asyncio.TimeoutError:
+            pass
+
+    if cancel_event.is_set():
+        return
+
+    # --- Phase: downloading ---
+    sso["phase"] = "downloading"
+
+    # Load queue
+    try:
+        papers = await db.get_manual_required_papers()
+    except Exception as exc:
+        sso["phase"] = "ended"
+        sso["last_message"] = f"Could not load queue: {exc}"
+        return
+    sso["queue_total"] = len(papers)
+
+    run_id = f"sso-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+
+    for idx, paper in enumerate(papers, start=1):
+        if cancel_event.is_set():
+            break
+
+        # --- session validity recheck ---
+        try:
+            probe = await bm.probe_sso_login(_sso_test_url())
+            if not probe.get("authenticated"):
+                sso["session_expired"] = True
+                sso["phase"] = "paused_reauth"
+                sso["last_message"] = "Session expired. Please log in again in the browser."
+
+                # Wait for re-login
+                while not cancel_event.is_set():
+                    try:
+                        probe2 = await bm.probe_sso_login(_sso_test_url())
+                        if probe2.get("authenticated"):
+                            sso["session_expired"] = False
+                            sso["phase"] = "downloading"
+                            sso["last_message"] = "\u2713 Session restored — resuming downloads"
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(
+                            cancel_event.wait(),
+                            timeout=SSO_REAUTH_POLL_INTERVAL_S,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
+                if cancel_event.is_set():
+                    break
+        except Exception as exc:
+            logger.debug("SSO session probe failed: %s", exc)
+
+        sso["current_paper_id"] = paper.canonical_id
+        sso["current_paper_title"] = paper.title
+        sso["queue_processed"] = idx
+        sso["last_message"] = f"Paper {idx}/{len(papers)} — downloading..."
+
+        # Reset paper state so tier3 can run — MANUAL_REQUIRED → READY_FOR_RETRIEVAL
+        try:
+            await db.reset_paper_for_retry(paper.canonical_id)
+        except Exception as exc:
+            logger.debug("Reset paper %s failed: %s", paper.canonical_id, exc)
+            continue
+
+        # Claim for retrieval so state machine is happy
+        worker_id = "sso-worker"
+        claimed = await db.claim_retrieval_task(paper.canonical_id, worker_id)
+        if not claimed:
+            # Another worker might have it — skip
+            continue
+
+        # Refresh paper (state is now RETRIEVING)
+        fresh = await db.get_paper(paper.canonical_id)
+        if fresh is None:
+            continue
+
+        # Run Tier 3 (SSO) only — reuses EZproxy URL construction +
+        # publisher-specific PDF extraction + atomic write
+        try:
+            success, failure_code = await engine.tier3_institutional_sso(
+                fresh, run_id
+            )
+        except Exception as exc:
+            logger.error("SSO retrieval error for %s: %s", paper.canonical_id, exc)
+            success, failure_code = False, "SSO_FAILED"
+
+        if success:
+            # Advance state RETRIEVING → RETRIEVED so validation kicks in
+            await db.transition_state(
+                paper.canonical_id, PaperState.RETRIEVED.value, run_id=run_id,
+            )
+            # Run validation pipeline inline so the paper reaches COMPLETE
+            try:
+                claimed_v = await db.claim_validation_task(
+                    paper.canonical_id, worker_id
+                )
+                if claimed_v:
+                    refreshed = await db.get_paper(paper.canonical_id)
+                    if refreshed:
+                        vstatus, istatus, score = await engine.run_validation_pipeline(
+                            refreshed, run_id
+                        )
+                        await db.transition_state(
+                            paper.canonical_id, PaperState.VALIDATED.value,
+                            run_id=run_id,
+                        )
+                        # Auto-complete unless flagged
+                        if istatus not in (
+                            "VERSION_MISMATCH", "CONTENT_UNVERIFIED",
+                            "TITLE_VERIFIED_WEAK",
+                        ):
+                            await db.transition_state(
+                                paper.canonical_id, PaperState.COMPLETE.value,
+                                run_id=run_id,
+                            )
+            except Exception as exc:
+                logger.debug("SSO validation error for %s: %s", paper.canonical_id, exc)
+            sso["queue_succeeded"] += 1
+        else:
+            # Revert to MANUAL_REQUIRED so user can act
+            try:
+                await db.transition_state(
+                    paper.canonical_id, PaperState.MANUAL_REQUIRED.value,
+                    failure_code=failure_code or "SSO_FAILED",
+                    run_id=run_id,
+                )
+            except Exception:
+                pass
+            sso["queue_manual"] += 1
+
+        # Inter-paper delay
+        if cancel_event.is_set():
+            break
+        try:
+            await asyncio.wait_for(
+                cancel_event.wait(), timeout=inter_paper_delay
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    sso["current_paper_id"] = None
+    sso["current_paper_title"] = None
+    if not cancel_event.is_set():
+        sso["phase"] = "ended"
+        sso["last_message"] = (
+            f"Queue complete: {sso['queue_succeeded']} succeeded, "
+            f"{sso['queue_manual']} still manual"
+        )
+
+
+# ===========================================================================
 # CAPTCHA ENDPOINTS
 # ===========================================================================
 
@@ -2202,6 +2814,34 @@ async def _build_stream_snapshot() -> Dict[str, Any]:
         "completed": enrichment.get("completed", 0),
         "enriched_count": enrichment.get("enriched_count", 0),
         "failed_count": enrichment.get("failed_count", 0),
+    }
+
+    # SSO session (serializable subset only — no credentials/cookies/DOM)
+    sso = app_state.get("sso_session") or {}
+    session_duration_s = 0.0
+    if sso.get("login_detected_at"):
+        try:
+            started = datetime.fromisoformat(sso["login_detected_at"])
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            session_duration_s = (datetime.now(timezone.utc) - started).total_seconds()
+        except (ValueError, TypeError):
+            pass
+    payload["sso"] = {
+        "active": bool(sso.get("active")),
+        "phase": sso.get("phase", "idle"),
+        "proxy_url": sso.get("proxy_url", ""),
+        "started_at": sso.get("started_at"),
+        "login_detected_at": sso.get("login_detected_at"),
+        "session_duration_s": round(session_duration_s, 1),
+        "queue_total": sso.get("queue_total", 0),
+        "queue_processed": sso.get("queue_processed", 0),
+        "queue_succeeded": sso.get("queue_succeeded", 0),
+        "queue_manual": sso.get("queue_manual", 0),
+        "current_paper_id": sso.get("current_paper_id"),
+        "current_paper_title": sso.get("current_paper_title"),
+        "last_message": sso.get("last_message", ""),
+        "session_expired": bool(sso.get("session_expired")),
     }
     return payload
 

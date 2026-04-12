@@ -570,6 +570,88 @@ class BrowserManager:
         await self.destroy_persistent_context(reason="SESSION_EXPIRED")
         return await self.initiate_sso_login(sso_url)
 
+    async def probe_sso_login(
+        self,
+        test_url: str,
+        page_load_timeout_s: float = DEFAULT_PAGE_LOAD_TIMEOUT_S,
+    ) -> Dict[str, Any]:
+        """Probe whether the SSO session is authenticated.
+
+        Navigates the persistent context to `test_url` (typically the
+        EZproxy-wrapped form of a known open-access DOI) and inspects the
+        resulting page URL. If the URL still looks like a login page we
+        treat the session as unauthenticated; otherwise authenticated.
+
+        SECURITY: This method NEVER reads form fields, input values, or
+        any DOM content except the final page URL. It does not log,
+        store, or screenshot anything. It only looks at where the browser
+        landed after a navigation.
+
+        Returns:
+            {
+                "authenticated": bool,
+                "final_url": str,
+                "http_status": int | None,
+                "error": str | None,
+                "elapsed_ms": float,
+            }
+        """
+        import time as _time
+        result: Dict[str, Any] = {
+            "authenticated": False,
+            "final_url": "",
+            "http_status": None,
+            "error": None,
+            "elapsed_ms": 0.0,
+        }
+
+        async with self._lock:
+            if self._persistent_context is None:
+                result["error"] = "NO_PERSISTENT_CONTEXT"
+                return result
+
+        try:
+            page = await self.get_sso_page()
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            return result
+
+        t0 = _time.monotonic()
+        try:
+            response = await page.goto(
+                test_url,
+                timeout=page_load_timeout_s * 1000,
+                wait_until="domcontentloaded",
+            )
+            if response is not None:
+                result["http_status"] = response.status
+            result["final_url"] = page.url
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            result["elapsed_ms"] = (_time.monotonic() - t0) * 1000.0
+            return result
+
+        result["elapsed_ms"] = (_time.monotonic() - t0) * 1000.0
+
+        # Heuristic: if the final URL still looks like a login page,
+        # we're not authenticated.
+        url_lower = (result["final_url"] or "").lower()
+        login_indicators = [
+            "/login", "/signin", "/sign-in", "/auth", "/sso",
+            "login.microsoftonline.com",
+            "shibboleth",
+            "wayf",
+            "idp.",
+            "idpz.",
+        ]
+        is_login_page = any(ind in url_lower for ind in login_indicators)
+
+        # A non-login URL + a 2xx/3xx response is our signal for auth success.
+        status = result["http_status"]
+        reached_target = status is None or (200 <= status < 400)
+        result["authenticated"] = (not is_login_page) and reached_target
+        return result
+
     # -----------------------------------------------------------------------
     # Page helpers — CAPTCHA detection
     # -----------------------------------------------------------------------

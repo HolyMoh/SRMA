@@ -1042,47 +1042,92 @@
         </div>
 
         <!-- ============================================================
-             PANEL 5: SSO
+             PANEL 5: SSO — User-Controlled, System-Assisted
              ============================================================ -->
         <div id="panelSso" class="panel">
             <div class="panel-header">
                 <h2>Institutional SSO Access</h2>
+                <span class="badge" id="ssoPhaseBadge">idle</span>
             </div>
 
+            <!-- Security reminder — always visible -->
+            <div class="card" style="border-left: 3px solid var(--success); background: #f0fdf4">
+                <div style="font-size:13px; line-height:1.6">
+                    <strong style="color:var(--success)">&#128274; Your credentials stay private</strong><br>
+                    The system opens a real browser window for you. <strong>You</strong> type your login.
+                    We never read, log, store, or screenshot anything in that browser. The browser
+                    context is destroyed when you end the session — no cookies are kept.
+                </div>
+            </div>
+
+            <!-- STEP 1: QUEUE VISIBILITY -->
             <div class="card">
                 <div class="card-header">
-                    <h3>Session Status</h3>
-                    <span class="badge" id="ssoStatusBadge">Not Connected</span>
+                    <h3>Step 1 &middot; SSO Queue</h3>
+                    <button class="btn btn-outline btn-sm" id="btnSsoReloadQueue">Refresh</button>
                 </div>
-
-                <div style="margin-bottom:20px; color:var(--text-secondary); font-size:14px; line-height:1.7">
-                    <p><strong>How it works:</strong></p>
-                    <ol style="padding-left:20px; margin-top:8px">
-                        <li>Click <strong>Start SSO Login</strong> to open your institution's login page in a headed browser.</li>
-                        <li>Complete authentication manually (username, password, MFA).</li>
-                        <li>Click <strong>Continue</strong> when finished. The system will <em>never</em> access what you type.</li>
-                        <li>Tier 3 and 3.5 retrieval will use your authenticated session.</li>
-                    </ol>
-                    <p style="margin-top:12px">
-                        If your session expires (403 errors), click <strong>Re-authenticate</strong> to start fresh.
-                    </p>
+                <div id="ssoQueueSummary" style="font-size:14px; margin-bottom:12px; color:var(--text-secondary)">
+                    Loading...
                 </div>
-
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="btnSsoStart">Start SSO Login</button>
-                    <button class="btn btn-success" id="btnSsoContinue" disabled>Continue</button>
-                    <button class="btn btn-warning" id="btnSsoReauth" disabled>Re-authenticate</button>
-                </div>
-
-                <div id="ssoMessage" style="margin-top:16px; font-size:13px; color:var(--text-secondary)"></div>
+                <div id="ssoQueueList" style="max-height:320px; overflow-y:auto; font-size:12px"></div>
+                <div id="ssoProxyPrefix" style="font-size:11px; color:var(--text-secondary); margin-top:8px; font-family:var(--mono)"></div>
             </div>
 
+            <!-- STEP 2: SESSION INITIALIZATION -->
             <div class="card">
-                <div class="card-header"><h3>Configuration</h3></div>
-                <p style="font-size:13px; color:var(--text-secondary); margin-bottom:12px">
-                    SSO URLs are configured in the Settings panel. At least one must be set for Tier 3 retrieval.
-                </p>
-                <div id="ssoConfigSummary" style="font-size:13px"></div>
+                <div class="card-header">
+                    <h3>Step 2 &middot; Session</h3>
+                    <span class="badge" id="ssoSessionBadge">Not started</span>
+                </div>
+                <div id="ssoSessionMessage" style="font-size:13px; color:var(--text-secondary); margin-bottom:12px;min-height:20px">
+                    Click Start SSO Session to open the browser at your institution's login page.
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="btnSsoSessionStart">Start SSO Session</button>
+                    <button class="btn btn-danger" id="btnSsoSessionEnd" disabled>End SSO Session</button>
+                </div>
+                <div id="ssoSessionTimer" style="margin-top:12px; font-size:12px; color:var(--text-secondary)"></div>
+            </div>
+
+            <!-- STEP 3: LIVE DOWNLOAD PROGRESS -->
+            <div class="card" id="ssoDownloadCard" style="display:none">
+                <div class="card-header">
+                    <h3>Step 3 &middot; Download Progress</h3>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="ssoProgressBar" style="width:0%"></div>
+                    </div>
+                    <div class="progress-stats">
+                        <span id="ssoProgressText">0 / 0 papers</span>
+                        <span id="ssoProgressPercent">0%</span>
+                    </div>
+                </div>
+                <div class="card-grid" style="margin-top:16px">
+                    <div class="metric-card">
+                        <div class="metric-value score-high" id="ssoSucceeded">0</div>
+                        <div class="metric-label">Succeeded</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value score-medium" id="ssoManualStill">0</div>
+                        <div class="metric-label">Still Manual</div>
+                    </div>
+                </div>
+                <div id="ssoCurrentPaper" style="margin-top:12px; font-size:13px; padding:10px; background:var(--bg-primary); border-radius:var(--radius-sm)"></div>
+            </div>
+
+            <!-- STEP 5: MANUAL FALLBACK -->
+            <div class="card" id="ssoManualCard">
+                <div class="card-header">
+                    <h3>Step 5 &middot; Manual Fallback</h3>
+                    <div class="btn-group">
+                        <button class="btn btn-outline btn-sm" id="btnSsoReloadManual">Refresh</button>
+                        <button class="btn btn-outline btn-sm" id="btnSsoExportManualCsv">Export CSV</button>
+                    </div>
+                </div>
+                <div id="ssoManualList" style="max-height:360px; overflow-y:auto; font-size:12px">
+                    Loading...
+                </div>
             </div>
         </div>
 
@@ -1805,6 +1850,11 @@ function handleStreamEvent(m) {
         state.enrichmentInProgress = false;
         setStartButtonEnrichmentLock(false);
     }
+
+    // --- SSO: live session state drives every element on the SSO panel ---
+    if (m.sso && typeof renderSsoFromStream === 'function') {
+        renderSsoFromStream(m.sso);
+    }
 }
 
 window.forceCooldownReset = async function(pub) {
@@ -1901,49 +1951,196 @@ document.getElementById('btnCancel').addEventListener('click', async function() 
 });
 
 /* ------------------------------------------------------------------
-   SSO
-   ------------------------------------------------------------------ */
-async function loadSsoStatus() {
-    try {
-        const data = await GET('/api/sso/status');
-        const badge = document.getElementById('ssoStatusBadge');
-        if (data.session_valid) { badge.textContent = 'Active'; badge.className = 'badge badge-success'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = false; }
-        else if (data.has_context) { badge.textContent = 'Pending'; badge.className = 'badge badge-warning'; document.getElementById('btnSsoContinue').disabled = false; document.getElementById('btnSsoReauth').disabled = false; }
-        else { badge.textContent = 'Not Connected'; badge.className = 'badge badge-neutral'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = true; }
-    } catch(e) {}
+   SSO — 5-step user-controlled flow
+   ------------------------------------------------------------------
+   The SSE stream pushes payload.sso (phase/queue/current_paper/...)
+   so most live UI is driven from handleStreamEvent → renderSsoFromStream.
+   The functions below handle:
+     - panel-load one-shot reads (queue list, manual fallback list)
+     - button click handlers for start/end/mark-retrieved/csv
+*/
 
-    // Load SSO queue count
+async function loadSsoStatus() {
+    // Fired on panel switch — load the queue and the manual-fallback list.
+    // Live session state comes from the SSE stream.
     try {
-        const q = await GET('/api/sso/queue-count');
-        const configLines = [];
-        if (q.sso_configured) {
-            configLines.push('<div style="color:var(--success)">&#10003; SSO URL configured</div>');
-        } else {
-            configLines.push('<div style="color:var(--warning)">&#9888; No SSO URL configured — set EZproxy/OpenAthens/resolver URL in Settings first.</div>');
-        }
-        configLines.push('<div style="margin-top:12px;padding:12px;background:var(--bg-primary);border-radius:var(--radius-sm)">');
-        configLines.push('<div style="font-weight:600;font-size:14px;margin-bottom:4px">SSO Queue</div>');
-        configLines.push('<div style="font-size:22px;font-weight:700;color:var(--accent)">' + q.pending_retrieval + ' papers</div>');
-        configLines.push('<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">will be attempted after you log in once</div>');
-        if (q.previously_failed_paywall > 0) {
-            configLines.push('<div style="font-size:12px;color:var(--warning);margin-top:8px">&#9888; ' + q.previously_failed_paywall + ' previously hit paywalls in Tier 2 — these will retry via your SSO session.</div>');
-        }
-        configLines.push('</div>');
-        configLines.push('<div style="margin-top:12px;font-size:12px;color:var(--text-secondary);line-height:1.6"><strong>Session reuse:</strong> ' + q.session_reuse_note + '</div>');
-        document.getElementById('ssoConfigSummary').innerHTML = configLines.join('');
-    } catch(e) {
-        document.getElementById('ssoConfigSummary').innerHTML = '<div style="color:var(--text-secondary);font-size:13px">Could not load SSO queue count.</div>';
+        const q = await GET('/api/sso/queue');
+        renderSsoQueue(q);
+    } catch (err) {
+        document.getElementById('ssoQueueSummary').innerHTML =
+            '<span style="color:var(--danger)">Could not load queue: ' + escHtml(err.message) + '</span>';
+    }
+    try {
+        const m = await GET('/api/sso/manual-fallback');
+        renderSsoManualFallback(m);
+    } catch (err) {
+        document.getElementById('ssoManualList').innerHTML =
+            '<span style="color:var(--danger)">Could not load manual list: ' + escHtml(err.message) + '</span>';
     }
 }
-document.getElementById('btnSsoStart').addEventListener('click', async function() {
-    try { const data = await POST('/api/sso/start'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('SSO page opened', 'info'); } catch (err) { toast(err.message, 'error'); }
+
+function renderSsoQueue(q) {
+    const total = q.total || 0;
+    document.getElementById('ssoProxyPrefix').textContent = 'EZproxy prefix in use: ' + (q.proxy_prefix || '(none)');
+    if (total === 0) {
+        document.getElementById('ssoQueueSummary').innerHTML =
+            '<span style="color:var(--success)">&#10003; No papers need SSO right now.</span>';
+        document.getElementById('ssoQueueList').innerHTML = '';
+        return;
+    }
+    document.getElementById('ssoQueueSummary').innerHTML =
+        '<strong>' + total + ' papers</strong> need institutional access (MANUAL_REQUIRED). ' +
+        'The system will attempt each one through your EZproxy session.';
+
+    const rows = q.papers.map(function(p) {
+        const ezproxy = p.expected_ezproxy_url || '';
+        return '<div style="padding:10px;border-bottom:1px solid var(--border)">' +
+            '<div style="font-weight:500;margin-bottom:2px">' + escHtml(p.title || '(no title)') + '</div>' +
+            '<div style="color:var(--text-secondary);margin-bottom:2px">' +
+                escHtml(p.first_author || '') + ' ' + (p.year || '') +
+                (p.journal ? ' &middot; ' + escHtml(p.journal) : '') +
+                (p.publisher ? ' &middot; <span class="badge badge-neutral">' + escHtml(p.publisher) + '</span>' : '') +
+            '</div>' +
+            (p.doi ? '<div style="font-family:var(--mono);font-size:11px"><a href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">' + escHtml(p.doi) + '</a></div>' : '') +
+            (ezproxy ? '<div style="font-family:var(--mono);font-size:11px;color:var(--text-secondary);margin-top:2px;word-break:break-all">EZproxy: ' + escHtml(ezproxy) + '</div>' : '') +
+            '</div>';
+    }).join('');
+    document.getElementById('ssoQueueList').innerHTML = rows;
+}
+
+function renderSsoManualFallback(data) {
+    const total = data.total || 0;
+    if (total === 0) {
+        document.getElementById('ssoManualList').innerHTML =
+            '<div style="color:var(--success);font-size:13px;padding:8px">&#10003; Nothing left. All SSO-queued papers have been handled.</div>';
+        return;
+    }
+    const rows = data.papers.map(function(p) {
+        return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
+            '<div style="font-weight:500;margin-bottom:4px">' + escHtml(p.title || '(no title)') + '</div>' +
+            '<div style="color:var(--text-secondary);font-size:11px;margin-bottom:4px">' +
+                escHtml(p.first_author || '') + ' ' + (p.year || '') +
+                (p.publisher ? ' &middot; ' + escHtml(p.publisher) : '') +
+                (p.last_failure_code ? ' &middot; <span class="badge badge-warning">' + escHtml(p.last_failure_code) + '</span>' : '') +
+            '</div>' +
+            (p.doi ? '<div style="font-family:var(--mono);font-size:11px;margin-bottom:2px">DOI: <a href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">' + escHtml(p.doi) + '</a></div>' : '') +
+            (p.ezproxy_url ? '<div style="font-family:var(--mono);font-size:11px;margin-bottom:6px"><a href="' + escAttr(p.ezproxy_url) + '" target="_blank" rel="noopener">Open via EZproxy &rarr;</a></div>' : '') +
+            '<button class="btn btn-sm btn-success" onclick="ssoMarkRetrieved(\'' + escAttr(p.canonical_id) + '\')">Mark as Retrieved</button>' +
+            '</div>';
+    }).join('');
+    document.getElementById('ssoManualList').innerHTML = rows;
+}
+
+// SSE-driven renderer for the live session state (phase, progress, timer).
+// Called from handleStreamEvent.
+function renderSsoFromStream(sso) {
+    if (!sso) return;
+
+    // Phase badge (top-right of panel)
+    const phaseBadge = document.getElementById('ssoPhaseBadge');
+    phaseBadge.textContent = sso.phase || 'idle';
+    phaseBadge.className = 'badge ' + ({
+        idle: 'badge-neutral',
+        waiting_login: 'badge-warning',
+        downloading: 'badge-info',
+        paused_reauth: 'badge-warning',
+        ended: 'badge-neutral',
+    }[sso.phase] || 'badge-neutral');
+
+    // Session card
+    const sessionBadge = document.getElementById('ssoSessionBadge');
+    if (sso.active) {
+        if (sso.session_expired) {
+            sessionBadge.textContent = 'Session expired'; sessionBadge.className = 'badge badge-danger';
+        } else if (sso.login_detected_at) {
+            sessionBadge.textContent = 'Active'; sessionBadge.className = 'badge badge-success';
+        } else {
+            sessionBadge.textContent = 'Waiting for login'; sessionBadge.className = 'badge badge-warning';
+        }
+    } else {
+        sessionBadge.textContent = 'Not started'; sessionBadge.className = 'badge badge-neutral';
+    }
+    document.getElementById('btnSsoSessionStart').disabled = !!sso.active;
+    document.getElementById('btnSsoSessionEnd').disabled = !sso.active;
+
+    if (sso.last_message) {
+        document.getElementById('ssoSessionMessage').textContent = sso.last_message;
+    }
+
+    // Session timer
+    if (sso.login_detected_at && sso.active) {
+        const secs = Math.max(0, Math.floor(sso.session_duration_s || 0));
+        const mins = Math.floor(secs / 60);
+        const rem = secs % 60;
+        document.getElementById('ssoSessionTimer').textContent =
+            'Session active for ' + mins + 'm ' + rem + 's';
+    } else if (sso.ended_at) {
+        document.getElementById('ssoSessionTimer').textContent = 'Session ended.';
+    } else {
+        document.getElementById('ssoSessionTimer').textContent = '';
+    }
+
+    // Download card — only show once downloading or beyond
+    const showDownload = ['downloading', 'paused_reauth', 'ended'].indexOf(sso.phase) >= 0;
+    document.getElementById('ssoDownloadCard').style.display = showDownload ? 'block' : 'none';
+
+    const total = sso.queue_total || 0;
+    const done = sso.queue_processed || 0;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    document.getElementById('ssoProgressBar').style.width = pct + '%';
+    document.getElementById('ssoProgressText').textContent = done + ' / ' + total + ' papers';
+    document.getElementById('ssoProgressPercent').textContent = pct + '%';
+    document.getElementById('ssoSucceeded').textContent = sso.queue_succeeded || 0;
+    document.getElementById('ssoManualStill').textContent = sso.queue_manual || 0;
+
+    // Current paper block
+    const cur = document.getElementById('ssoCurrentPaper');
+    if (sso.current_paper_id) {
+        cur.style.color = sso.session_expired ? 'var(--danger)' : 'var(--text-primary)';
+        cur.innerHTML =
+            '<strong>' + (sso.session_expired ? 'Paused on:' : 'Processing:') + '</strong> ' +
+            escHtml(sso.current_paper_title || sso.current_paper_id);
+    } else if (sso.phase === 'ended') {
+        cur.innerHTML = '<strong>Queue finished.</strong> See Step 5 for any remaining manual items.';
+    } else {
+        cur.innerHTML = '';
+    }
+}
+
+document.getElementById('btnSsoSessionStart').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/sso/session/start');
+        toast('SSO browser opened — log in with your credentials', 'info');
+        document.getElementById('ssoSessionMessage').textContent = data.message || '';
+    } catch (err) { toast(err.message, 'error'); }
 });
-document.getElementById('btnSsoContinue').addEventListener('click', async function() {
-    try { const data = await POST('/api/sso/continue'); document.getElementById('ssoMessage').textContent = data.message; loadSsoStatus(); toast(data.status === 'sso_active' ? 'SSO confirmed' : 'Session uncertain', data.status === 'sso_active' ? 'success' : 'warning'); } catch (err) { toast(err.message, 'error'); }
+document.getElementById('btnSsoSessionEnd').addEventListener('click', async function() {
+    if (!confirm('End the SSO session? The browser will close and any unprocessed papers will remain in the SSO queue for next time.')) return;
+    try {
+        const data = await POST('/api/sso/session/end');
+        toast('Session ended. ' + (data.queue_succeeded || 0) + ' retrieved, ' + (data.queue_manual || 0) + ' still manual', 'success');
+        loadSsoStatus();  // refresh queue + manual list
+    } catch (err) { toast(err.message, 'error'); }
 });
-document.getElementById('btnSsoReauth').addEventListener('click', async function() {
-    try { const data = await POST('/api/sso/reauth'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('Re-auth started', 'info'); } catch (err) { toast(err.message, 'error'); }
+document.getElementById('btnSsoReloadQueue').addEventListener('click', async function() {
+    try { const q = await GET('/api/sso/queue'); renderSsoQueue(q); } catch (err) { toast(err.message, 'error'); }
 });
+document.getElementById('btnSsoReloadManual').addEventListener('click', async function() {
+    try { const m = await GET('/api/sso/manual-fallback'); renderSsoManualFallback(m); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnSsoExportManualCsv').addEventListener('click', function() {
+    window.location.href = '/api/sso/manual-fallback/csv';
+});
+
+window.ssoMarkRetrieved = async function(canonicalId) {
+    const note = prompt('Optional note (e.g. how you got it):') || '';
+    try {
+        await POST('/api/sso/paper/' + encodeURIComponent(canonicalId) + '/mark-retrieved?note=' + encodeURIComponent(note));
+        toast('Marked as manually retrieved', 'success');
+        const m = await GET('/api/sso/manual-fallback');
+        renderSsoManualFallback(m);
+    } catch (err) { toast(err.message, 'error'); }
+};
 
 /* ------------------------------------------------------------------
    CAPTCHA
