@@ -1,0 +1,579 @@
+# Built-in synonym map for variable header resolution.
+# Format: canonical_name: [list of accepted string variants]
+# Used by utils/variable_dictionary.py resolve() function.
+
+sample_size:
+  - "N"
+  - "n"
+  - "total enrolled"
+  - "number of participants"
+  - "total N"
+  - "sample size"
+  - "participants"
+  - "patients"
+  - "subjects"
+  - "total randomised"
+  - "total randomized"
+  - "enrolled"
+
+mean_age:
+  - "mean age"
+  - "age mean"
+  - "average age"
+  - "age (mean)"
+  - "age (years)"
+  - "age years"
+
+age_sd:
+  - "age SD"
+  - "age standard deviation"
+  - "SD age"
+  - "age (SD)"
+  - "age ± SD"
+
+sex_ratio_male:
+  - "% male"
+  - "male (%)"
+  - "proportion male"
+  - "males"
+  - "sex ratio male"
+  - "male sex"
+  - "gender male"
+  - "% men"
+  - "men (%)"
+
+bmi_mean:
+  - "BMI"
+  - "mean BMI"
+  - "body mass index"
+  - "BMI mean"
+  - "average BMI"
+
+dropout_rate:
+  - "dropout rate"
+  - "attrition"
+  - "loss to follow-up"
+  - "withdrawal rate"
+  - "dropout"
+  - "lost to follow-up"
+  - "attrition rate"
+
+follow_up_duration:
+  - "follow-up duration"
+  - "follow-up"
+  - "follow up"
+  - "duration of follow-up"
+  - "observation period"
+  - "study duration"
+  - "length of follow-up"
+
+mean:
+  - "mean"
+  - "average"
+  - "arithmetic mean"
+  - "Mean"
+
+sd:
+  - "SD"
+  - "standard deviation"
+  - "std dev"
+  - "std"
+  - "s.d."
+  - "Std Dev"
+
+sem:
+  - "SEM"
+  - "standard error"
+  - "standard error of the mean"
+  - "SE"
+  - "s.e.m."
+  - "s.e."
+
+median:
+  - "median"
+  - "Median"
+  - "50th percentile"
+
+iqr_lower:
+  - "IQR lower"
+  - "Q1"
+  - "25th percentile"
+  - "lower IQR"
+  - "IQR lower bound"
+  - "first quartile"
+
+iqr_upper:
+  - "IQR upper"
+  - "Q3"
+  - "75th percentile"
+  - "upper IQR"
+  - "IQR upper bound"
+  - "third quartile"
+
+ci_lower:
+  - "CI lower"
+  - "lower CI"
+  - "lower bound"
+  - "lower 95% CI"
+  - "95% CI lower"
+  - "lower confidence interval"
+  - "LCL"
+  - "lower limit"
+
+ci_upper:
+  - "CI upper"
+  - "upper CI"
+  - "upper bound"
+  - "upper 95% CI"
+  - "95% CI upper"
+  - "upper confidence interval"
+  - "UCL"
+  - "upper limit"
+
+p_value:
+  - "p-value"
+  - "p value"
+  - "P value"
+  - "P-value"
+  - "p"
+  - "probability value"
+  - "significance"
+  - "p-val"
+
+event_count:
+  - "event count"
+  - "events"
+  - "number of events"
+  - "n events"
+  - "event n"
+  - "outcome events"
+  - "number of outcomes"
+
+event_rate:
+  - "event rate"
+  - "incidence rate"
+  - "rate"
+  - "events per person-year"
+  - "incidence"
+  - "outcome rate"
+
+hazard_ratio:
+  - "HR"
+  - "hazard ratio"
+  - "Cox HR"
+  - "adjusted hazard ratio"
+  - "aHR"
+  - "crude HR"
+  - "Hazard Ratio"
+
+odds_ratio:
+  - "OR"
+  - "odds ratio"
+  - "adjusted OR"
+  - "crude OR"
+  - "aOR"
+  - "Odds Ratio"
+
+risk_ratio:
+  - "RR"
+  - "risk ratio"
+  - "relative risk"
+  - "rate ratio"
+  - "Risk Ratio"
+  - "Relative Risk"
+
+mean_difference:
+  - "MD"
+  - "mean difference"
+  - "difference in means"
+  - "WMD"
+  - "weighted mean difference"
+  - "Mean Difference"
+
+absolute_risk_reduction:
+  - "ARR"
+  - "absolute risk reduction"
+  - "risk difference"
+  - "RD"
+  - "absolute risk difference"
+
+nnt:
+  - "NNT"
+  - "number needed to treat"
+  - "NNH"
+  - "number needed to harm"
+
+cohens_d:
+  - "Cohen's d"
+  - "d"
+  - "effect size d"
+  - "standardised mean difference"
+  - "SMD"
+  - "Hedges' g"
+
+sensitivity:
+  - "sensitivity"
+  - "true positive rate"
+  - "TPR"
+  - "Sn"
+  - "recall"
+
+specificity:
+  - "specificity"
+  - "true negative rate"
+  - "TNR"
+  - "Sp"
+
+auc:
+  - "AUC"
+  - "area under the curve"
+  - "AUROC"
+  - "c-statistic"
+  - "C statistic"
+  - "AUC-ROC"
+  - "ROC AUC"
+
+icer:
+  - "ICER"
+  - "incremental cost-effectiveness ratio"
+  - "cost per QALY"
+  - "cost-effectiveness ratio"
+
+# RoB 2 domains
+rob2_randomisation:
+  - "D1"
+  - "domain 1"
+  - "randomisation"
+  - "randomization"
+  - "random sequence generation"
+  - "allocation sequence"
+
+rob2_allocation_concealment:
+  - "D2"
+  - "domain 2"
+  - "allocation concealment"
+  - "concealment of allocation"
+  - "deviations from intended interventions"
+
+rob2_blinding:
+  - "D3"
+  - "domain 3"
+  - "blinding"
+  - "masking"
+  - "missing outcome data"
+
+rob2_outcome_measurement:
+  - "D4"
+  - "domain 4"
+  - "outcome measurement"
+  - "measurement of outcomes"
+  - "blinding of outcome assessment"
+
+rob2_selective_reporting:
+  - "D5"
+  - "domain 5"
+  - "selective reporting"
+  - "selection of reported results"
+  - "reporting bias"
+
+# ROBINS-I domains
+robins_i_confounding:
+  - "D1"
+  - "confounding"
+  - "bias due to confounding"
+
+robins_i_selection:
+  - "D2"
+  - "selection of participants"
+  - "selection bias"
+
+robins_i_classification:
+  - "D3"
+  - "classification of interventions"
+  - "intervention classification"
+
+robins_i_deviations:
+  - "D4"
+  - "deviations from intended interventions"
+  - "co-interventions"
+
+robins_i_missing_data:
+  - "D5"
+  - "missing data"
+  - "incomplete outcome data"
+
+robins_i_outcome_measurement:
+  - "D6"
+  - "measurement of outcomes"
+  - "outcome measurement bias"
+
+robins_i_selective_reporting:
+  - "D7"
+  - "selective reporting"
+  - "reporting bias"
+
+# QUADAS-2 domains
+quadas2_patient_selection:
+  - "D1"
+  - "patient selection"
+  - "participant selection"
+
+quadas2_index_test:
+  - "D2"
+  - "index test"
+  - "index test blinding"
+
+quadas2_reference_standard:
+  - "D3"
+  - "reference standard"
+  - "reference test"
+
+quadas2_flow_timing:
+  - "D4"
+  - "flow and timing"
+  - "patient flow"
+  - "timing"
+
+# NOS cohort items
+nos_cohort_representativeness:
+  - "representativeness of exposed cohort"
+  - "selection of exposed cohort"
+  - "exposed cohort"
+
+nos_cohort_selection_unexposed:
+  - "selection of non-exposed cohort"
+  - "non-exposed cohort"
+  - "unexposed cohort"
+
+nos_cohort_ascertainment_exposure:
+  - "ascertainment of exposure"
+  - "exposure ascertainment"
+
+nos_cohort_outcome_not_present:
+  - "outcome not present at start"
+  - "demonstration that outcome was not present at start"
+
+nos_cohort_comparability:
+  - "comparability of cohorts"
+  - "cohort comparability"
+
+nos_cohort_assessment_outcome:
+  - "assessment of outcome"
+  - "outcome assessment"
+
+nos_cohort_follow_up_length:
+  - "adequate follow-up length"
+  - "follow-up length"
+  - "adequacy of follow-up"
+
+nos_cohort_adequacy_follow_up:
+  - "adequacy of follow-up"
+  - "completeness of follow-up"
+  - "follow-up completeness"
+
+# NOS case-control items
+nos_cc_case_definition:
+  - "adequate case definition"
+  - "case definition"
+  - "definition of cases"
+
+nos_cc_representativeness_cases:
+  - "representativeness of cases"
+  - "case representativeness"
+
+nos_cc_selection_controls:
+  - "selection of controls"
+  - "control selection"
+
+nos_cc_definition_controls:
+  - "definition of controls"
+  - "control definition"
+
+nos_cc_comparability:
+  - "comparability of cases and controls"
+  - "case-control comparability"
+
+nos_cc_ascertainment_exposure:
+  - "ascertainment of exposure"
+  - "exposure ascertainment"
+
+nos_cc_same_method:
+  - "same method of ascertainment"
+  - "non-response rate"
+
+nos_cc_non_response:
+  - "non-response rate"
+  - "response rate"
+
+# AMSTAR 2 items
+amstar2_pico:
+  - "PICO components"
+  - "research question PICO"
+  - "population intervention comparison outcome"
+
+amstar2_protocol:
+  - "established protocol"
+  - "review protocol"
+  - "a priori protocol"
+
+amstar2_study_designs:
+  - "study designs"
+  - "explanation for study designs"
+  - "included study designs"
+
+amstar2_search_strategy:
+  - "comprehensive search strategy"
+  - "literature search"
+  - "search strategy"
+
+amstar2_duplicate_selection:
+  - "duplicate study selection"
+  - "duplicate selection"
+  - "independent study selection"
+
+amstar2_duplicate_extraction:
+  - "duplicate data extraction"
+  - "independent data extraction"
+  - "duplicate extraction"
+
+amstar2_excluded_studies:
+  - "excluded studies"
+  - "list of excluded studies"
+  - "study exclusions"
+
+amstar2_included_studies:
+  - "included studies described"
+  - "description of included studies"
+  - "study characteristics"
+
+amstar2_rob_assessment:
+  - "risk of bias assessment"
+  - "RoB assessment"
+  - "quality assessment"
+
+amstar2_funding:
+  - "funding sources"
+  - "funding of included studies"
+  - "conflict of interest"
+
+amstar2_meta_analysis_methods:
+  - "appropriate methods for meta-analysis"
+  - "meta-analysis methods"
+  - "statistical combination"
+
+amstar2_rob_impact:
+  - "impact of RoB"
+  - "potential impact of RoB"
+  - "sensitivity analysis"
+
+amstar2_heterogeneity:
+  - "heterogeneity"
+  - "between-study heterogeneity"
+  - "statistical heterogeneity"
+
+amstar2_publication_bias:
+  - "publication bias"
+  - "small study effects"
+  - "reporting bias assessment"
+
+amstar2_conflicts:
+  - "conflicts of interest"
+  - "COI"
+  - "financial conflicts"
+
+amstar2_overall:
+  - "overall confidence"
+  - "overall rating"
+  - "AMSTAR overall"
+
+# JBI Cross-Sectional items
+jbi_cs_inclusion_criteria:
+  - "inclusion criteria"
+  - "eligibility criteria"
+  - "study inclusion criteria"
+
+jbi_cs_participants:
+  - "participants described"
+  - "study subjects described"
+  - "participant description"
+
+jbi_cs_exposure:
+  - "exposure measured"
+  - "exposure measurement"
+  - "valid and reliable exposure"
+
+jbi_cs_objective_criteria:
+  - "objective criteria"
+  - "standard criteria for conditions"
+  - "objective standard criteria"
+
+jbi_cs_confounders:
+  - "confounders identified"
+  - "confounding factors"
+  - "potential confounders"
+
+jbi_cs_strategies:
+  - "strategies to deal with confounders"
+  - "confounder control"
+  - "confounder strategies"
+
+jbi_cs_outcomes:
+  - "outcomes measured"
+  - "outcome measurement"
+  - "valid reliable outcomes"
+
+jbi_cs_statistical:
+  - "appropriate statistical analysis"
+  - "statistical analysis"
+  - "analysis methods"
+
+# Economic items
+economic_study_question:
+  - "study question"
+  - "research question"
+  - "economic question"
+
+economic_alternatives:
+  - "alternatives compared"
+  - "comparators"
+  - "competing alternatives"
+
+economic_effectiveness:
+  - "effectiveness established"
+  - "clinical effectiveness"
+  - "evidence of effectiveness"
+
+economic_costs:
+  - "costs identified"
+  - "cost identification"
+  - "relevant costs"
+
+economic_outcomes:
+  - "outcomes measured"
+  - "outcome measurement"
+  - "health outcomes"
+
+economic_time_horizon:
+  - "time horizon"
+  - "time frame"
+  - "study time horizon"
+
+economic_discount_rate:
+  - "discount rate"
+  - "discounting"
+  - "discount rate stated"
+
+economic_sensitivity_analysis:
+  - "sensitivity analysis"
+  - "uncertainty analysis"
+  - "SA performed"
+
+economic_incremental_analysis:
+  - "incremental analysis"
+  - "ICER"
+  - "incremental cost"
+
+economic_equity:
+  - "equity considerations"
+  - "distributional effects"
+  - "equity"
