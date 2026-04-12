@@ -562,3 +562,366 @@
         }
     </style>
 </head>
+<body>
+<div class="toast-container" id="toastContainer"></div>
+
+<div class="app-container">
+    <!-- ============================================================
+         SIDEBAR
+         ============================================================ -->
+    <aside class="sidebar">
+        <h1>FT Acquisition</h1>
+        <nav>
+            <div class="nav-item active" data-panel="upload">
+                <span class="nav-icon">&#128194;</span> Upload
+            </div>
+            <div class="nav-item" data-panel="settings">
+                <span class="nav-icon">&#9881;</span> Settings
+            </div>
+            <div class="nav-item" data-panel="health">
+                <span class="nav-icon">&#128200;</span> Health
+            </div>
+            <div class="nav-item" data-panel="run">
+                <span class="nav-icon">&#9654;</span> Run
+            </div>
+            <div class="nav-item" data-panel="sso">
+                <span class="nav-icon">&#128274;</span> SSO
+            </div>
+            <div class="nav-item" data-panel="results">
+                <span class="nav-icon">&#128203;</span> Results
+            </div>
+        </nav>
+        <div style="padding:20px; margin-top:auto; font-size:11px; opacity:0.4;">
+            <div id="sidebarOcr">OCR: checking...</div>
+            <div id="sidebarWorkers">Workers: idle</div>
+        </div>
+    </aside>
+
+    <main class="main-content">
+        <!-- ============================================================
+             PANEL 1: UPLOAD
+             ============================================================ -->
+        <div id="panelUpload" class="panel active">
+            <div class="panel-header">
+                <h2>Upload Papers</h2>
+            </div>
+
+            <div class="card">
+                <div class="drop-zone" id="dropZone">
+                    <div class="drop-zone-icon">&#128196;</div>
+                    <div class="drop-zone-text">
+                        <strong>Click to upload</strong> or drag and drop<br>
+                        CSV, TSV, or Excel (.xlsx) from Rayyan or Covidence
+                    </div>
+                    <input type="file" id="fileInput" accept=".csv,.tsv,.xlsx,.xls" style="display:none">
+                </div>
+            </div>
+
+            <!-- Upload progress -->
+            <div class="card" id="uploadProgress" style="display:none">
+                <h3>Processing...</h3>
+                <div class="progress-container" style="margin-top:12px">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="uploadProgressBar" style="width:50%"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Upload results -->
+            <div class="card" id="uploadResults" style="display:none">
+                <div class="card-header">
+                    <h3>Ingestion Summary</h3>
+                    <span class="badge badge-success" id="uploadRunId"></span>
+                </div>
+
+                <div class="card-grid" style="margin-bottom:16px">
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadTotal">0</div>
+                        <div class="metric-label">Total Submitted</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadDedup">0</div>
+                        <div class="metric-label">Duplicates Removed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadAlready">0</div>
+                        <div class="metric-label">Already Retrieved</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadReady">0</div>
+                        <div class="metric-label">Ready for Retrieval</div>
+                    </div>
+                </div>
+
+                <!-- Column mapping -->
+                <div class="card-header"><h3>Detected Columns</h3></div>
+                <div class="form-row" id="columnMapping" style="margin-bottom:16px"></div>
+
+                <!-- Preview table -->
+                <div class="card-header"><h3>Preview (first 10 rows)</h3></div>
+                <div class="table-container">
+                    <table id="previewTable">
+                        <thead><tr id="previewHead"></tr></thead>
+                        <tbody id="previewBody"></tbody>
+                    </table>
+                </div>
+
+                <div style="margin-top:16px">
+                    <button class="btn btn-primary" id="btnStartAfterUpload">Start Retrieval</button>
+                </div>
+            </div>
+
+            <!-- Deduplication report -->
+            <div class="card" id="dedupReport" style="display:none">
+                <div class="card-header"><h3>Deduplication Report</h3></div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>Paper A</th><th>Paper B</th><th>Match Type</th><th>Score</th></tr>
+                        </thead>
+                        <tbody id="dedupBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             PANEL 2: SETTINGS
+             ============================================================ -->
+        <div id="panelSettings" class="panel">
+            <div class="panel-header">
+                <h2>Settings</h2>
+                <button class="btn btn-primary" id="btnSaveSettings">Save Settings</button>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>System Status</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>OCR Status</label>
+                        <div id="settingsOcrStatus" class="badge badge-neutral" style="font-size:13px">Checking...</div>
+                        <div class="form-hint">Read-only. Install Tesseract + Ghostscript to enable.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Playwright</label>
+                        <div id="settingsPlaywright" class="badge badge-neutral">Checking...</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Python Version</label>
+                        <div id="settingsPython"></div>
+                    </div>
+                    <div class="form-group">
+                        <label>Platform</label>
+                        <div id="settingsPlatform"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Timeouts (seconds)</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>API Request</label>
+                        <input type="number" class="form-control" id="cfgApiTimeout" step="1" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label>PDF Download</label>
+                        <input type="number" class="form-control" id="cfgPdfTimeout" step="1" min="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Page Load</label>
+                        <input type="number" class="form-control" id="cfgPageLoad" step="1" min="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Selector Wait</label>
+                        <input type="number" class="form-control" id="cfgSelectorTimeout" step="1" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label>PDF Validation</label>
+                        <input type="number" class="form-control" id="cfgValidationTimeout" step="1" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label>OCR Per Page</label>
+                        <input type="number" class="form-control" id="cfgOcrTimeout" step="1" min="5">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Concurrency & Limits</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Retrieval Workers (1-5)</label>
+                        <input type="number" class="form-control" id="cfgRetrievalConc" min="1" max="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Validation Workers (1-3)</label>
+                        <input type="number" class="form-control" id="cfgValidationConc" min="1" max="3">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Retries</label>
+                        <input type="number" class="form-control" id="cfgMaxRetries" min="1" max="10">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Total Attempts</label>
+                        <input type="number" class="form-control" id="cfgMaxAttempts" min="1" max="50">
+                    </div>
+                    <div class="form-group">
+                        <label>Backpressure Threshold</label>
+                        <input type="number" class="form-control" id="cfgBackpressure" min="1" max="100">
+                    </div>
+                    <div class="form-group">
+                        <label>Min Disk Space (MB)</label>
+                        <input type="number" class="form-control" id="cfgDiskSpace" min="100" step="100">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Publisher Cooldowns</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Failure Threshold (0-1)</label>
+                        <input type="number" class="form-control" id="cfgCooldownThreshold" min="0" max="1" step="0.05">
+                    </div>
+                    <div class="form-group">
+                        <label>Window Size</label>
+                        <input type="number" class="form-control" id="cfgCooldownWindow" min="5" max="100">
+                    </div>
+                    <div class="form-group">
+                        <label>Cooldown Minutes</label>
+                        <input type="number" class="form-control" id="cfgCooldownMinutes" min="1" max="60">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Institutional Access</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>EZproxy URL</label>
+                        <input type="url" class="form-control" id="cfgEzproxy" placeholder="https://proxy.university.edu">
+                    </div>
+                    <div class="form-group">
+                        <label>OpenAthens URL</label>
+                        <input type="url" class="form-control" id="cfgOpenAthens" placeholder="https://...">
+                    </div>
+                    <div class="form-group">
+                        <label>Institutional Resolver</label>
+                        <input type="url" class="form-control" id="cfgResolver" placeholder="https://resolver.university.edu">
+                    </div>
+                    <div class="form-group">
+                        <label>Unpaywall Email</label>
+                        <input type="email" class="form-control" id="cfgUnpaywallEmail" placeholder="your@email.edu">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>API Cache</h3>
+                    <button class="btn btn-outline btn-sm" id="btnClearCache">Clear Cache</button>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Cache TTL (days)</label>
+                        <input type="number" class="form-control" id="cfgCacheTtl" min="1" max="90">
+                    </div>
+                    <div class="form-group">
+                        <label>Active Entries</label>
+                        <div id="cacheActiveCount" style="padding:8px 0; font-weight:600">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>Setup Wizard</h3>
+                    <button class="btn btn-outline btn-sm" id="btnRerunWizard">Re-run Wizard</button>
+                </div>
+                <div id="wizardResults" style="font-size:13px; color:var(--text-secondary)">
+                    Click "Re-run Wizard" to check system dependencies.
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             PANEL 3: HEALTH DASHBOARD
+             ============================================================ -->
+        <div id="panelHealth" class="panel">
+            <div class="panel-header">
+                <h2>Health Dashboard</h2>
+                <span class="badge badge-info" id="healthLive">LIVE</span>
+            </div>
+
+            <div class="card-grid" id="healthMetrics">
+                <div class="metric-card">
+                    <div class="metric-value" id="hSuccessRate">-</div>
+                    <div class="metric-label">Retrieval Success Rate</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hAvgAttempts">-</div>
+                    <div class="metric-label">Avg Attempts / Paper</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hAvgTime">-</div>
+                    <div class="metric-label">Avg Retrieval Time</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hCacheRate">-</div>
+                    <div class="metric-label">Cache Hit Rate</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hTotal">0</div>
+                    <div class="metric-label">Total Papers</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value score-high" id="hCompleted">0</div>
+                    <div class="metric-label">Completed</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value score-low" id="hFailed">0</div>
+                    <div class="metric-label">Failed</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hManual">0</div>
+                    <div class="metric-label">Manual Required</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Queue Status</h3></div>
+                <div class="card-grid">
+                    <div class="metric-card">
+                        <div class="metric-value" id="hRetrievalQueue">0</div>
+                        <div class="metric-label">Retrieval Queue</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="hValidationQueue">0</div>
+                        <div class="metric-label">Validation Queue</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="hBackpressure">0 / 20</div>
+                        <div class="metric-label">Backpressure (Weighted / Threshold)</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="hDiskSpace">-</div>
+                        <div class="metric-label">Disk Space Free</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Active Cooldowns</h3></div>
+                <div id="healthCooldowns">
+                    <div style="color:var(--text-secondary); font-size:13px">No active cooldowns</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Paywall Detections by Publisher</h3></div>
+                <div id="healthPaywalls">
+                    <div style="color:var(--text-secondary); font-size:13px">No paywall events</div>
+                </div>
+            </div>
+        </div>
