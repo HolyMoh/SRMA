@@ -1419,3 +1419,247 @@ class Database:
             return cursor.rowcount
 
         return await self._enqueue_write(_do_bulk_reset, canonical_ids, retry_type)
+
+    # -----------------------------------------------------------------------
+    # Run management
+    # -----------------------------------------------------------------------
+
+    async def create_run(self, run_record: RunRecord) -> bool:
+        """Insert a new run record."""
+
+        async def _do_insert(
+            conn: aiosqlite.Connection, rec: RunRecord
+        ) -> bool:
+            d = rec.to_dict()
+            columns = ", ".join(d.keys())
+            placeholders = ", ".join("?" for _ in d)
+            cursor = await conn.execute(
+                f"INSERT OR IGNORE INTO runs ({columns}) VALUES ({placeholders})",
+                tuple(d.values()),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_insert, run_record)
+
+    async def complete_run(
+        self,
+        run_id: str,
+        status: str = RunStatus.COMPLETED.value,
+    ) -> bool:
+        """Mark a run as completed with a timestamp."""
+
+        async def _do_complete(
+            conn: aiosqlite.Connection,
+            rid: str,
+            st: str,
+        ) -> bool:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = await conn.execute(
+                "UPDATE runs SET completed_at = ?, status = ? WHERE run_id = ?",
+                (now, st, rid),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_complete, run_id, status)
+
+    async def get_run(self, run_id: str) -> Optional[RunRecord]:
+        """Fetch a single run record by run_id."""
+        row = await self.read_one(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        )
+        if row is None:
+            return None
+        return RunRecord(
+            run_id=row["run_id"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            status=row["status"],
+            total_submitted=row["total_submitted"],
+            config_snapshot=row["config_snapshot"],
+        )
+
+    async def list_runs(self, limit: int = 50) -> List[RunRecord]:
+        """List all runs ordered by most recent first."""
+        rows = await self.read_all(
+            "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            RunRecord(
+                run_id=row["run_id"],
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                status=row["status"],
+                total_submitted=row["total_submitted"],
+                config_snapshot=row["config_snapshot"],
+            )
+            for row in rows
+        ]
+
+    async def update_run_submitted_count(
+        self, run_id: str, total_submitted: int
+    ) -> bool:
+        """Update the total_submitted count on a run record."""
+
+        async def _do_update(
+            conn: aiosqlite.Connection, rid: str, count: int
+        ) -> bool:
+            cursor = await conn.execute(
+                "UPDATE runs SET total_submitted = ? WHERE run_id = ?",
+                (count, rid),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_update, run_id, total_submitted)
+
+    # -----------------------------------------------------------------------
+    # Paper-run linkage
+    # -----------------------------------------------------------------------
+
+    async def create_paper_run(self, paper_run: PaperRun) -> bool:
+        """Insert a paper-run linkage record."""
+
+        async def _do_insert(
+            conn: aiosqlite.Connection, pr: PaperRun
+        ) -> bool:
+            d = pr.to_dict()
+            # Convert booleans for SQLite
+            for bool_field in (
+                "submitted_in_this_run",
+                "retrieval_attempted_in_this_run",
+            ):
+                if bool_field in d:
+                    d[bool_field] = int(d[bool_field])
+
+            columns = ", ".join(d.keys())
+            placeholders = ", ".join("?" for _ in d)
+            cursor = await conn.execute(
+                f"INSERT OR IGNORE INTO paper_runs ({columns}) "
+                f"VALUES ({placeholders})",
+                tuple(d.values()),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_insert, paper_run)
+
+    async def create_paper_runs_bulk(self, paper_runs: List[PaperRun]) -> int:
+        """Insert multiple paper-run records in a single transaction."""
+
+        async def _do_bulk(
+            conn: aiosqlite.Connection, prs: List[PaperRun]
+        ) -> int:
+            if not prs:
+                return 0
+            inserted = 0
+            for pr in prs:
+                d = pr.to_dict()
+                for bool_field in (
+                    "submitted_in_this_run",
+                    "retrieval_attempted_in_this_run",
+                ):
+                    if bool_field in d:
+                        d[bool_field] = int(d[bool_field])
+
+                columns = ", ".join(d.keys())
+                placeholders = ", ".join("?" for _ in d)
+                cursor = await conn.execute(
+                    f"INSERT OR IGNORE INTO paper_runs ({columns}) "
+                    f"VALUES ({placeholders})",
+                    tuple(d.values()),
+                )
+                inserted += cursor.rowcount
+            await conn.commit()
+            return inserted
+
+        return await self._enqueue_write(_do_bulk, paper_runs)
+
+    async def update_paper_run_outcome(
+        self,
+        canonical_id: str,
+        run_id: str,
+        outcome: str,
+        retrieval_attempted: bool = False,
+    ) -> bool:
+        """Update the outcome and retrieval_attempted flag for a paper-run."""
+
+        async def _do_update(
+            conn: aiosqlite.Connection,
+            cid: str,
+            rid: str,
+            out: str,
+            attempted: bool,
+        ) -> bool:
+            cursor = await conn.execute(
+                "UPDATE paper_runs SET outcome_in_this_run = ?, "
+                "retrieval_attempted_in_this_run = ? "
+                "WHERE canonical_id = ? AND run_id = ?",
+                (out, int(attempted), cid, rid),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(
+            _do_update, canonical_id, run_id, outcome, retrieval_attempted
+        )
+
+    async def get_paper_runs_for_run(
+        self, run_id: str
+    ) -> List[PaperRun]:
+        """Fetch all paper-run linkage records for a given run."""
+        rows = await self.read_all(
+            "SELECT * FROM paper_runs WHERE run_id = ?", (run_id,)
+        )
+        return [
+            PaperRun(
+                canonical_id=row["canonical_id"],
+                run_id=row["run_id"],
+                submitted_in_this_run=bool(row["submitted_in_this_run"]),
+                retrieval_attempted_in_this_run=bool(
+                    row["retrieval_attempted_in_this_run"]
+                ),
+                outcome_in_this_run=row["outcome_in_this_run"],
+            )
+            for row in rows
+        ]
+
+    async def get_paper_run_history(
+        self, canonical_id: str
+    ) -> List[PaperRun]:
+        """Fetch all run linkage records for a given paper across all runs."""
+        rows = await self.read_all(
+            "SELECT * FROM paper_runs WHERE canonical_id = ? "
+            "ORDER BY run_id ASC",
+            (canonical_id,),
+        )
+        return [
+            PaperRun(
+                canonical_id=row["canonical_id"],
+                run_id=row["run_id"],
+                submitted_in_this_run=bool(row["submitted_in_this_run"]),
+                retrieval_attempted_in_this_run=bool(
+                    row["retrieval_attempted_in_this_run"]
+                ),
+                outcome_in_this_run=row["outcome_in_this_run"],
+            )
+            for row in rows
+        ]
+
+    async def check_already_retrieved(
+        self, canonical_id: str
+    ) -> Optional[str]:
+        """Check if a paper was already successfully retrieved in a prior run.
+
+        Returns the originating run_id if COMPLETE, else None.
+        """
+        row = await self.read_one(
+            "SELECT run_id_of_first_success FROM papers "
+            "WHERE canonical_id = ? AND state = ?",
+            (canonical_id, PaperState.COMPLETE.value),
+        )
+        if row and row[0]:
+            return row[0]
+        return None
