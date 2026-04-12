@@ -434,3 +434,305 @@ class Database:
 
         self._initialized = False
         logger.info("Database closed")
+
+    # -----------------------------------------------------------------------
+    # Config migration
+    # -----------------------------------------------------------------------
+
+    async def run_config_migration(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Check config_version and run additive migrations if needed.
+
+        Rules:
+            - Missing config_version → assume version 0, migrate to current.
+            - Version < current → run migration functions in sequence.
+            - Version > current → raise ValueError (warn user and exit).
+            - Migrations are additive only: add missing keys with defaults.
+            - Never delete existing keys.
+
+        Returns the (possibly updated) config dict.
+        """
+        version = config.get("config_version", 0)
+
+        if version > CURRENT_CONFIG_VERSION:
+            raise ValueError(
+                f"Config version {version} is newer than supported "
+                f"version {CURRENT_CONFIG_VERSION}. Please update the application."
+            )
+
+        if version == CURRENT_CONFIG_VERSION:
+            return config
+
+        old_version = version
+        updated = dict(config)
+
+        # Migration 0 → 1: add all default keys that are missing
+        if version < 1:
+            for key, default_value in DEFAULT_CONFIG.items():
+                if key not in updated:
+                    updated[key] = default_value
+            updated["config_version"] = 1
+            version = 1
+
+        # Future migrations would follow the same pattern:
+        # if version < 2:
+        #     updated.setdefault("new_key", "default_value")
+        #     updated["config_version"] = 2
+        #     version = 2
+
+        await self.log_audit(AuditLogEntry(
+            outcome="CONFIG_MIGRATION",
+            details=json.dumps({
+                "old_version": old_version,
+                "new_version": version,
+                "keys_added": [
+                    k for k in updated if k not in config
+                ],
+            }),
+        ))
+
+        logger.info(
+            "Config migrated from version %d to %d",
+            old_version, version,
+        )
+        return updated
+
+    # -----------------------------------------------------------------------
+    # Startup: interrupted state reset
+    # -----------------------------------------------------------------------
+
+    async def reset_interrupted_states(self) -> List[Dict[str, Any]]:
+        """Reset papers stuck in transient states from prior sessions.
+
+        RETRIEVING → READY_FOR_RETRIEVAL
+        VALIDATING → RETRIEVED
+
+        Returns list of reset records for logging.
+        """
+
+        async def _do_reset(
+            conn: aiosqlite.Connection,
+        ) -> List[Dict[str, Any]]:
+            resets: List[Dict[str, Any]] = []
+            now = datetime.now(timezone.utc).isoformat()
+
+            # Find papers in RETRIEVING state
+            cursor = await conn.execute(
+                "SELECT canonical_id, state, run_id FROM papers "
+                "WHERE state = ?",
+                (PaperState.RETRIEVING.value,),
+            )
+            retrieving_rows = await cursor.fetchall()
+
+            for row in retrieving_rows:
+                cid = row[0]
+                prior_state = row[1]
+                origin_run = row[2]
+                await conn.execute(
+                    "UPDATE papers SET state = ?, previous_state = ?, "
+                    "worker_id = NULL, claimed_at = NULL, updated_at = ? "
+                    "WHERE canonical_id = ?",
+                    (
+                        PaperState.READY_FOR_RETRIEVAL.value,
+                        prior_state,
+                        now,
+                        cid,
+                    ),
+                )
+                resets.append({
+                    "canonical_id": cid,
+                    "prior_state": prior_state,
+                    "new_state": PaperState.READY_FOR_RETRIEVAL.value,
+                    "reset_timestamp": now,
+                    "run_id_of_origin": origin_run,
+                })
+
+            # Find papers in VALIDATING state
+            cursor = await conn.execute(
+                "SELECT canonical_id, state, run_id FROM papers "
+                "WHERE state = ?",
+                (PaperState.VALIDATING.value,),
+            )
+            validating_rows = await cursor.fetchall()
+
+            for row in validating_rows:
+                cid = row[0]
+                prior_state = row[1]
+                origin_run = row[2]
+                await conn.execute(
+                    "UPDATE papers SET state = ?, previous_state = ?, "
+                    "worker_id = NULL, claimed_at = NULL, updated_at = ? "
+                    "WHERE canonical_id = ?",
+                    (
+                        PaperState.RETRIEVED.value,
+                        prior_state,
+                        now,
+                        cid,
+                    ),
+                )
+                resets.append({
+                    "canonical_id": cid,
+                    "prior_state": prior_state,
+                    "new_state": PaperState.RETRIEVED.value,
+                    "reset_timestamp": now,
+                    "run_id_of_origin": origin_run,
+                })
+
+            await conn.commit()
+            return resets
+
+        resets = await self._enqueue_write(_do_reset)
+
+        # Log each reset
+        for reset_info in resets:
+            await self.log_audit(AuditLogEntry(
+                canonical_id=reset_info["canonical_id"],
+                run_id=reset_info.get("run_id_of_origin"),
+                outcome="INTERRUPTED_RESET",
+                failure_code=FailureCode.INTERRUPTED_RESET.value,
+                details=json.dumps(reset_info),
+            ))
+
+        if resets:
+            logger.info(
+                "Reset %d interrupted papers (RETRIEVING: %d, VALIDATING: %d)",
+                len(resets),
+                sum(1 for r in resets if r["prior_state"] == PaperState.RETRIEVING.value),
+                sum(1 for r in resets if r["prior_state"] == PaperState.VALIDATING.value),
+            )
+
+        return resets
+
+    # -----------------------------------------------------------------------
+    # Startup: filesystem reconciliation
+    # -----------------------------------------------------------------------
+
+    async def reconcile_filesystem(self) -> List[Dict[str, str]]:
+        """Verify pdf_path exists on disk for papers that should have files.
+
+        Checks papers in RETRIEVED, VALIDATING, VALIDATED, or COMPLETE states.
+        If file is missing:
+            - Log FILE_MISSING
+            - Reset state to READY_FOR_RETRIEVAL
+            - Clear pdf_path, sha256_checksum, pdf_size_bytes, pdf_page_count
+
+        Returns list of papers with missing files.
+        """
+        states_to_check = (
+            PaperState.RETRIEVED.value,
+            PaperState.VALIDATING.value,
+            PaperState.VALIDATED.value,
+            PaperState.COMPLETE.value,
+        )
+        placeholders = ",".join("?" for _ in states_to_check)
+
+        rows = await self.read_all(
+            f"SELECT canonical_id, pdf_path, state FROM papers "
+            f"WHERE state IN ({placeholders}) AND pdf_path IS NOT NULL",
+            states_to_check,
+        )
+
+        missing: List[Dict[str, str]] = []
+
+        for row in rows:
+            cid = row[0]
+            pdf_path = row[1]
+            current_state = row[2]
+
+            if not os.path.isfile(pdf_path):
+                missing.append({
+                    "canonical_id": cid,
+                    "expected_path": pdf_path,
+                    "prior_state": current_state,
+                })
+
+        # Process missing files through write queue
+        if missing:
+            async def _reset_missing(
+                conn: aiosqlite.Connection,
+                missing_list: List[Dict[str, str]],
+            ) -> None:
+                now = datetime.now(timezone.utc).isoformat()
+                for info in missing_list:
+                    await conn.execute(
+                        "UPDATE papers SET state = ?, previous_state = state, "
+                        "pdf_path = NULL, sha256_checksum = NULL, "
+                        "pdf_size_bytes = NULL, pdf_page_count = NULL, "
+                        "updated_at = ? "
+                        "WHERE canonical_id = ?",
+                        (
+                            PaperState.READY_FOR_RETRIEVAL.value,
+                            now,
+                            info["canonical_id"],
+                        ),
+                    )
+                await conn.commit()
+
+            await self._enqueue_write(_reset_missing, missing)
+
+            for info in missing:
+                await self.log_audit(AuditLogEntry(
+                    canonical_id=info["canonical_id"],
+                    outcome="FILE_MISSING",
+                    failure_code=FailureCode.FILE_MISSING.value,
+                    details=json.dumps({
+                        "expected_path": info["expected_path"],
+                        "prior_state": info["prior_state"],
+                    }),
+                ))
+
+            logger.warning(
+                "Filesystem reconciliation: %d papers had missing PDF files, "
+                "reset to READY_FOR_RETRIEVAL",
+                len(missing),
+            )
+
+        return missing
+
+    # -----------------------------------------------------------------------
+    # Shutdown: reset in-progress states
+    # -----------------------------------------------------------------------
+
+    async def reset_shutdown_states(self) -> int:
+        """Reset transient states during graceful shutdown.
+
+        RETRIEVING → READY_FOR_RETRIEVAL
+        VALIDATING → RETRIEVED
+
+        Returns count of papers reset.
+        """
+
+        async def _do_shutdown_reset(conn: aiosqlite.Connection) -> int:
+            now = datetime.now(timezone.utc).isoformat()
+            count = 0
+
+            cursor = await conn.execute(
+                "UPDATE papers SET state = ?, previous_state = state, "
+                "worker_id = NULL, claimed_at = NULL, updated_at = ? "
+                "WHERE state = ?",
+                (
+                    PaperState.READY_FOR_RETRIEVAL.value,
+                    now,
+                    PaperState.RETRIEVING.value,
+                ),
+            )
+            count += cursor.rowcount
+
+            cursor = await conn.execute(
+                "UPDATE papers SET state = ?, previous_state = state, "
+                "worker_id = NULL, claimed_at = NULL, updated_at = ? "
+                "WHERE state = ?",
+                (
+                    PaperState.RETRIEVED.value,
+                    now,
+                    PaperState.VALIDATING.value,
+                ),
+            )
+            count += cursor.rowcount
+
+            await conn.commit()
+            return count
+
+        count = await self._enqueue_write(_do_shutdown_reset)
+        if count > 0:
+            logger.info("Shutdown reset: %d papers returned to safe states", count)
+        return count
