@@ -149,3 +149,258 @@ All transitions are atomic SQLite transactions. No step executes unless the pape
 - **PRISMA 2020** (.csv) — Per-run compliance report with subcategorized counts
 - **Audit Log** (.jsonl) — Complete retrieval/validation event trail
 - **Integration JSON** — Per-paper export for ASReview, extraction pipelines, bias assessment
+
+---
+
+## Installation
+
+### Prerequisites
+
+- **Python 3.9+**
+- **pip** (or your preferred package manager)
+- **Playwright Chromium** (auto-installed on first launch if missing)
+
+Optional for OCR:
+- **Tesseract** — install via system package manager (`apt install tesseract-ocr`, `brew install tesseract`, or download from GitHub)
+- **Ghostscript** — install via system package manager (`apt install ghostscript`, `brew install ghostscript`)
+
+### Install Steps
+
+```bash
+# 1. Clone the repository
+git clone <repo-url>
+cd SRMA
+
+# 2. Create a virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate   # Linux/macOS
+# venv\Scripts\activate    # Windows
+
+# 3. Install dependencies
+pip install -r full_text_acquisition/requirements.txt
+
+# 4. Install Playwright Chromium
+playwright install chromium
+
+# 5. Launch
+python -m full_text_acquisition.app
+```
+
+The system auto-opens `http://localhost:8000` in your default browser.
+
+### First-Launch Wizard
+
+On first run (and re-runnable from Settings), the wizard checks:
+
+| Check | Required | Action on Failure |
+|-------|----------|-------------------|
+| Python >= 3.9 | Yes | Exit with error |
+| pip dependencies | Yes | List missing packages |
+| Playwright + Chromium | Yes | Auto-install Chromium if Playwright present |
+| Tesseract on PATH | No | OCR disabled gracefully |
+| Ghostscript on PATH | No | ocrmypdf disabled, falls back to pytesseract |
+| config.json current | Yes | Auto-migrate from older versions |
+
+OCR availability is permanently visible in the Settings panel.
+
+---
+
+## Configuration
+
+All settings are stored in `config.json` (created automatically on first run). Every setting is also editable from the Settings panel in the UI.
+
+### config.json Reference
+
+```json
+{
+  "config_version": 1,
+  "output_directory": "./downloads",
+  "supplement_directory": "./downloads/Supplements",
+  "database_path": "./acquisition.db",
+
+  "api_timeout_s": 10,
+  "pdf_download_timeout_s": 30,
+  "page_load_timeout_s": 20,
+  "selector_timeout_s": 15,
+  "pdf_validation_timeout_s": 10,
+  "ocr_per_page_timeout_s": 30,
+
+  "max_retries": 3,
+  "max_total_attempts": 10,
+  "retrieval_concurrency": 2,
+  "validation_concurrency": 2,
+  "backpressure_threshold": 20,
+  "min_disk_space_bytes": 1073741824,
+
+  "cache_ttl_days": 7,
+  "cooldown_failure_threshold": 0.70,
+  "cooldown_window_size": 20,
+  "cooldown_minutes": 10,
+
+  "unpaywall_email": "",
+  "sso_proxy_url": "",
+  "openathens_url": "",
+  "institutional_resolver_url": "",
+  "scholar_min_delay_s": 10,
+  "scholar_max_queries_per_paper": 3
+}
+```
+
+### Config Versioning
+
+- `config_version` is checked on every startup
+- Migrations are **additive only** — new keys are added with defaults, existing keys are never deleted
+- If config version is newer than the application supports, the system warns and exits
+
+---
+
+## Usage
+
+### 1. Upload
+
+- Drag and drop a CSV or Excel file exported from Rayyan or Covidence
+- The system auto-detects DOI, Title, Authors, Year, and Journal columns
+- Review the 10-row preview and column mapping
+- Deduplication report shows exact DOI and fuzzy title/author matches
+- Metadata enrichment fills missing fields from OpenAlex and CrossRef
+- Click **Start Retrieval** to begin
+
+### 2. Run Control
+
+- **Start** — begins retrieval workers for the selected run
+- **Pause** — pauses retrieval workers (validation continues to drain)
+- **Resume** — resumes paused retrieval
+- **Cancel** — stops all workers and resets in-progress papers
+- **Retry Failed / Mismatch / Manual / All** — re-queues eligible papers
+
+### 3. SSO Access (Tier 3)
+
+1. Configure at least one SSO URL in Settings (EZproxy, OpenAthens, or institutional resolver)
+2. Click **Start SSO Login** — a headed browser opens to your institution's login page
+3. Complete authentication manually (username, password, MFA)
+4. Click **Continue** — the system verifies your session
+5. Tier 3 and 3.5 retrieval will use your authenticated session
+6. If the session expires, click **Re-authenticate**
+
+The system **never accesses anything you type**.
+
+### 4. CAPTCHA Handling
+
+If Google Scholar detects automated access during Tier 3.5:
+- The retrieval queue pauses
+- A full-screen overlay appears: "CAPTCHA Detected"
+- Solve the CAPTCHA in the headed browser window
+- Click **CAPTCHA Resolved** to resume
+
+### 5. Results & Overrides
+
+- Filter by: All | Downloaded | Partial | Mismatch | Failed | Manual
+- Sort by any column header
+- Filter by specific run ID
+- **Mismatch / Unverified papers** (amber highlight) require user action:
+  - **Confirm Correct** — free-text reason required, counted separately in PRISMA
+  - **Re-retrieve** — resets paper to READY_FOR_RETRIEVAL
+- Manual tab sorted by integrity score ascending (lowest confidence first)
+
+### 6. Exports
+
+| Export | Format | Scope |
+|--------|--------|-------|
+| Excel Report | .xlsx (2 sheets) | Current run / specific run / all |
+| PRISMA 2020 | .csv | Per run_id (required) |
+| Audit Log | .jsonl | Current run / all |
+| Integration | .json | Current run / all |
+
+All exports respect the run_id filter selected in the Results panel.
+
+### 7. Health Dashboard
+
+Live SSE-powered metrics visible during any active run:
+- Retrieval success rate (rolling 50)
+- Average attempts per paper
+- API failure rates by source tier
+- Queue depths with backpressure indicator
+- Active publisher cooldowns with manual reset
+- Paywall detection counts by publisher
+- Cache hit rate
+- Disk space remaining
+- Worker status (active/paused)
+
+---
+
+## File Structure
+
+```
+full_text_acquisition/
+    __init__.py
+    models.py              # Enums, dataclasses, Pydantic schemas, helpers
+    database.py            # SQLite with WAL, write queue, state machine
+    browser_manager.py     # Playwright singleton, stealth, CAPTCHA detection
+    retrieval_engine.py    # Multi-tier retrieval, validation, scoring
+    workers.py             # Worker pools, backpressure, disk safety
+    app.py                 # FastAPI endpoints, lifespan, startup sequence
+    requirements.txt       # Python dependencies
+    README.md              # This file
+    templates/
+        index.html         # Single-page UI (HTML + CSS + vanilla JS)
+```
+
+## Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `papers` | All paper metadata, state, validation results, file paths |
+| `runs` | Run records with config snapshots |
+| `paper_runs` | Per-run paper linkage and outcomes |
+| `audit_log` | Every retrieval attempt, validation check, state transition |
+| `api_cache` | Cached API responses (shared across runs, TTL-based) |
+| `publisher_cooldowns` | Adaptive cooldown state per publisher |
+| `supplements` | Downloaded supplement file metadata |
+
+---
+
+## Troubleshooting
+
+### "Playwright Chromium not installed"
+
+```bash
+playwright install chromium
+```
+
+### "OCR unavailable"
+
+Install system packages:
+```bash
+# Ubuntu/Debian
+sudo apt install tesseract-ocr ghostscript
+
+# macOS
+brew install tesseract ghostscript
+
+# Windows
+# Download from: https://github.com/tesseract-ocr/tesseract
+# Download from: https://ghostscript.com/releases/gsdnld.html
+```
+
+Then re-run the wizard from Settings.
+
+### Database locked errors
+
+The system uses WAL mode and a single write queue to prevent this. If you see lock errors:
+1. Ensure only one instance of the application is running
+2. Delete `acquisition.db-wal` and `acquisition.db-shm` files if they exist after a crash
+3. Restart the application
+
+### Papers stuck in RETRIEVING/VALIDATING
+
+The system automatically resets these on startup (RETRIEVING → READY_FOR_RETRIEVAL, VALIDATING → RETRIEVED). Simply restart the application.
+
+### Low disk space warning
+
+The system pauses all workers when disk space falls below the configured threshold (default 1 GB). Free disk space and click Resume in the Run panel.
+
+---
+
+## License
+
+This system is designed for lawful academic use only. No telemetry. No external data transmission. Local-first by design.
