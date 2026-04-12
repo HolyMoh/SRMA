@@ -190,3 +190,168 @@ class BrowserManager:
                 )
         except Exception:
             pass
+
+    # -----------------------------------------------------------------------
+    # Browser startup
+    # -----------------------------------------------------------------------
+
+    async def ensure_browser(self, headless: bool = True) -> Any:
+        """Lazily start Playwright and launch Chromium if not already running.
+
+        Args:
+            headless: True for Tier 2 (disposable), False for Tier 3 (persistent).
+
+        Returns the browser instance. If the browser is already running in
+        a different headless mode, it is closed and relaunched.
+        """
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("BrowserManager has been closed")
+
+            # Start Playwright if needed
+            if self._playwright is None:
+                try:
+                    from playwright.async_api import async_playwright
+                    self._playwright = await async_playwright().start()
+                    logger.info("Playwright started")
+                except ImportError:
+                    raise RuntimeError(
+                        "Playwright is not installed. "
+                        "Run: pip install playwright && playwright install chromium"
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to start Playwright: %s: %s\n%s",
+                        type(exc).__name__,
+                        exc,
+                        traceback.format_exc(),
+                    )
+                    raise
+
+            # Launch browser if needed
+            if self._browser is None or not self._browser.is_connected():
+                try:
+                    self._browser = await self._playwright.chromium.launch(
+                        headless=headless,
+                        args=self._browser_launch_args,
+                    )
+                    logger.info(
+                        "Chromium launched (headless=%s)", headless
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to launch Chromium: %s: %s\n%s",
+                        type(exc).__name__,
+                        exc,
+                        traceback.format_exc(),
+                    )
+                    raise
+
+            return self._browser
+
+    async def _inject_stealth(self, context: Any) -> None:
+        """Inject stealth scripts into a browser context.
+
+        Scripts are added via add_init_script so they execute on every
+        new page and navigation within the context.
+        """
+        for script in STEALTH_SCRIPTS:
+            try:
+                await context.add_init_script(script)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to inject stealth script: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+
+    # -----------------------------------------------------------------------
+    # Disposable context (Tier 2) — per-paper, headless, stealth
+    # -----------------------------------------------------------------------
+
+    async def create_disposable_context(self) -> Any:
+        """Create a fresh, isolated browser context for a single paper (Tier 2).
+
+        Features:
+            - Headless Chromium
+            - Stealth scripts injected
+            - Fresh cookies and storage (no carryover)
+            - Tracked for cleanup on shutdown
+
+        Returns the BrowserContext. Caller must close it via
+        close_disposable_context() or the disposable_context() manager.
+        """
+        browser = await self.ensure_browser(headless=True)
+
+        try:
+            context = await browser.new_context(
+                viewport=HEADLESS_VIEWPORT,
+                java_script_enabled=True,
+                accept_downloads=True,
+                ignore_https_errors=False,
+                user_agent=USER_AGENTS[
+                    len(self._disposable_contexts) % len(USER_AGENTS)
+                ],
+            )
+            await self._inject_stealth(context)
+            self._disposable_contexts.add(context)
+            logger.debug(
+                "Disposable context created (active: %d)",
+                len(self._disposable_contexts),
+            )
+            return context
+        except Exception as exc:
+            logger.error(
+                "Failed to create disposable context: %s: %s\n%s",
+                type(exc).__name__,
+                exc,
+                traceback.format_exc(),
+            )
+            raise
+
+    async def close_disposable_context(self, context: Any) -> None:
+        """Close and clean up a disposable browser context.
+
+        Clears cookies, cache, and storage before closing.
+        Removes context from tracking set.
+        """
+        if context is None:
+            return
+
+        try:
+            # Clear all cookies and storage
+            await context.clear_cookies()
+        except Exception as exc:
+            logger.debug(
+                "Could not clear cookies on disposable context: %s", exc
+            )
+
+        try:
+            await context.close()
+        except Exception as exc:
+            logger.debug(
+                "Error closing disposable context: %s", exc
+            )
+        finally:
+            self._disposable_contexts.discard(context)
+            logger.debug(
+                "Disposable context closed (remaining: %d)",
+                len(self._disposable_contexts),
+            )
+
+    @asynccontextmanager
+    async def disposable_context(self) -> AsyncIterator[Any]:
+        """Async context manager for a disposable Tier 2 browser context.
+
+        Usage:
+            async with browser_manager.disposable_context() as ctx:
+                page = await ctx.new_page()
+                await page.goto(url)
+                ...
+            # Context automatically closed and cleaned up
+        """
+        context = await self.create_disposable_context()
+        try:
+            yield context
+        finally:
+            await self.close_disposable_context(context)
