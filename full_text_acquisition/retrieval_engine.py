@@ -652,10 +652,31 @@ class RetrievalEngine:
         max_retries = self._config.get("max_retries", DEFAULT_MAX_RETRIES)
         last_exc: Optional[Exception] = None
 
+        # Shared singleton rate limiter — bounds per-host req/s + concurrency
+        from full_text_acquisition.rate_limiter import RateLimiter
+        limiter = RateLimiter.get_instance()
+
         for attempt in range(max_retries + 1):
             start_ms = time.monotonic() * 1000
             try:
-                response = await client.get(url, timeout=timeout_s)
+                async with limiter.acquire(api_name) as rate_delay_s:
+                    if rate_delay_s > 0:
+                        await self._log(
+                            canonical_id=canonical_id,
+                            run_id=run_id,
+                            tier=tier,
+                            method=api_name,
+                            url_attempted=url,
+                            outcome="RATE_LIMIT_APPLIED",
+                            execution_time_ms=rate_delay_s * 1000,
+                            retry_count=attempt,
+                            details={
+                                "host": api_name,
+                                "delay_s": round(rate_delay_s, 3),
+                                "limit_per_second": limiter.limits.get(api_name),
+                            },
+                        )
+                    response = await client.get(url, timeout=timeout_s)
                 elapsed_ms = (time.monotonic() * 1000) - start_ms
 
                 if response.status_code == 200:
