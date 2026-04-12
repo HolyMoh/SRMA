@@ -3279,3 +3279,379 @@ class RetrievalEngine:
 
         # CONTENT_UNVERIFIED
         return ValidationStatus.CONTENT_UNVERIFIED.value
+
+    # ===================================================================
+    # STEP 3.5 — Version Detection
+    # ===================================================================
+
+    async def detect_version(
+        self,
+        paper: Paper,
+        extracted_text: str,
+        run_id: str,
+    ) -> str:
+        """Classify the PDF version type.
+
+        Signals (priority order):
+            1. Source domain → preprint servers
+            2. PDF text patterns → accepted manuscript / published indicators
+            3. Journal branding → presence of publisher formatting
+
+        Returns VersionType value.
+        """
+        version = VersionType.UNKNOWN.value
+
+        # Signal 1: Source domain
+        retrieval_url = paper.retrieval_url or ""
+        try:
+            domain = urlparse(retrieval_url).hostname or ""
+            domain_lower = domain.lower()
+
+            for preprint_domain in PREPRINT_DOMAINS:
+                if preprint_domain in domain_lower:
+                    version = VersionType.PREPRINT.value
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        method="version_detect",
+                        outcome="VERSION_DETECTED",
+                        details={
+                            "version": version,
+                            "signal": "source_domain",
+                            "domain": domain_lower,
+                        },
+                    )
+                    await self._db.update_paper_fields(
+                        paper.canonical_id, version_type=version
+                    )
+                    return version
+        except Exception:
+            pass
+
+        text_lower = extracted_text.lower() if extracted_text else ""
+
+        # Signal 2: Accepted manuscript patterns
+        for pattern in ACCEPTED_MANUSCRIPT_PATTERNS:
+            if pattern in text_lower:
+                version = VersionType.ACCEPTED_MANUSCRIPT.value
+                await self._log(
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    method="version_detect",
+                    outcome="VERSION_DETECTED",
+                    details={
+                        "version": version,
+                        "signal": "text_pattern",
+                        "pattern": pattern,
+                    },
+                )
+                await self._db.update_paper_fields(
+                    paper.canonical_id, version_type=version
+                )
+                return version
+
+        # Signal 3: Published version patterns
+        for pattern in PUBLISHED_VERSION_PATTERNS:
+            if pattern in text_lower:
+                version = VersionType.PUBLISHED_VERSION.value
+                await self._log(
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    method="version_detect",
+                    outcome="VERSION_DETECTED",
+                    details={
+                        "version": version,
+                        "signal": "text_pattern",
+                        "pattern": pattern,
+                    },
+                )
+                await self._db.update_paper_fields(
+                    paper.canonical_id, version_type=version
+                )
+                return version
+
+        # Signal 4: Journal branding heuristics
+        # If from a known publisher and has DOI, likely published
+        if paper.publisher and paper.publisher != PublisherEnum.OTHER.value:
+            if paper.identity_status == IdentityStatus.DOI_VERIFIED.value:
+                version = VersionType.PUBLISHED_VERSION.value
+                await self._log(
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    method="version_detect",
+                    outcome="VERSION_DETECTED",
+                    details={
+                        "version": version,
+                        "signal": "publisher_doi_heuristic",
+                        "publisher": paper.publisher,
+                    },
+                )
+                await self._db.update_paper_fields(
+                    paper.canonical_id, version_type=version
+                )
+                return version
+
+        # Could not determine — stay UNKNOWN
+        await self._log(
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            method="version_detect",
+            outcome="VERSION_UNKNOWN",
+            details={"version": version},
+        )
+        await self._db.update_paper_fields(
+            paper.canonical_id, version_type=version
+        )
+        return version
+
+    # ===================================================================
+    # STEP 3.6 — Integrity Score Calculation
+    # ===================================================================
+
+    async def compute_integrity_score(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[int, str]:
+        """Compute the integrity score (0–100) and confidence level.
+
+        Uses source tier, version type, identity status, and supplements.
+
+        Returns (score, confidence_level).
+        """
+        has_supplements = paper.supplement_count > 0
+
+        score, confidence = calculate_integrity_score(
+            source_tier=paper.retrieval_tier,
+            version_type=paper.version_type,
+            identity_status=paper.identity_status,
+            has_supplements=has_supplements,
+        )
+
+        await self._db.update_paper_fields(
+            paper.canonical_id,
+            integrity_score=score,
+            confidence_level=confidence,
+        )
+
+        await self._log(
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            method="integrity_score",
+            outcome=f"SCORE_{confidence}",
+            details={
+                "score": score,
+                "confidence": confidence,
+                "source_tier": paper.retrieval_tier,
+                "version_type": paper.version_type,
+                "identity_status": paper.identity_status,
+                "has_supplements": has_supplements,
+            },
+        )
+
+        return score, confidence
+
+    # ===================================================================
+    # STEP 4 — File Naming & Collision Handling
+    # ===================================================================
+
+    async def finalize_file_storage(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Optional[str]:
+        """Ensure the PDF is stored with its final canonical filename.
+
+        Handles collision detection via SHA-256 comparison:
+            Same hash → REUSED (skip save)
+            Different hash → append _v2, _v3, ...
+
+        Returns the final file path, or None on failure.
+        """
+        if not paper.pdf_path or not os.path.isfile(paper.pdf_path):
+            return None
+
+        # Generate canonical filename
+        filename = generate_filename(
+            paper.first_author_lastname,
+            paper.year,
+            paper.title,
+        )
+        final_path = os.path.join(self._output_dir, filename)
+
+        # If already at the correct path, nothing to do
+        current_path = paper.pdf_path
+        if os.path.abspath(current_path) == os.path.abspath(final_path):
+            return final_path
+
+        # Read current file hash
+        try:
+            with open(current_path, "rb") as f:
+                current_hash = hashlib.sha256(f.read()).hexdigest()
+        except Exception as exc:
+            logger.error("Cannot read PDF for finalization: %s", exc)
+            return current_path
+
+        # Check for collision
+        if os.path.isfile(final_path):
+            try:
+                with open(final_path, "rb") as f:
+                    existing_hash = hashlib.sha256(f.read()).hexdigest()
+
+                if existing_hash == current_hash:
+                    # Same file — REUSED
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        method="file_storage",
+                        outcome="REUSED",
+                        failure_code=FailureCode.REUSED.value,
+                        details={
+                            "path": final_path,
+                            "hash": current_hash[:16],
+                        },
+                    )
+                    # Clean up duplicate if different path
+                    if os.path.abspath(current_path) != os.path.abspath(final_path):
+                        try:
+                            os.unlink(current_path)
+                        except OSError:
+                            pass
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        pdf_path=final_path,
+                        pdf_filename=filename,
+                        sha256_checksum=current_hash,
+                    )
+                    return final_path
+                else:
+                    # Different content — version the filename
+                    base, ext = os.path.splitext(final_path)
+                    version = 2
+                    while os.path.isfile(f"{base}_v{version}{ext}"):
+                        version += 1
+                    versioned_path = f"{base}_v{version}{ext}"
+                    versioned_filename = os.path.basename(versioned_path)
+
+                    try:
+                        os.replace(current_path, versioned_path)
+                    except OSError as exc:
+                        logger.error("Failed to move to versioned path: %s", exc)
+                        return current_path
+
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        pdf_path=versioned_path,
+                        pdf_filename=versioned_filename,
+                        sha256_checksum=current_hash,
+                        content_drift_version=version,
+                    )
+
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        method="file_storage",
+                        outcome="VERSIONED",
+                        details={
+                            "path": versioned_path,
+                            "version": version,
+                            "hash": current_hash[:16],
+                        },
+                    )
+                    return versioned_path
+
+            except Exception as exc:
+                logger.error("Collision check error: %s", exc)
+                return current_path
+        else:
+            # No collision — move to final path
+            try:
+                os.makedirs(os.path.dirname(final_path), exist_ok=True)
+                os.replace(current_path, final_path)
+            except OSError as exc:
+                logger.error("Failed to move to final path: %s", exc)
+                return current_path
+
+            await self._db.update_paper_fields(
+                paper.canonical_id,
+                pdf_path=final_path,
+                pdf_filename=filename,
+                sha256_checksum=current_hash,
+            )
+            return final_path
+
+    # ===================================================================
+    # Full validation + finalization pipeline
+    # ===================================================================
+
+    async def run_validation_pipeline(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[str, str, int]:
+        """Run the complete post-retrieval pipeline:
+
+        1. PDF Validation (Step 3)
+        2. Version Detection (Step 3.5)
+        3. Integrity Score (Step 3.6)
+        4. File Naming & Storage (Step 4)
+
+        Returns (validation_status, identity_status, integrity_score).
+        """
+        # Step 3: Validate
+        validation_status, identity_status = await self.validate_pdf(
+            paper, run_id
+        )
+
+        # Update paper with validation results
+        await self._db.update_paper_fields(
+            paper.canonical_id,
+            validation_status=validation_status,
+            identity_status=identity_status,
+        )
+
+        # Refresh paper to get updated fields
+        paper = await self._db.get_paper(paper.canonical_id) or paper
+
+        # HARD CONSTRAINT: VERSION_MISMATCH or CONTENT_UNVERIFIED → never auto-succeed
+        if identity_status in (
+            IdentityStatus.VERSION_MISMATCH.value,
+            IdentityStatus.CONTENT_UNVERIFIED.value,
+        ):
+            # Still continue with scoring and storage, but don't mark COMPLETE
+            pass
+
+        # Step 3.5: Version Detection
+        extracted_text = ""
+        if paper.pdf_path and os.path.isfile(paper.pdf_path):
+            try:
+                try:
+                    import fitz
+
+                    doc = fitz.open(paper.pdf_path)
+                    pages_to_read = min(3, len(doc))
+                    for i in range(pages_to_read):
+                        extracted_text += doc[i].get_text() + "\n"
+                    doc.close()
+                except ImportError:
+                    from pypdf import PdfReader
+
+                    reader = PdfReader(paper.pdf_path)
+                    pages_to_read = min(3, len(reader.pages))
+                    for i in range(pages_to_read):
+                        extracted_text += (reader.pages[i].extract_text() or "") + "\n"
+            except Exception:
+                pass
+
+        version_type = await self.detect_version(paper, extracted_text, run_id)
+
+        # Refresh after version update
+        paper = await self._db.get_paper(paper.canonical_id) or paper
+
+        # Step 3.6: Integrity Score
+        score, confidence = await self.compute_integrity_score(paper, run_id)
+
+        # Step 4: File Naming & Storage
+        await self.finalize_file_storage(paper, run_id)
+
+        return validation_status, identity_status, score
