@@ -2196,3 +2196,540 @@ class Database:
             (canonical_id,),
         )
         return count or 0
+
+    # -----------------------------------------------------------------------
+    # Health metrics
+    # -----------------------------------------------------------------------
+
+    async def get_health_metrics(
+        self,
+        backpressure_threshold: int = 20,
+    ) -> HealthMetrics:
+        """Compute live health metrics for the SSE dashboard."""
+
+        # State counts
+        state_counts = await self.count_papers_by_state()
+        total = sum(state_counts.values())
+        completed = state_counts.get(PaperState.COMPLETE.value, 0)
+        failed = state_counts.get(PaperState.FAILED.value, 0)
+        manual_required = state_counts.get(PaperState.MANUAL_REQUIRED.value, 0)
+        retrieval_queue = state_counts.get(PaperState.READY_FOR_RETRIEVAL.value, 0)
+        validation_queue = state_counts.get(PaperState.RETRIEVED.value, 0)
+        retrieving_count = state_counts.get(PaperState.RETRIEVING.value, 0)
+        validating_count = state_counts.get(PaperState.VALIDATING.value, 0)
+
+        # Rolling success rate (last 50 completed retrieval attempts)
+        success_rate_rows = await self.read_all(
+            "SELECT outcome FROM audit_log "
+            "WHERE outcome IN ('RETRIEVED', 'FAILED', 'MANUAL_REQUIRED') "
+            "ORDER BY id DESC LIMIT 50"
+        )
+        if success_rate_rows:
+            successes = sum(
+                1 for row in success_rate_rows if row[0] == "RETRIEVED"
+            )
+            success_rate = successes / len(success_rate_rows)
+        else:
+            success_rate = 0.0
+
+        # Average attempts per completed paper
+        avg_attempts_row = await self.read_one(
+            "SELECT AVG(attempt_count) FROM papers WHERE state = ?",
+            (PaperState.COMPLETE.value,),
+        )
+        avg_attempts = float(avg_attempts_row[0]) if avg_attempts_row and avg_attempts_row[0] else 0.0
+
+        # Average retrieval time (from recent audit entries with execution_time_ms)
+        avg_time_row = await self.read_one(
+            "SELECT AVG(execution_time_ms) FROM ("
+            "  SELECT execution_time_ms FROM audit_log "
+            "  WHERE execution_time_ms IS NOT NULL "
+            "  AND outcome = 'RETRIEVED' "
+            "  ORDER BY id DESC LIMIT 50"
+            ")"
+        )
+        avg_time = float(avg_time_row[0]) if avg_time_row and avg_time_row[0] else 0.0
+
+        # API failure rates per source tier
+        api_failure_rows = await self.read_all(
+            "SELECT tier, "
+            "  SUM(CASE WHEN outcome = 'RETRIEVED' THEN 1 ELSE 0 END) as ok, "
+            "  COUNT(*) as total "
+            "FROM audit_log "
+            "WHERE tier IS NOT NULL "
+            "GROUP BY tier"
+        )
+        api_failure_rates: Dict[str, float] = {}
+        for row in api_failure_rows:
+            tier_name = row[0]
+            ok_count = row[1]
+            total_count = row[2]
+            if total_count > 0:
+                api_failure_rates[tier_name] = 1.0 - (ok_count / total_count)
+
+        # Backpressure weighted depth
+        # Standard PDF = 1 slot, IMAGE_ONLY_SCAN = 5 slots
+        ocr_count = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers "
+            "WHERE state = ? AND ocr_applied = 1",
+            (PaperState.RETRIEVED.value,),
+        ) or 0
+        non_ocr_retrieved = validation_queue - ocr_count
+        weighted_depth = (
+            non_ocr_retrieved * STANDARD_BACKPRESSURE_WEIGHT
+            + ocr_count * OCR_BACKPRESSURE_WEIGHT
+        )
+
+        # Active cooldowns
+        active_cooldowns = await self.get_active_cooldowns()
+        cooldown_dicts: List[Dict[str, Any]] = []
+        for cd in active_cooldowns:
+            remaining_seconds = 0.0
+            if cd.cooldown_until:
+                try:
+                    expiry = datetime.fromisoformat(cd.cooldown_until)
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    remaining_seconds = max(
+                        0.0,
+                        (expiry - datetime.now(timezone.utc)).total_seconds(),
+                    )
+                except (ValueError, TypeError):
+                    pass
+            cooldown_dicts.append({
+                "publisher": cd.publisher,
+                "failure_rate": cd.failure_rate,
+                "time_remaining_s": remaining_seconds,
+                "extended_count": cd.extended_count,
+            })
+
+        # Paywall counts by publisher
+        paywall_rows = await self.read_all(
+            "SELECT details FROM audit_log "
+            "WHERE failure_code = ?",
+            (FailureCode.PAYWALL_DETECTED.value,),
+        )
+        paywall_counts: Dict[str, int] = {}
+        for row in paywall_rows:
+            details_str = row[0]
+            if details_str:
+                try:
+                    details = json.loads(details_str)
+                    pub = details.get("publisher", "UNKNOWN")
+                    paywall_counts[pub] = paywall_counts.get(pub, 0) + 1
+                except (json.JSONDecodeError, TypeError):
+                    paywall_counts["UNKNOWN"] = paywall_counts.get("UNKNOWN", 0) + 1
+
+        # Cache hit rate
+        total_cache_checks = await self.read_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE cache_hit IS NOT NULL"
+        ) or 0
+        cache_hits = await self.read_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE cache_hit = 1"
+        ) or 0
+        cache_hit_rate = cache_hits / total_cache_checks if total_cache_checks > 0 else 0.0
+
+        # Disk space (checked at caller level, passed in or computed here)
+        try:
+            stat = os.statvfs(os.path.dirname(self._db_path) or ".")
+            disk_remaining = stat.f_bavail * stat.f_frsize
+        except (OSError, AttributeError):
+            # Windows or unavailable
+            disk_remaining = 0
+
+        # ALREADY_RETRIEVED count
+        already_retrieved = await self.read_scalar(
+            "SELECT COUNT(*) FROM paper_runs WHERE outcome_in_this_run = ?",
+            (FailureCode.ALREADY_RETRIEVED.value,),
+        ) or 0
+
+        return HealthMetrics(
+            retrieval_success_rate=round(success_rate, 3),
+            avg_attempts_per_paper=round(avg_attempts, 2),
+            api_failure_rates=api_failure_rates,
+            avg_retrieval_time_ms=round(avg_time, 1),
+            retrieval_queue_depth=retrieval_queue,
+            validation_queue_depth=validation_queue,
+            backpressure_weighted_depth=weighted_depth,
+            backpressure_threshold=backpressure_threshold,
+            active_cooldowns=cooldown_dicts,
+            paywall_counts_by_publisher=paywall_counts,
+            cache_hit_rate=round(cache_hit_rate, 3),
+            disk_space_remaining_bytes=disk_remaining,
+            already_retrieved_count=already_retrieved,
+            retrieval_workers_active=retrieving_count,
+            validation_workers_active=validating_count,
+            total_papers=total,
+            completed_papers=completed,
+            failed_papers=failed,
+            manual_required_papers=manual_required,
+        )
+
+    # -----------------------------------------------------------------------
+    # PRISMA 2020 report
+    # -----------------------------------------------------------------------
+
+    async def generate_prisma_report(
+        self, run_id: str
+    ) -> PrismaReport:
+        """Generate a PRISMA 2020 compliance report for a specific run."""
+
+        # Total papers submitted in this run
+        total_sought = await self.read_scalar(
+            "SELECT COUNT(*) FROM paper_runs WHERE run_id = ? "
+            "AND submitted_in_this_run = 1",
+            (run_id,),
+        ) or 0
+
+        # Papers verified (COMPLETE with DOI_VERIFIED or TITLE_VERIFIED)
+        verified = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers p "
+            "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+            "WHERE pr.run_id = ? AND p.state = ? "
+            "AND p.identity_status IN (?, ?)",
+            (
+                run_id,
+                PaperState.COMPLETE.value,
+                IdentityStatus.DOI_VERIFIED.value,
+                IdentityStatus.TITLE_VERIFIED.value,
+            ),
+        ) or 0
+
+        # Flagged (COMPLETE but VERSION_MISMATCH or CONTENT_UNVERIFIED)
+        flagged = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers p "
+            "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+            "WHERE pr.run_id = ? AND p.state = ? "
+            "AND p.identity_status IN (?, ?)",
+            (
+                run_id,
+                PaperState.COMPLETE.value,
+                IdentityStatus.VERSION_MISMATCH.value,
+                IdentityStatus.CONTENT_UNVERIFIED.value,
+            ),
+        ) or 0
+
+        # Not retrieved subcategories — from audit log failure codes for this run
+        not_retrieved_no_oa = await self._count_failures_in_run(
+            run_id, FailureCode.NO_OA_SOURCE.value
+        )
+        not_retrieved_paywall = await self._count_failures_in_run(
+            run_id, FailureCode.PAYWALL_DETECTED.value
+        )
+        not_retrieved_access = await self._count_failures_in_run(
+            run_id, FailureCode.ACCESS_DENIED.value
+        )
+        not_retrieved_not_found = await self._count_failures_in_run(
+            run_id, FailureCode.NOT_FOUND.value
+        )
+        not_retrieved_timeout = await self._count_failures_in_run(
+            run_id, FailureCode.TIMEOUT.value
+        )
+
+        # Other failures (FAILED state papers not counted above)
+        total_categorized = (
+            not_retrieved_no_oa
+            + not_retrieved_paywall
+            + not_retrieved_access
+            + not_retrieved_not_found
+            + not_retrieved_timeout
+        )
+        total_failed = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers p "
+            "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+            "WHERE pr.run_id = ? AND p.state = ?",
+            (run_id, PaperState.FAILED.value),
+        ) or 0
+        not_retrieved_other = max(0, total_failed - total_categorized)
+
+        # Manual required
+        manual_required = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers p "
+            "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+            "WHERE pr.run_id = ? AND p.state = ?",
+            (run_id, PaperState.MANUAL_REQUIRED.value),
+        ) or 0
+
+        # Already retrieved
+        already_retrieved = await self.read_scalar(
+            "SELECT COUNT(*) FROM paper_runs "
+            "WHERE run_id = ? AND outcome_in_this_run = ?",
+            (run_id, FailureCode.ALREADY_RETRIEVED.value),
+        ) or 0
+
+        # User overrides
+        overrides_confirmed = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers p "
+            "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+            "WHERE pr.run_id = ? AND p.user_override = 'CONFIRMED_CORRECT'",
+            (run_id,),
+        ) or 0
+
+        overrides_reretried = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers p "
+            "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+            "WHERE pr.run_id = ? AND p.user_override = 'RE_RETRIEVE'",
+            (run_id,),
+        ) or 0
+
+        return PrismaReport(
+            run_id=run_id,
+            total_sought=total_sought,
+            verified=verified,
+            flagged=flagged,
+            not_retrieved_no_oa=not_retrieved_no_oa,
+            not_retrieved_paywall=not_retrieved_paywall,
+            not_retrieved_access_denied=not_retrieved_access,
+            not_retrieved_not_found=not_retrieved_not_found,
+            not_retrieved_timeout=not_retrieved_timeout,
+            not_retrieved_other=not_retrieved_other,
+            manual_required=manual_required,
+            already_retrieved=already_retrieved,
+            user_overrides_confirmed=overrides_confirmed,
+            user_overrides_reretried=overrides_reretried,
+        )
+
+    async def _count_failures_in_run(
+        self, run_id: str, failure_code: str
+    ) -> int:
+        """Count distinct papers with a specific failure code in a run.
+
+        Uses the audit_log to find papers whose final (most recent)
+        failure code matches, within the given run.
+        """
+        count = await self.read_scalar(
+            "SELECT COUNT(DISTINCT canonical_id) FROM audit_log "
+            "WHERE run_id = ? AND failure_code = ?",
+            (run_id, failure_code),
+        )
+        return count or 0
+
+    # -----------------------------------------------------------------------
+    # Results table query (paginated, filterable)
+    # -----------------------------------------------------------------------
+
+    async def get_results_table(
+        self,
+        run_id: Optional[str] = None,
+        state_filter: Optional[str] = None,
+        sort_by: str = "created_at",
+        sort_order: str = "ASC",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Tuple[List[Paper], int]:
+        """Fetch papers for the results table with filters and pagination.
+
+        Returns (papers, total_count).
+        """
+        # Validate sort to prevent SQL injection
+        allowed_sorts = {
+            "created_at", "title", "year", "state", "integrity_score",
+            "attempt_count", "first_author_lastname",
+        }
+        if sort_by not in allowed_sorts:
+            sort_by = "created_at"
+        if sort_order.upper() not in ("ASC", "DESC"):
+            sort_order = "ASC"
+
+        conditions: List[str] = []
+        params: List[Any] = []
+
+        if run_id:
+            conditions.append(
+                "p.canonical_id IN ("
+                "  SELECT canonical_id FROM paper_runs WHERE run_id = ?"
+                ")"
+            )
+            params.append(run_id)
+
+        if state_filter:
+            if state_filter == "downloaded":
+                conditions.append(
+                    "p.state IN (?, ?, ?)"
+                )
+                params.extend([
+                    PaperState.RETRIEVED.value,
+                    PaperState.VALIDATED.value,
+                    PaperState.COMPLETE.value,
+                ])
+            elif state_filter == "partial":
+                conditions.append(
+                    "p.validation_status LIKE 'PARTIAL%'"
+                )
+            elif state_filter == "mismatch":
+                conditions.append(
+                    "p.identity_status IN (?, ?)"
+                )
+                params.extend([
+                    IdentityStatus.VERSION_MISMATCH.value,
+                    IdentityStatus.CONTENT_UNVERIFIED.value,
+                ])
+            elif state_filter == "failed":
+                conditions.append("p.state = ?")
+                params.append(PaperState.FAILED.value)
+            elif state_filter == "manual":
+                conditions.append("p.state = ?")
+                params.append(PaperState.MANUAL_REQUIRED.value)
+            else:
+                conditions.append("p.state = ?")
+                params.append(state_filter)
+
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+
+        # Count query
+        count_sql = f"SELECT COUNT(*) FROM papers p {where_clause}"
+        total_count = await self.read_scalar(count_sql, tuple(params)) or 0
+
+        # Data query
+        data_sql = (
+            f"SELECT p.* FROM papers p {where_clause} "
+            f"ORDER BY p.{sort_by} {sort_order} LIMIT ? OFFSET ?"
+        )
+        data_params = tuple(params) + (limit, offset)
+        rows = await self.read_all(data_sql, data_params)
+        papers = [self._row_to_paper(row) for row in rows]
+
+        return papers, total_count
+
+    # -----------------------------------------------------------------------
+    # Integration export data assembly
+    # -----------------------------------------------------------------------
+
+    async def build_integration_export(
+        self,
+        canonical_id: str,
+    ) -> Optional[IntegrationExport]:
+        """Assemble full integration export data for a single paper."""
+        paper = await self.get_paper(canonical_id)
+        if paper is None:
+            return None
+
+        supplements = await self.get_supplements_for_paper(canonical_id)
+        audit_entries = await self.get_audit_log_for_paper(canonical_id)
+
+        return IntegrationExport.from_paper(paper, supplements, audit_entries)
+
+    async def build_integration_export_bulk(
+        self,
+        run_id: Optional[str] = None,
+        limit: int = 5000,
+    ) -> List[IntegrationExport]:
+        """Assemble integration export for all papers (optionally per run)."""
+        if run_id:
+            papers = await self.get_papers_by_run(run_id, limit=limit)
+        else:
+            papers = await self.get_all_papers(limit=limit)
+
+        exports: List[IntegrationExport] = []
+        for paper in papers:
+            supplements = await self.get_supplements_for_paper(
+                paper.canonical_id
+            )
+            audit_entries = await self.get_audit_log_for_paper(
+                paper.canonical_id
+            )
+            exports.append(
+                IntegrationExport.from_paper(paper, supplements, audit_entries)
+            )
+
+        return exports
+
+    # -----------------------------------------------------------------------
+    # Excel report summary data
+    # -----------------------------------------------------------------------
+
+    async def get_summary_stats(
+        self, run_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Compute summary statistics for the Excel report Sheet 2."""
+
+        state_counts = await self.count_papers_by_state()
+        total = sum(state_counts.values())
+        completed = state_counts.get(PaperState.COMPLETE.value, 0)
+        failed = state_counts.get(PaperState.FAILED.value, 0)
+
+        # Success rate
+        attempted = completed + failed
+        success_rate = completed / attempted if attempted > 0 else 0.0
+
+        # OCR count
+        if run_id:
+            ocr_count = await self.read_scalar(
+                "SELECT COUNT(*) FROM papers p "
+                "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+                "WHERE pr.run_id = ? AND p.ocr_applied = 1",
+                (run_id,),
+            ) or 0
+        else:
+            ocr_count = await self.read_scalar(
+                "SELECT COUNT(*) FROM papers WHERE ocr_applied = 1"
+            ) or 0
+
+        # Content drift count
+        drift_count = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers WHERE content_drift_status = ?",
+            (ContentDriftStatus.CONTENT_UPDATED.value,),
+        ) or 0
+
+        # Override counts
+        overrides_confirmed = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers WHERE user_override = 'CONFIRMED_CORRECT'"
+        ) or 0
+        overrides_reretried = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers WHERE user_override = 'RE_RETRIEVE'"
+        ) or 0
+
+        # Cooldown events
+        cooldown_events = await self.read_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE failure_code = ?",
+            (FailureCode.PUBLISHER_COOLDOWN_ACTIVE.value,),
+        ) or 0
+
+        # Cache rate
+        cache_stats = await self.get_cache_stats()
+
+        # Average time and attempts
+        avg_time_row = await self.read_one(
+            "SELECT AVG(execution_time_ms) FROM audit_log "
+            "WHERE outcome = 'RETRIEVED' AND execution_time_ms IS NOT NULL"
+        )
+        avg_time = float(avg_time_row[0]) if avg_time_row and avg_time_row[0] else 0.0
+
+        avg_attempts_row = await self.read_one(
+            "SELECT AVG(attempt_count) FROM papers WHERE state = ?",
+            (PaperState.COMPLETE.value,),
+        )
+        avg_attempts = float(avg_attempts_row[0]) if avg_attempts_row and avg_attempts_row[0] else 0.0
+
+        # Score distribution
+        score_rows = await self.read_all(
+            "SELECT confidence_level, COUNT(*) as cnt FROM papers "
+            "WHERE confidence_level IS NOT NULL GROUP BY confidence_level"
+        )
+        score_distribution = {row[0]: row[1] for row in score_rows}
+
+        # ALREADY_RETRIEVED count
+        already_retrieved = await self.read_scalar(
+            "SELECT COUNT(*) FROM paper_runs WHERE outcome_in_this_run = ?",
+            (FailureCode.ALREADY_RETRIEVED.value,),
+        ) or 0
+
+        return {
+            "total_papers": total,
+            "completed": completed,
+            "failed": failed,
+            "manual_required": state_counts.get(PaperState.MANUAL_REQUIRED.value, 0),
+            "success_rate": round(success_rate, 3),
+            "ocr_count": ocr_count,
+            "content_drift_count": drift_count,
+            "overrides_confirmed": overrides_confirmed,
+            "overrides_reretried": overrides_reretried,
+            "cooldown_events": cooldown_events,
+            "cache_hit_rate": cache_stats.get("active_entries", 0),
+            "avg_retrieval_time_ms": round(avg_time, 1),
+            "avg_attempts": round(avg_attempts, 2),
+            "score_distribution": score_distribution,
+            "already_retrieved_count": already_retrieved,
+        }
