@@ -975,3 +975,447 @@ class Database:
             (PaperState.RETRIEVED.value, limit),
         )
         return [row[0] for row in rows]
+
+    # -----------------------------------------------------------------------
+    # Paper CRUD
+    # -----------------------------------------------------------------------
+
+    def _row_to_paper(self, row: aiosqlite.Row) -> Paper:
+        """Convert a database row to a Paper dataclass."""
+        keys = row.keys()
+        data = {k: row[k] for k in keys}
+        # SQLite stores booleans as integers
+        for bool_field in ("is_primary", "ocr_applied", "ocr_text_extracted"):
+            if bool_field in data and data[bool_field] is not None:
+                data[bool_field] = bool(data[bool_field])
+        return Paper(**data)
+
+    async def insert_paper(self, paper: Paper) -> bool:
+        """Insert a new paper into the papers table.
+
+        Returns True on success, False if canonical_id already exists.
+        """
+
+        async def _do_insert(
+            conn: aiosqlite.Connection, p: Paper
+        ) -> bool:
+            d = p.to_dict()
+            # Convert booleans to integers for SQLite
+            for bool_field in ("is_primary", "ocr_applied", "ocr_text_extracted"):
+                if bool_field in d:
+                    d[bool_field] = int(d[bool_field])
+
+            columns = ", ".join(d.keys())
+            placeholders = ", ".join("?" for _ in d)
+            sql = f"INSERT OR IGNORE INTO papers ({columns}) VALUES ({placeholders})"
+            cursor = await conn.execute(sql, tuple(d.values()))
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_insert, paper)
+
+    async def insert_papers_bulk(self, papers: List[Paper]) -> int:
+        """Insert multiple papers in a single transaction.
+
+        Uses INSERT OR IGNORE so existing canonical_ids are skipped.
+        Returns count of newly inserted papers.
+        """
+
+        async def _do_bulk_insert(
+            conn: aiosqlite.Connection, paper_list: List[Paper]
+        ) -> int:
+            if not paper_list:
+                return 0
+
+            inserted = 0
+            for p in paper_list:
+                d = p.to_dict()
+                for bool_field in ("is_primary", "ocr_applied", "ocr_text_extracted"):
+                    if bool_field in d:
+                        d[bool_field] = int(d[bool_field])
+
+                columns = ", ".join(d.keys())
+                placeholders = ", ".join("?" for _ in d)
+                sql = (
+                    f"INSERT OR IGNORE INTO papers ({columns}) "
+                    f"VALUES ({placeholders})"
+                )
+                cursor = await conn.execute(sql, tuple(d.values()))
+                inserted += cursor.rowcount
+
+            await conn.commit()
+            return inserted
+
+        return await self._enqueue_write(_do_bulk_insert, papers)
+
+    async def get_paper(self, canonical_id: str) -> Optional[Paper]:
+        """Fetch a single paper by canonical_id."""
+        row = await self.read_one(
+            "SELECT * FROM papers WHERE canonical_id = ?",
+            (canonical_id,),
+        )
+        if row is None:
+            return None
+        return self._row_to_paper(row)
+
+    async def get_papers_by_state(
+        self, state: str, limit: int = 100, offset: int = 0
+    ) -> List[Paper]:
+        """Fetch papers in a given state with pagination."""
+        rows = await self.read_all(
+            "SELECT * FROM papers WHERE state = ? "
+            "ORDER BY created_at ASC LIMIT ? OFFSET ?",
+            (state, limit, offset),
+        )
+        return [self._row_to_paper(row) for row in rows]
+
+    async def get_papers_by_states(
+        self, states: List[str], limit: int = 500
+    ) -> List[Paper]:
+        """Fetch papers in any of the given states."""
+        if not states:
+            return []
+        placeholders = ",".join("?" for _ in states)
+        rows = await self.read_all(
+            f"SELECT * FROM papers WHERE state IN ({placeholders}) "
+            f"ORDER BY created_at ASC LIMIT ?",
+            tuple(states) + (limit,),
+        )
+        return [self._row_to_paper(row) for row in rows]
+
+    async def get_papers_by_run(
+        self, run_id: str, limit: int = 500, offset: int = 0
+    ) -> List[Paper]:
+        """Fetch papers associated with a specific run via paper_runs."""
+        rows = await self.read_all(
+            "SELECT p.* FROM papers p "
+            "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+            "WHERE pr.run_id = ? ORDER BY p.created_at ASC LIMIT ? OFFSET ?",
+            (run_id, limit, offset),
+        )
+        return [self._row_to_paper(row) for row in rows]
+
+    async def get_all_papers(
+        self, limit: int = 1000, offset: int = 0
+    ) -> List[Paper]:
+        """Fetch all papers with pagination."""
+        rows = await self.read_all(
+            "SELECT * FROM papers ORDER BY created_at ASC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        return [self._row_to_paper(row) for row in rows]
+
+    async def update_paper_fields(
+        self, canonical_id: str, **fields: Any
+    ) -> bool:
+        """Update arbitrary fields on a paper record.
+
+        Does not enforce state transitions — use transition_state() for state
+        changes. This method is for updating metadata, file paths, scores, etc.
+        """
+        if not fields:
+            return False
+
+        # Prevent direct state changes through this method
+        if "state" in fields:
+            raise ValueError(
+                "Cannot update state via update_paper_fields(). "
+                "Use transition_state() for state changes."
+            )
+
+        async def _do_update(
+            conn: aiosqlite.Connection,
+            cid: str,
+            update_fields: Dict[str, Any],
+        ) -> bool:
+            update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+            # Convert booleans
+            for bool_field in ("is_primary", "ocr_applied", "ocr_text_extracted"):
+                if bool_field in update_fields and isinstance(
+                    update_fields[bool_field], bool
+                ):
+                    update_fields[bool_field] = int(update_fields[bool_field])
+
+            set_clause = ", ".join(f"{k} = ?" for k in update_fields)
+            values = list(update_fields.values()) + [cid]
+            cursor = await conn.execute(
+                f"UPDATE papers SET {set_clause} WHERE canonical_id = ?",
+                tuple(values),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_update, canonical_id, dict(fields))
+
+    async def count_papers_by_state(self) -> Dict[str, int]:
+        """Return count of papers grouped by state."""
+        rows = await self.read_all(
+            "SELECT state, COUNT(*) as cnt FROM papers GROUP BY state"
+        )
+        return {row[0]: row[1] for row in rows}
+
+    async def paper_exists(self, canonical_id: str) -> bool:
+        """Check whether a paper with this canonical_id exists."""
+        count = await self.read_scalar(
+            "SELECT COUNT(*) FROM papers WHERE canonical_id = ?",
+            (canonical_id,),
+        )
+        return count > 0
+
+    async def get_paper_state(self, canonical_id: str) -> Optional[str]:
+        """Get the current state of a paper."""
+        row = await self.read_one(
+            "SELECT state FROM papers WHERE canonical_id = ?",
+            (canonical_id,),
+        )
+        return row[0] if row else None
+
+    async def check_duplicate_doi(self, doi: str) -> Optional[str]:
+        """Check if a normalized DOI already exists. Returns canonical_id or None."""
+        if not doi:
+            return None
+        row = await self.read_one(
+            "SELECT canonical_id FROM papers WHERE doi = ?",
+            (doi,),
+        )
+        return row[0] if row else None
+
+    async def get_failed_papers(
+        self, run_id: Optional[str] = None
+    ) -> List[Paper]:
+        """Fetch all papers in FAILED state, optionally filtered by run."""
+        if run_id:
+            rows = await self.read_all(
+                "SELECT p.* FROM papers p "
+                "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+                "WHERE p.state = ? AND pr.run_id = ?",
+                (PaperState.FAILED.value, run_id),
+            )
+        else:
+            rows = await self.read_all(
+                "SELECT * FROM papers WHERE state = ?",
+                (PaperState.FAILED.value,),
+            )
+        return [self._row_to_paper(row) for row in rows]
+
+    async def get_manual_required_papers(
+        self, run_id: Optional[str] = None
+    ) -> List[Paper]:
+        """Fetch all papers in MANUAL_REQUIRED state, optionally by run."""
+        if run_id:
+            rows = await self.read_all(
+                "SELECT p.* FROM papers p "
+                "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+                "WHERE p.state = ? AND pr.run_id = ?",
+                (PaperState.MANUAL_REQUIRED.value, run_id),
+            )
+        else:
+            rows = await self.read_all(
+                "SELECT * FROM papers WHERE state = ?",
+                (PaperState.MANUAL_REQUIRED.value,),
+            )
+        return [self._row_to_paper(row) for row in rows]
+
+    async def get_flagged_papers(
+        self, run_id: Optional[str] = None
+    ) -> List[Paper]:
+        """Fetch papers with VERSION_MISMATCH or CONTENT_UNVERIFIED identity."""
+        flagged_statuses = (
+            IdentityStatus.VERSION_MISMATCH.value,
+            IdentityStatus.CONTENT_UNVERIFIED.value,
+        )
+        if run_id:
+            rows = await self.read_all(
+                "SELECT p.* FROM papers p "
+                "INNER JOIN paper_runs pr ON p.canonical_id = pr.canonical_id "
+                "WHERE p.identity_status IN (?, ?) AND pr.run_id = ?",
+                flagged_statuses + (run_id,),
+            )
+        else:
+            rows = await self.read_all(
+                "SELECT * FROM papers WHERE identity_status IN (?, ?)",
+                flagged_statuses,
+            )
+        return [self._row_to_paper(row) for row in rows]
+
+    async def apply_user_override(
+        self,
+        canonical_id: str,
+        action: str,
+        reason: str,
+    ) -> bool:
+        """Apply a user validation override on a flagged paper.
+
+        action='confirm_correct' → store override, keep COMPLETE state.
+        action='re_retrieve' → reset to READY_FOR_RETRIEVAL.
+        """
+
+        async def _do_override(
+            conn: aiosqlite.Connection,
+            cid: str,
+            act: str,
+            rsn: str,
+        ) -> bool:
+            now = datetime.now(timezone.utc).isoformat()
+
+            if act == "confirm_correct":
+                cursor = await conn.execute(
+                    "UPDATE papers SET user_override = 'CONFIRMED_CORRECT', "
+                    "override_reason = ?, override_timestamp = ?, "
+                    "updated_at = ? WHERE canonical_id = ?",
+                    (rsn, now, now, cid),
+                )
+            elif act == "re_retrieve":
+                cursor = await conn.execute(
+                    "UPDATE papers SET state = ?, previous_state = state, "
+                    "user_override = 'RE_RETRIEVE', override_reason = ?, "
+                    "override_timestamp = ?, pdf_path = NULL, "
+                    "sha256_checksum = NULL, pdf_size_bytes = NULL, "
+                    "pdf_page_count = NULL, validation_status = NULL, "
+                    "identity_status = NULL, integrity_score = NULL, "
+                    "confidence_level = NULL, updated_at = ? "
+                    "WHERE canonical_id = ?",
+                    (
+                        PaperState.READY_FOR_RETRIEVAL.value,
+                        rsn,
+                        now,
+                        now,
+                        cid,
+                    ),
+                )
+            else:
+                return False
+
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        success = await self._enqueue_write(
+            _do_override, canonical_id, action, reason
+        )
+        if success:
+            await self.log_audit(AuditLogEntry(
+                canonical_id=canonical_id,
+                outcome=f"USER_OVERRIDE_{action.upper()}",
+                details=json.dumps({"reason": reason}),
+            ))
+        return success
+
+    async def reset_paper_for_retry(self, canonical_id: str) -> bool:
+        """Reset a FAILED or MANUAL_REQUIRED paper to READY_FOR_RETRIEVAL."""
+
+        async def _do_reset(
+            conn: aiosqlite.Connection, cid: str
+        ) -> bool:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = await conn.execute(
+                "UPDATE papers SET state = ?, previous_state = state, "
+                "worker_id = NULL, claimed_at = NULL, "
+                "last_failure_code = NULL, updated_at = ? "
+                "WHERE canonical_id = ? AND state IN (?, ?)",
+                (
+                    PaperState.READY_FOR_RETRIEVAL.value,
+                    now,
+                    cid,
+                    PaperState.FAILED.value,
+                    PaperState.MANUAL_REQUIRED.value,
+                ),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._enqueue_write(_do_reset, canonical_id)
+
+    async def reset_papers_for_retry_bulk(
+        self, canonical_ids: Optional[List[str]] = None, retry_type: str = "failed"
+    ) -> int:
+        """Reset multiple papers for retry.
+
+        retry_type:
+            'failed' → all FAILED papers
+            'mismatch' → VERSION_MISMATCH or CONTENT_UNVERIFIED
+            'manual' → all MANUAL_REQUIRED papers
+            'all_eligible' → all of the above
+
+        If canonical_ids is provided, only those specific papers are reset.
+        Returns count of papers reset.
+        """
+
+        async def _do_bulk_reset(
+            conn: aiosqlite.Connection,
+            cids: Optional[List[str]],
+            rtype: str,
+        ) -> int:
+            now = datetime.now(timezone.utc).isoformat()
+
+            if cids:
+                placeholders = ",".join("?" for _ in cids)
+                eligible_states = (
+                    PaperState.FAILED.value,
+                    PaperState.MANUAL_REQUIRED.value,
+                )
+                cursor = await conn.execute(
+                    f"UPDATE papers SET state = ?, previous_state = state, "
+                    f"worker_id = NULL, claimed_at = NULL, "
+                    f"last_failure_code = NULL, updated_at = ? "
+                    f"WHERE canonical_id IN ({placeholders}) "
+                    f"AND state IN (?, ?)",
+                    (PaperState.READY_FOR_RETRIEVAL.value, now)
+                    + tuple(cids)
+                    + eligible_states,
+                )
+            elif rtype == "failed":
+                cursor = await conn.execute(
+                    "UPDATE papers SET state = ?, previous_state = state, "
+                    "worker_id = NULL, claimed_at = NULL, "
+                    "last_failure_code = NULL, updated_at = ? "
+                    "WHERE state = ?",
+                    (PaperState.READY_FOR_RETRIEVAL.value, now, PaperState.FAILED.value),
+                )
+            elif rtype == "manual":
+                cursor = await conn.execute(
+                    "UPDATE papers SET state = ?, previous_state = state, "
+                    "worker_id = NULL, claimed_at = NULL, "
+                    "last_failure_code = NULL, updated_at = ? "
+                    "WHERE state = ?",
+                    (
+                        PaperState.READY_FOR_RETRIEVAL.value,
+                        now,
+                        PaperState.MANUAL_REQUIRED.value,
+                    ),
+                )
+            elif rtype == "mismatch":
+                cursor = await conn.execute(
+                    "UPDATE papers SET state = ?, previous_state = state, "
+                    "worker_id = NULL, claimed_at = NULL, "
+                    "last_failure_code = NULL, validation_status = NULL, "
+                    "identity_status = NULL, pdf_path = NULL, "
+                    "sha256_checksum = NULL, updated_at = ? "
+                    "WHERE identity_status IN (?, ?)",
+                    (
+                        PaperState.READY_FOR_RETRIEVAL.value,
+                        now,
+                        IdentityStatus.VERSION_MISMATCH.value,
+                        IdentityStatus.CONTENT_UNVERIFIED.value,
+                    ),
+                )
+            elif rtype == "all_eligible":
+                cursor = await conn.execute(
+                    "UPDATE papers SET state = ?, previous_state = state, "
+                    "worker_id = NULL, claimed_at = NULL, "
+                    "last_failure_code = NULL, updated_at = ? "
+                    "WHERE state IN (?, ?)",
+                    (
+                        PaperState.READY_FOR_RETRIEVAL.value,
+                        now,
+                        PaperState.FAILED.value,
+                        PaperState.MANUAL_REQUIRED.value,
+                    ),
+                )
+            else:
+                return 0
+
+            await conn.commit()
+            return cursor.rowcount
+
+        return await self._enqueue_write(_do_bulk_reset, canonical_ids, retry_type)
