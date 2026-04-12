@@ -1,0 +1,29 @@
+# Full-Text Acquisition System — Dependencies
+# Install: pip install -r full_text_acquisition/requirements.txt
+
+# === Core (required) ===
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+aiosqlite>=0.19.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
+
+# === Browser automation (required for Tier 2+) ===
+playwright>=1.40.0
+
+# === PDF processing (at least one required) ===
+PyMuPDF>=1.23.0
+pypdf>=3.17.0
+
+# === Excel support (required for upload + export) ===
+openpyxl>=3.1.0
+
+# === OCR (optional — install tesseract + ghostscript system packages) ===
+# ocrmypdf>=16.0.0
+# pytesseract>=0.3.10
+# Pillow>=10.0.0
+
+# === Development (optional) ===
+# pytest>=7.4.0
+# pytest-asyncio>=0.23.0
