@@ -736,3 +736,242 @@ class Database:
         if count > 0:
             logger.info("Shutdown reset: %d papers returned to safe states", count)
         return count
+
+    # -----------------------------------------------------------------------
+    # State machine: atomic transitions
+    # -----------------------------------------------------------------------
+
+    async def transition_state(
+        self,
+        canonical_id: str,
+        new_state: str,
+        failure_code: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> bool:
+        """Atomically transition a paper to a new state.
+
+        Validates against VALID_TRANSITIONS. On invalid transition,
+        logs STATE_MACHINE_ERROR and returns False without modifying state.
+
+        RETRIEVING → FAILED requires an explicit failure_code argument.
+
+        Returns True on success, False on invalid transition or missing paper.
+        """
+
+        async def _do_transition(
+            conn: aiosqlite.Connection,
+            cid: str,
+            target: str,
+            f_code: Optional[str],
+            r_id: Optional[str],
+        ) -> Tuple[bool, Optional[str]]:
+            # Read current state
+            cursor = await conn.execute(
+                "SELECT state FROM papers WHERE canonical_id = ?",
+                (cid,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return False, "PAPER_NOT_FOUND"
+
+            current_state = row[0]
+
+            # Validate transition
+            if not validate_state_transition(current_state, target):
+                return False, current_state
+
+            # Enforce failure_code on RETRIEVING → FAILED
+            if (
+                current_state == PaperState.RETRIEVING.value
+                and target == PaperState.FAILED.value
+                and not f_code
+            ):
+                return False, "MISSING_FAILURE_CODE"
+
+            now = datetime.now(timezone.utc).isoformat()
+            update_fields = [
+                "state = ?",
+                "previous_state = ?",
+                "updated_at = ?",
+            ]
+            params: List[Any] = [target, current_state, now]
+
+            if f_code:
+                update_fields.append("last_failure_code = ?")
+                params.append(f_code)
+
+            # Clear worker tracking when leaving transient states
+            if target not in (PaperState.RETRIEVING.value, PaperState.VALIDATING.value):
+                update_fields.append("worker_id = NULL")
+                update_fields.append("claimed_at = NULL")
+
+            params.append(cid)
+            sql = f"UPDATE papers SET {', '.join(update_fields)} WHERE canonical_id = ?"
+            await conn.execute(sql, tuple(params))
+            await conn.commit()
+            return True, None
+
+        success, error_info = await self._enqueue_write(
+            _do_transition, canonical_id, new_state, failure_code, run_id
+        )
+
+        if not success:
+            if error_info == "PAPER_NOT_FOUND":
+                logger.error(
+                    "State transition failed: paper %s not found", canonical_id
+                )
+            elif error_info == "MISSING_FAILURE_CODE":
+                logger.error(
+                    "State transition RETRIEVING→FAILED requires failure_code "
+                    "for paper %s",
+                    canonical_id,
+                )
+            else:
+                logger.error(
+                    "Invalid state transition for %s: %s → %s",
+                    canonical_id,
+                    error_info,
+                    new_state,
+                )
+                await self.log_audit(AuditLogEntry(
+                    canonical_id=canonical_id,
+                    run_id=run_id,
+                    outcome="STATE_MACHINE_ERROR",
+                    failure_code=FailureCode.STATE_MACHINE_ERROR.value,
+                    details=json.dumps({
+                        "current_state": error_info,
+                        "attempted_state": new_state,
+                    }),
+                ))
+
+        return success
+
+    # -----------------------------------------------------------------------
+    # Task claiming: retrieval (database-level atomicity)
+    # -----------------------------------------------------------------------
+
+    async def claim_retrieval_task(
+        self,
+        canonical_id: str,
+        worker_id: str,
+    ) -> bool:
+        """Atomically claim a paper for retrieval.
+
+        Executes:
+            UPDATE papers
+            SET state='RETRIEVING', claimed_at=NOW, worker_id=?
+            WHERE canonical_id=? AND state='READY_FOR_RETRIEVAL'
+
+        rows_affected=1 → claimed, proceed.
+        rows_affected=0 → already claimed or wrong state, skip.
+
+        Returns True if claimed successfully.
+        """
+
+        async def _do_claim(
+            conn: aiosqlite.Connection,
+            cid: str,
+            wid: str,
+        ) -> bool:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = await conn.execute(
+                "UPDATE papers SET state = ?, claimed_at = ?, "
+                "worker_id = ?, previous_state = state, updated_at = ? "
+                "WHERE canonical_id = ? AND state = ?",
+                (
+                    PaperState.RETRIEVING.value,
+                    now,
+                    wid,
+                    now,
+                    cid,
+                    PaperState.READY_FOR_RETRIEVAL.value,
+                ),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        claimed = await self._enqueue_write(_do_claim, canonical_id, worker_id)
+        if claimed:
+            logger.debug(
+                "Worker %s claimed retrieval task for %s", worker_id, canonical_id
+            )
+        return claimed
+
+    # -----------------------------------------------------------------------
+    # Task claiming: validation (database-level atomicity)
+    # -----------------------------------------------------------------------
+
+    async def claim_validation_task(
+        self,
+        canonical_id: str,
+        worker_id: str,
+    ) -> bool:
+        """Atomically claim a paper for validation.
+
+        Executes:
+            UPDATE papers
+            SET state='VALIDATING', claimed_at=NOW, worker_id=?
+            WHERE canonical_id=? AND state='RETRIEVED'
+
+        rows_affected=1 → claimed, proceed.
+        rows_affected=0 → already claimed or wrong state, skip.
+
+        Returns True if claimed successfully.
+        """
+
+        async def _do_claim(
+            conn: aiosqlite.Connection,
+            cid: str,
+            wid: str,
+        ) -> bool:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = await conn.execute(
+                "UPDATE papers SET state = ?, claimed_at = ?, "
+                "worker_id = ?, previous_state = state, updated_at = ? "
+                "WHERE canonical_id = ? AND state = ?",
+                (
+                    PaperState.VALIDATING.value,
+                    now,
+                    wid,
+                    now,
+                    cid,
+                    PaperState.RETRIEVED.value,
+                ),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
+
+        claimed = await self._enqueue_write(_do_claim, canonical_id, worker_id)
+        if claimed:
+            logger.debug(
+                "Worker %s claimed validation task for %s", worker_id, canonical_id
+            )
+        return claimed
+
+    # -----------------------------------------------------------------------
+    # Fetch next claimable tasks (for worker polling)
+    # -----------------------------------------------------------------------
+
+    async def get_next_retrieval_candidates(self, limit: int = 10) -> List[str]:
+        """Return canonical_ids of papers in READY_FOR_RETRIEVAL state.
+
+        Ordered by created_at (oldest first) for FIFO processing.
+        """
+        rows = await self.read_all(
+            "SELECT canonical_id FROM papers "
+            "WHERE state = ? ORDER BY created_at ASC LIMIT ?",
+            (PaperState.READY_FOR_RETRIEVAL.value, limit),
+        )
+        return [row[0] for row in rows]
+
+    async def get_next_validation_candidates(self, limit: int = 10) -> List[str]:
+        """Return canonical_ids of papers in RETRIEVED state.
+
+        Ordered by created_at (oldest first) for FIFO processing.
+        """
+        rows = await self.read_all(
+            "SELECT canonical_id FROM papers "
+            "WHERE state = ? ORDER BY created_at ASC LIMIT ?",
+            (PaperState.RETRIEVED.value, limit),
+        )
+        return [row[0] for row in rows]
