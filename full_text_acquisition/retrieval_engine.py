@@ -896,3 +896,421 @@ class RetrievalEngine:
             details={"size_bytes": len(data)},
         )
         return True, None, data
+
+    # ===================================================================
+    # TIER 0 — Unpaywall (pure HTTP)
+    # ===================================================================
+
+    async def tier0_unpaywall(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 0: Query Unpaywall API for an open-access PDF URL.
+
+        Returns:
+            Tuple of (success, failure_code).
+        """
+        if not paper.doi:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_0.value,
+                method="unpaywall",
+                outcome="SKIPPED",
+                failure_code=FailureCode.NO_DOI.value,
+            )
+            return False, FailureCode.NO_DOI.value
+
+        email = self._config.get("unpaywall_email", "")
+        if not email:
+            email = "srma-acquisition@example.com"
+
+        url = f"{UNPAYWALL_BASE_URL}{paper.doi}?email={email}"
+
+        data, cache_hit = await self._api_request(
+            url=url,
+            doi=paper.doi,
+            api_name="unpaywall",
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_0.value,
+        )
+
+        if data is None:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_0.value,
+                method="unpaywall",
+                outcome="NO_RESULT",
+                failure_code=FailureCode.NO_OA_SOURCE.value,
+                cache_hit=cache_hit,
+            )
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        # Extract best OA location PDF URL
+        pdf_url = self._extract_unpaywall_pdf_url(data)
+        if not pdf_url:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_0.value,
+                method="unpaywall",
+                outcome="NO_PDF_URL",
+                failure_code=FailureCode.NO_OA_SOURCE.value,
+                cache_hit=cache_hit,
+            )
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        # Generate file path
+        filename = generate_filename(
+            paper.first_author_lastname,
+            paper.year,
+            paper.title,
+        )
+        final_path = os.path.join(self._output_dir, filename)
+
+        # Download
+        success, failure_code, pdf_data = await self._download_pdf(
+            url=pdf_url,
+            final_path=final_path,
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_0.value,
+            method="unpaywall",
+        )
+
+        if success:
+            await self._db.update_paper_fields(
+                paper.canonical_id,
+                pdf_path=final_path,
+                pdf_filename=filename,
+                retrieval_tier=TierEnum.TIER_0.value,
+                retrieval_method="unpaywall",
+                retrieval_url=pdf_url,
+                pdf_size_bytes=len(pdf_data) if pdf_data else None,
+            )
+
+        return success, failure_code
+
+    @staticmethod
+    def _extract_unpaywall_pdf_url(data: Dict[str, Any]) -> Optional[str]:
+        """Extract the best PDF URL from an Unpaywall API response.
+
+        Prefers the best_oa_location, falls back to other oa_locations.
+        Only returns direct PDF URLs (url_for_pdf field).
+        """
+        # Best OA location
+        best = data.get("best_oa_location")
+        if best:
+            pdf_url = best.get("url_for_pdf")
+            if pdf_url:
+                return pdf_url
+
+        # Fallback: iterate all OA locations
+        locations = data.get("oa_locations", [])
+        for loc in locations:
+            pdf_url = loc.get("url_for_pdf")
+            if pdf_url:
+                return pdf_url
+
+        # Last resort: use landing page URL (may not be direct PDF)
+        if best:
+            return best.get("url")
+
+        return None
+
+    # ===================================================================
+    # TIER 1 — Open Access APIs (pure HTTP)
+    # ===================================================================
+
+    async def tier1_open_access(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 1: Try multiple OA APIs in sequence.
+
+        Order: PMC → Europe PMC → Semantic Scholar → OpenAlex.
+
+        Returns:
+            Tuple of (success, failure_code).
+        """
+        methods: List[
+            Tuple[str, Any]
+        ] = [
+            ("pmc", self._tier1_pmc),
+            ("europepmc", self._tier1_europepmc),
+            ("semantic_scholar", self._tier1_semantic_scholar),
+            ("openalex", self._tier1_openalex),
+        ]
+
+        last_failure: Optional[str] = None
+        for method_name, method_fn in methods:
+            success, failure_code = await method_fn(paper, run_id)
+            if success:
+                return True, None
+            last_failure = failure_code
+
+        return False, last_failure or FailureCode.NO_OA_SOURCE.value
+
+    async def _tier1_pmc(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 1a: PubMed Central full-text PDF."""
+        pmid = paper.pmid
+        doi = paper.doi
+
+        # Try to find PMC ID via PMID or DOI
+        pmc_id = None
+
+        if pmid:
+            # Query NCBI E-utilities to convert PMID → PMCID
+            eutils_url = (
+                f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+                f"?ids={pmid}&format=json"
+            )
+            data, cache_hit = await self._api_request(
+                url=eutils_url,
+                doi=doi,
+                api_name="pmc_idconv",
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_1.value,
+            )
+            if data:
+                records = data.get("records", [])
+                if records:
+                    pmc_id = records[0].get("pmcid")
+
+        if not pmc_id and doi:
+            # Try DOI-based lookup
+            eutils_url = (
+                f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+                f"?ids={doi}&format=json"
+            )
+            data, cache_hit = await self._api_request(
+                url=eutils_url,
+                doi=doi,
+                api_name="pmc_idconv_doi",
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_1.value,
+            )
+            if data:
+                records = data.get("records", [])
+                if records:
+                    pmc_id = records[0].get("pmcid")
+
+        if not pmc_id:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        # Construct PDF URL
+        pdf_url = f"{PMC_BASE_URL}{pmc_id}/pdf/"
+
+        filename = generate_filename(
+            paper.first_author_lastname, paper.year, paper.title,
+        )
+        final_path = os.path.join(self._output_dir, filename)
+
+        success, failure_code, pdf_data = await self._download_pdf(
+            url=pdf_url,
+            final_path=final_path,
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_1.value,
+            method="pmc",
+        )
+
+        if success:
+            await self._db.update_paper_fields(
+                paper.canonical_id,
+                pdf_path=final_path,
+                pdf_filename=filename,
+                retrieval_tier=TierEnum.TIER_1.value,
+                retrieval_method="pmc",
+                retrieval_url=pdf_url,
+                pdf_size_bytes=len(pdf_data) if pdf_data else None,
+            )
+
+        return success, failure_code
+
+    async def _tier1_europepmc(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 1b: Europe PMC full-text PDF."""
+        if not paper.doi and not paper.pmid:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        # Search Europe PMC
+        query = paper.doi if paper.doi else paper.pmid
+        search_url = (
+            f"{EUROPEPMC_API_URL}?query={query}"
+            f"&resultType=core&format=json&pageSize=1"
+        )
+
+        data, cache_hit = await self._api_request(
+            url=search_url,
+            doi=paper.doi,
+            api_name="europepmc",
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_1.value,
+        )
+
+        if not data:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        results = data.get("resultList", {}).get("result", [])
+        if not results:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        result = results[0]
+        pmcid = result.get("pmcid")
+
+        if not pmcid:
+            # Try fullTextUrlList for direct PDF
+            url_list = result.get("fullTextUrlList", {}).get("fullTextUrl", [])
+            for url_entry in url_list:
+                if (
+                    url_entry.get("documentStyle") == "pdf"
+                    and url_entry.get("availabilityCode") == "OA"
+                ):
+                    pdf_url = url_entry.get("url")
+                    if pdf_url:
+                        return await self._try_download_tier1(
+                            paper, run_id, pdf_url, "europepmc"
+                        )
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        # Use PMC PDF URL
+        pdf_url = f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmcid}&blobtype=pdf"
+        return await self._try_download_tier1(
+            paper, run_id, pdf_url, "europepmc"
+        )
+
+    async def _tier1_semantic_scholar(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 1c: Semantic Scholar open-access PDF links."""
+        if not paper.doi:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        url = (
+            f"{SEMANTIC_SCHOLAR_BASE_URL}{paper.doi}"
+            f"?fields=openAccessPdf,externalIds"
+        )
+
+        data, cache_hit = await self._api_request(
+            url=url,
+            doi=paper.doi,
+            api_name="semantic_scholar",
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_1.value,
+        )
+
+        if not data:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        oa_pdf = data.get("openAccessPdf")
+        if not oa_pdf:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        pdf_url = oa_pdf.get("url")
+        if not pdf_url:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        return await self._try_download_tier1(
+            paper, run_id, pdf_url, "semantic_scholar"
+        )
+
+    async def _tier1_openalex(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 1d: OpenAlex PDF URLs."""
+        if not paper.doi:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        url = f"{OPENALEX_BASE_URL}{paper.doi}"
+
+        data, cache_hit = await self._api_request(
+            url=url,
+            doi=paper.doi,
+            api_name="openalex",
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_1.value,
+        )
+
+        if not data:
+            return False, FailureCode.NO_OA_SOURCE.value
+
+        # Check primary_location and best_oa_location
+        for location_key in ("best_oa_location", "primary_location"):
+            location = data.get(location_key)
+            if location:
+                pdf_url = location.get("pdf_url")
+                if pdf_url:
+                    success, fc = await self._try_download_tier1(
+                        paper, run_id, pdf_url, "openalex"
+                    )
+                    if success:
+                        return True, None
+
+        # Check all locations
+        locations = data.get("locations", [])
+        for loc in locations:
+            pdf_url = loc.get("pdf_url")
+            if pdf_url:
+                success, fc = await self._try_download_tier1(
+                    paper, run_id, pdf_url, "openalex"
+                )
+                if success:
+                    return True, None
+
+        return False, FailureCode.NO_OA_SOURCE.value
+
+    async def _try_download_tier1(
+        self,
+        paper: Paper,
+        run_id: str,
+        pdf_url: str,
+        method_name: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Shared download helper for Tier 1 methods."""
+        filename = generate_filename(
+            paper.first_author_lastname, paper.year, paper.title,
+        )
+        final_path = os.path.join(self._output_dir, filename)
+
+        success, failure_code, pdf_data = await self._download_pdf(
+            url=pdf_url,
+            final_path=final_path,
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_1.value,
+            method=method_name,
+        )
+
+        if success:
+            await self._db.update_paper_fields(
+                paper.canonical_id,
+                pdf_path=final_path,
+                pdf_filename=filename,
+                retrieval_tier=TierEnum.TIER_1.value,
+                retrieval_method=method_name,
+                retrieval_url=pdf_url,
+                pdf_size_bytes=len(pdf_data) if pdf_data else None,
+            )
+
+        return success, failure_code
