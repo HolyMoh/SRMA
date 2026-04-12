@@ -9,11 +9,13 @@ uses database-level atomicity (no in-memory locks).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 import traceback
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from full_text_acquisition.models import (
@@ -25,6 +27,7 @@ from full_text_acquisition.models import (
     MAX_VALIDATION_CONCURRENCY,
     OCR_BACKPRESSURE_WEIGHT,
     STANDARD_BACKPRESSURE_WEIGHT,
+    AuditLogEntry,
     FailureCode,
     PaperState,
 )
@@ -39,6 +42,12 @@ POLL_INTERVAL_S: float = 2.0
 BACKPRESSURE_CHECK_INTERVAL_S: float = 5.0
 DISK_CHECK_INTERVAL_PAPERS: int = 50
 DISK_CHECK_INTERVAL_S: float = 60.0
+
+# Stale claim reaper: a paper whose state is RETRIEVING or VALIDATING for
+# more than STALE_CLAIM_TIMEOUT_MINUTES without any progress is assumed
+# to be abandoned by a crashed or disconnected worker.
+STALE_CLAIM_TIMEOUT_MINUTES: int = 30
+STALE_CLAIM_CHECK_INTERVAL_S: float = 600.0  # 10 minutes
 
 
 def generate_worker_id(prefix: str = "w") -> str:
@@ -77,6 +86,200 @@ def compute_weighted_backpressure(
         non_ocr * STANDARD_BACKPRESSURE_WEIGHT
         + ocr_pending_count * OCR_BACKPRESSURE_WEIGHT
     )
+
+
+# ===========================================================================
+# Stale Claim Reaper
+# ===========================================================================
+
+
+async def run_stale_claim_reaper_once(
+    db: Any,
+    timeout_minutes: int = STALE_CLAIM_TIMEOUT_MINUTES,
+) -> int:
+    """Reset papers whose claim has exceeded the staleness timeout.
+
+    Finds all papers where:
+        state = 'RETRIEVING' AND claimed_at < now - timeout_minutes
+        state = 'VALIDATING' AND claimed_at < now - timeout_minutes
+
+    Resets:
+        RETRIEVING → READY_FOR_RETRIEVAL
+        VALIDATING → RETRIEVED
+
+    Each reset is logged to the audit log with outcome='STALE_CLAIM_RESET'
+    and details containing canonical_id, worker_id, prior_state, claimed_at,
+    and reset_timestamp.
+
+    Returns the count of papers reset.
+    """
+    if db is None:
+        return 0
+
+    now_dt = datetime.now(timezone.utc)
+    cutoff_dt = now_dt - timedelta(minutes=timeout_minutes)
+    cutoff_iso = cutoff_dt.isoformat()
+    now_iso = now_dt.isoformat()
+
+    # Read stale papers (read-only, no lock on write queue)
+    try:
+        stale_rows = await db.read_all(
+            "SELECT canonical_id, state, worker_id, claimed_at, run_id "
+            "FROM papers "
+            "WHERE state IN (?, ?) "
+            "AND claimed_at IS NOT NULL AND claimed_at < ?",
+            (
+                PaperState.RETRIEVING.value,
+                PaperState.VALIDATING.value,
+                cutoff_iso,
+            ),
+        )
+    except Exception as exc:
+        logger.error(
+            "Stale claim reaper: failed to read stale papers: %s", exc
+        )
+        return 0
+
+    if not stale_rows:
+        return 0
+
+    # Reset each paper's state via the write queue (serialized atomic updates)
+    reset_records: List[Dict[str, Any]] = []
+    for row in stale_rows:
+        cid = row[0]
+        prior_state = row[1]
+        worker_id = row[2]
+        claimed_at = row[3]
+        run_id = row[4]
+
+        if prior_state == PaperState.RETRIEVING.value:
+            new_state = PaperState.READY_FOR_RETRIEVAL.value
+        elif prior_state == PaperState.VALIDATING.value:
+            new_state = PaperState.RETRIEVED.value
+        else:
+            continue
+
+        reset_records.append({
+            "canonical_id": cid,
+            "prior_state": prior_state,
+            "new_state": new_state,
+            "worker_id": worker_id,
+            "claimed_at": claimed_at,
+            "reset_timestamp": now_iso,
+            "run_id": run_id,
+        })
+
+    if not reset_records:
+        return 0
+
+    async def _do_reset(conn: Any, records: List[Dict[str, Any]]) -> int:
+        count = 0
+        for rec in records:
+            cursor = await conn.execute(
+                "UPDATE papers SET state = ?, previous_state = ?, "
+                "worker_id = NULL, claimed_at = NULL, updated_at = ? "
+                "WHERE canonical_id = ? AND state = ? "
+                "AND claimed_at IS NOT NULL AND claimed_at < ?",
+                (
+                    rec["new_state"],
+                    rec["prior_state"],
+                    rec["reset_timestamp"],
+                    rec["canonical_id"],
+                    rec["prior_state"],
+                    cutoff_iso,
+                ),
+            )
+            # rowcount==0 means the paper transitioned out of the stuck
+            # state between our read and the update (a worker may have
+            # progressed it) — that's fine, we just skip the log.
+            if cursor.rowcount == 1:
+                count += 1
+                rec["reset_applied"] = True
+            else:
+                rec["reset_applied"] = False
+        await conn.commit()
+        return count
+
+    try:
+        applied_count = await db._enqueue_write(_do_reset, reset_records)
+    except Exception as exc:
+        logger.error(
+            "Stale claim reaper: write queue failed: %s\n%s",
+            exc, traceback.format_exc(),
+        )
+        return 0
+
+    # Audit log entries (one per successful reset)
+    for rec in reset_records:
+        if not rec.get("reset_applied"):
+            continue
+        try:
+            await db.log_audit(AuditLogEntry(
+                canonical_id=rec["canonical_id"],
+                run_id=rec["run_id"],
+                outcome="STALE_CLAIM_RESET",
+                failure_code=FailureCode.INTERRUPTED_RESET.value,
+                details=json.dumps({
+                    "canonical_id": rec["canonical_id"],
+                    "worker_id": rec["worker_id"],
+                    "prior_state": rec["prior_state"],
+                    "new_state": rec["new_state"],
+                    "claimed_at": rec["claimed_at"],
+                    "reset_timestamp": rec["reset_timestamp"],
+                    "timeout_minutes": timeout_minutes,
+                }),
+            ))
+        except Exception as exc:
+            logger.debug(
+                "Stale claim reaper: audit log failed for %s: %s",
+                rec["canonical_id"], exc,
+            )
+
+    if applied_count > 0:
+        logger.warning(
+            "Stale claim reaper: reset %d papers "
+            "(timeout=%dmin, cutoff=%s)",
+            applied_count, timeout_minutes, cutoff_iso,
+        )
+    return applied_count
+
+
+async def stale_claim_reaper_loop(
+    db: Any,
+    shutdown_event: asyncio.Event,
+    interval_s: float = STALE_CLAIM_CHECK_INTERVAL_S,
+    timeout_minutes: int = STALE_CLAIM_TIMEOUT_MINUTES,
+) -> None:
+    """Periodic stale claim reaper.
+
+    Runs every interval_s seconds until shutdown is signaled. Each iteration
+    calls run_stale_claim_reaper_once. Exceptions are logged and do not
+    stop the loop.
+    """
+    logger.info(
+        "Stale claim reaper loop started (interval=%.0fs, timeout=%dmin)",
+        interval_s, timeout_minutes,
+    )
+
+    while not shutdown_event.is_set():
+        try:
+            await run_stale_claim_reaper_once(db, timeout_minutes)
+        except Exception as exc:
+            logger.error(
+                "Stale claim reaper: unhandled exception: %s\n%s",
+                exc, traceback.format_exc(),
+            )
+
+        # Wait interval or until shutdown
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(), timeout=interval_s
+            )
+            break  # shutdown signaled
+        except asyncio.TimeoutError:
+            pass  # normal: keep looping
+
+    logger.info("Stale claim reaper loop stopped")
 
 
 # ===========================================================================
@@ -555,6 +758,22 @@ class WorkerPool:
             "min_disk_space_bytes", DEFAULT_MIN_DISK_SPACE_BYTES
         )
 
+        # One-shot stale claim reaper BEFORE workers start.
+        # Clears any papers left stuck in RETRIEVING/VALIDATING by a crashed
+        # or killed prior run, so fresh workers don't find the queue empty
+        # while stale papers hoard their claims.
+        try:
+            initial_reset = await run_stale_claim_reaper_once(self._db)
+            if initial_reset > 0:
+                logger.warning(
+                    "WorkerPool startup: stale claim reaper reset %d papers",
+                    initial_reset,
+                )
+        except Exception as exc:
+            logger.error(
+                "WorkerPool startup: stale claim reaper failed: %s", exc
+            )
+
         # Start retrieval workers
         for i in range(self._retrieval_concurrency):
             wid = generate_worker_id(f"ret-{i}")
@@ -605,6 +824,19 @@ class WorkerPool:
             name="disk-space-monitor",
         )
         self._monitor_tasks.append(disk_task)
+
+        # Start stale claim reaper — runs every 10 minutes while active.
+        # Any paper that remains in RETRIEVING or VALIDATING for more than
+        # 30 minutes is assumed to have been abandoned by a crashed worker
+        # and is reset so another worker can pick it up.
+        reaper_task = asyncio.create_task(
+            stale_claim_reaper_loop(
+                db=self._db,
+                shutdown_event=self._shutdown_event,
+            ),
+            name="stale-claim-reaper",
+        )
+        self._monitor_tasks.append(reaper_task)
 
         logger.info(
             "WorkerPool started: %d retrieval, %d validation workers (run=%s)",
