@@ -1388,3 +1388,297 @@ async def captcha_resolved() -> JSONResponse:
         "status": "captcha_resolved",
         "message": "CAPTCHA marked as resolved. Retrieval will resume.",
     })
+
+
+# ===========================================================================
+# RESULTS & PAPER ENDPOINTS
+# ===========================================================================
+
+
+@app.get("/api/papers")
+async def get_papers(
+    run_id: Optional[str] = Query(default=None),
+    state_filter: Optional[str] = Query(default=None, description="all|downloaded|partial|mismatch|failed|manual"),
+    sort_by: str = Query(default="created_at"),
+    sort_order: str = Query(default="ASC"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> JSONResponse:
+    """Fetch papers for the results table with filters and pagination."""
+    db = _get_db()
+
+    papers, total_count = await db.get_results_table(
+        run_id=run_id,
+        state_filter=state_filter,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        limit=limit,
+        offset=offset,
+    )
+
+    return JSONResponse({
+        "papers": [PaperResponse.from_paper(p).model_dump() for p in papers],
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@app.get("/api/paper/{canonical_id}")
+async def get_paper_detail(canonical_id: str) -> JSONResponse:
+    """Get full detail for a single paper including audit log."""
+    db = _get_db()
+
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+
+    audit_entries = await db.get_audit_log_for_paper(canonical_id, limit=100)
+    supplements = await db.get_supplements_for_paper(canonical_id)
+    run_history = await db.get_paper_run_history(canonical_id)
+
+    return JSONResponse({
+        "paper": PaperResponse.from_paper(paper).model_dump(),
+        "audit_log": [e.to_dict() for e in audit_entries],
+        "supplements": [s.to_dict() for s in supplements],
+        "run_history": [
+            {
+                "run_id": pr.run_id,
+                "submitted": pr.submitted_in_this_run,
+                "attempted": pr.retrieval_attempted_in_this_run,
+                "outcome": pr.outcome_in_this_run,
+            }
+            for pr in run_history
+        ],
+    })
+
+
+@app.post("/api/override")
+async def apply_override(request: OverrideRequest) -> JSONResponse:
+    """Apply a user validation override on a flagged paper.
+
+    action='confirm_correct': Accept with free-text reason.
+    action='re_retrieve': Reset to READY_FOR_RETRIEVAL.
+    """
+    db = _get_db()
+
+    if request.action == "confirm_correct" and not request.reason.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="A reason is required when confirming a flagged paper.",
+        )
+
+    success = await db.apply_user_override(
+        canonical_id=request.canonical_id,
+        action=request.action,
+        reason=request.reason,
+    )
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Paper not found or override failed")
+
+    return JSONResponse({
+        "status": "override_applied",
+        "canonical_id": request.canonical_id,
+        "action": request.action,
+    })
+
+
+# ===========================================================================
+# EXPORT ENDPOINTS
+# ===========================================================================
+
+
+@app.get("/api/export/excel")
+async def export_excel(
+    run_id: Optional[str] = Query(default=None),
+) -> FileResponse:
+    """Export results as Excel (.xlsx) with two sheets.
+
+    Sheet 1: Full results table.
+    Sheet 2: Summary statistics.
+    """
+    db = _get_db()
+
+    try:
+        import openpyxl
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="openpyxl required for Excel export. Install: pip install openpyxl",
+        )
+
+    # Fetch data
+    if run_id:
+        papers = await db.get_papers_by_run(run_id, limit=10000)
+    else:
+        papers = await db.get_all_papers(limit=10000)
+
+    summary = await db.get_summary_stats(run_id=run_id)
+
+    # Build workbook
+    wb = openpyxl.Workbook()
+
+    # Sheet 1: Full results
+    ws1 = wb.active
+    ws1.title = "Results"
+    headers = [
+        "Canonical ID", "DOI", "PMID", "Title", "Authors", "Year", "Journal",
+        "State", "Validation Status", "Identity Status", "Version Type",
+        "Integrity Score", "Confidence", "Retrieval Tier", "Attempts",
+        "Failure Code", "PDF Filename", "Size (bytes)", "Pages",
+        "OCR Applied", "Supplements", "Override", "Override Reason",
+        "Run ID", "Drift Version",
+    ]
+    ws1.append(headers)
+
+    for p in papers:
+        ws1.append([
+            p.canonical_id, p.doi, p.pmid, p.title, p.authors, p.year,
+            p.journal, p.state, p.validation_status, p.identity_status,
+            p.version_type, p.integrity_score, p.confidence_level,
+            p.retrieval_tier, p.attempt_count, p.last_failure_code,
+            p.pdf_filename, p.pdf_size_bytes, p.pdf_page_count,
+            "Yes" if p.ocr_applied else "No", p.supplement_count,
+            p.user_override, p.override_reason, p.run_id,
+            p.content_drift_version,
+        ])
+
+    # Sheet 2: Summary
+    ws2 = wb.create_sheet("Summary")
+    summary_rows = [
+        ("Total Papers", summary.get("total_papers", 0)),
+        ("Completed", summary.get("completed", 0)),
+        ("Failed", summary.get("failed", 0)),
+        ("Manual Required", summary.get("manual_required", 0)),
+        ("Success Rate", f"{summary.get('success_rate', 0):.1%}"),
+        ("OCR Count", summary.get("ocr_count", 0)),
+        ("Content Drift Count", summary.get("content_drift_count", 0)),
+        ("Overrides Confirmed", summary.get("overrides_confirmed", 0)),
+        ("Overrides Re-retrieved", summary.get("overrides_reretried", 0)),
+        ("Cooldown Events", summary.get("cooldown_events", 0)),
+        ("Avg Retrieval Time (ms)", summary.get("avg_retrieval_time_ms", 0)),
+        ("Avg Attempts", summary.get("avg_attempts", 0)),
+        ("Already Retrieved", summary.get("already_retrieved_count", 0)),
+    ]
+    ws2.append(["Metric", "Value"])
+    for metric, value in summary_rows:
+        ws2.append([metric, value])
+
+    # Score distribution
+    ws2.append([])
+    ws2.append(["Score Distribution", "Count"])
+    for level, count in summary.get("score_distribution", {}).items():
+        ws2.append([level, count])
+
+    # Save to temp file
+    export_dir = os.path.join(_get_config().get("output_directory", "./downloads"), "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"acquisition_report_{timestamp}.xlsx"
+    filepath = os.path.join(export_dir, filename)
+    wb.save(filepath)
+    wb.close()
+
+    return FileResponse(
+        filepath,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+
+@app.get("/api/export/prisma")
+async def export_prisma(
+    run_id: str = Query(..., description="Run ID for PRISMA report"),
+) -> FileResponse:
+    """Export PRISMA 2020 compliance report as CSV for a specific run."""
+    db = _get_db()
+
+    report = await db.generate_prisma_report(run_id)
+
+    # Write CSV
+    export_dir = os.path.join(_get_config().get("output_directory", "./downloads"), "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"prisma_{run_id}_{timestamp}.csv"
+    filepath = os.path.join(export_dir, filename)
+
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Category", "Count"])
+        writer.writerow(["Run ID", report.run_id])
+        writer.writerow(["Total Sought", report.total_sought])
+        writer.writerow(["Verified (Retrieved + Validated)", report.verified])
+        writer.writerow(["Flagged (Needs Review)", report.flagged])
+        writer.writerow(["Not Retrieved - No OA Source", report.not_retrieved_no_oa])
+        writer.writerow(["Not Retrieved - Paywall", report.not_retrieved_paywall])
+        writer.writerow(["Not Retrieved - Access Denied", report.not_retrieved_access_denied])
+        writer.writerow(["Not Retrieved - Not Found", report.not_retrieved_not_found])
+        writer.writerow(["Not Retrieved - Timeout", report.not_retrieved_timeout])
+        writer.writerow(["Not Retrieved - Other", report.not_retrieved_other])
+        writer.writerow(["Manual Required", report.manual_required])
+        writer.writerow(["Already Retrieved (Prior Run)", report.already_retrieved])
+        writer.writerow(["User Overrides - Confirmed", report.user_overrides_confirmed])
+        writer.writerow(["User Overrides - Re-retrieved", report.user_overrides_reretried])
+
+    return FileResponse(
+        filepath,
+        media_type="text/csv",
+        filename=filename,
+    )
+
+
+@app.get("/api/export/audit")
+async def export_audit(
+    run_id: Optional[str] = Query(default=None),
+) -> FileResponse:
+    """Export complete audit log as JSONL (per run_id or all)."""
+    db = _get_db()
+
+    entries = await db.export_audit_log_jsonl(run_id=run_id)
+
+    export_dir = os.path.join(_get_config().get("output_directory", "./downloads"), "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_suffix = f"_{run_id}" if run_id else "_all"
+    filename = f"audit_log{run_suffix}_{timestamp}.jsonl"
+    filepath = os.path.join(export_dir, filename)
+
+    with open(filepath, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, default=str) + "\n")
+
+    return FileResponse(
+        filepath,
+        media_type="application/jsonl",
+        filename=filename,
+    )
+
+
+@app.get("/api/export/integration")
+async def export_integration(
+    run_id: Optional[str] = Query(default=None),
+) -> FileResponse:
+    """Export integration JSON for downstream tools (ASReview, etc.)."""
+    db = _get_db()
+
+    exports = await db.build_integration_export_bulk(run_id=run_id, limit=10000)
+
+    export_dir = os.path.join(_get_config().get("output_directory", "./downloads"), "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_suffix = f"_{run_id}" if run_id else "_all"
+    filename = f"integration{run_suffix}_{timestamp}.json"
+    filepath = os.path.join(export_dir, filename)
+
+    with open(filepath, "w") as f:
+        json.dump(
+            [e.model_dump() for e in exports],
+            f, indent=2, default=str,
+        )
+
+    return FileResponse(
+        filepath,
+        media_type="application/json",
+        filename=filename,
+    )
