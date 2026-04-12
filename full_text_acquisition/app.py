@@ -1682,3 +1682,278 @@ async def export_integration(
         media_type="application/json",
         filename=filename,
     )
+
+
+# ===========================================================================
+# SETTINGS ENDPOINTS
+# ===========================================================================
+
+
+@app.get("/api/settings")
+async def get_settings() -> JSONResponse:
+    """Get current system settings and runtime status."""
+    config = _get_config()
+    wizard: Optional[WizardResult] = app_state.get("wizard_result")
+
+    resp = SettingsResponse(
+        config=config,
+        ocr_available=wizard.ocr_available if wizard else False,
+        tesseract_available=wizard.tesseract_available if wizard else False,
+        ghostscript_available=wizard.ghostscript_available if wizard else False,
+        playwright_installed=wizard.playwright_ok if wizard else False,
+        python_version=wizard.python_version if wizard else platform.python_version(),
+        platform=platform.system(),
+    )
+
+    return JSONResponse(resp.model_dump())
+
+
+@app.put("/api/settings")
+async def update_settings(update: SettingsUpdate) -> JSONResponse:
+    """Update system configuration.
+
+    Only provided (non-None) fields are updated.
+    Changes are persisted to config.json immediately.
+    """
+    config = _get_config()
+
+    updated_fields: List[str] = []
+    update_dict = update.model_dump(exclude_none=True)
+
+    for key, value in update_dict.items():
+        if key in config and config[key] != value:
+            config[key] = value
+            updated_fields.append(key)
+        elif key not in config:
+            config[key] = value
+            updated_fields.append(key)
+
+    if updated_fields:
+        save_config(config)
+        app_state["config"] = config
+
+        await _get_db().log_audit(AuditLogEntry(
+            outcome="SETTINGS_UPDATED",
+            details=json.dumps({
+                "updated_fields": updated_fields,
+                "new_values": {k: config[k] for k in updated_fields},
+            }),
+        ))
+
+        logger.info("Settings updated: %s", updated_fields)
+
+    return JSONResponse({
+        "status": "updated",
+        "fields_changed": updated_fields,
+        "config": config,
+    })
+
+
+@app.post("/api/cache/clear")
+async def clear_cache() -> JSONResponse:
+    """Clear all API response cache entries."""
+    db = _get_db()
+    deleted = await db.clear_all_cache()
+    await db.log_audit(AuditLogEntry(
+        outcome="CACHE_CLEARED",
+        details=json.dumps({"entries_deleted": deleted}),
+    ))
+    return JSONResponse({"status": "cleared", "entries_deleted": deleted})
+
+
+@app.get("/api/cache/stats")
+async def get_cache_stats() -> JSONResponse:
+    """Get API cache statistics."""
+    db = _get_db()
+    stats = await db.get_cache_stats()
+    return JSONResponse(stats)
+
+
+@app.post("/api/wizard")
+async def run_wizard_endpoint() -> JSONResponse:
+    """Re-run the first-launch setup wizard manually."""
+    config = _get_config()
+    db = _get_db()
+
+    wizard = await run_wizard(config, db)
+    app_state["wizard_result"] = wizard
+
+    # Update engine OCR flags
+    engine = app_state.get("engine")
+    if engine:
+        engine.tesseract_available = wizard.tesseract_available
+        engine.ghostscript_available = wizard.ghostscript_available
+
+    return JSONResponse(wizard.to_dict())
+
+
+@app.post("/api/cooldown/force")
+async def force_cooldown(
+    publisher: str = Query(...),
+    minutes: int = Query(default=30, ge=1, le=120),
+) -> JSONResponse:
+    """Force a publisher into cooldown (manual override from UI)."""
+    db = _get_db()
+    success = await db.force_publisher_cooldown(publisher, minutes)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to set cooldown")
+    return JSONResponse({
+        "status": "cooldown_set",
+        "publisher": publisher,
+        "minutes": minutes,
+    })
+
+
+@app.post("/api/cooldown/reset")
+async def reset_cooldown(
+    publisher: str = Query(...),
+) -> JSONResponse:
+    """Clear cooldown for a specific publisher."""
+    db = _get_db()
+    success = await db.reset_publisher_cooldown(publisher)
+    return JSONResponse({
+        "status": "cooldown_reset" if success else "not_found",
+        "publisher": publisher,
+    })
+
+
+# ===========================================================================
+# HEALTH DASHBOARD — SSE + SNAPSHOT
+# ===========================================================================
+
+
+@app.get("/api/health/stream")
+async def health_stream(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream for live health metrics.
+
+    Sends a health metrics JSON event every 3 seconds.
+    Connection closes when the client disconnects or shutdown is signaled.
+    """
+    config = _get_config()
+    backpressure_threshold = config.get(
+        "backpressure_threshold", DEFAULT_BACKPRESSURE_THRESHOLD
+    )
+
+    async def event_generator() -> AsyncIterator[str]:
+        shutdown_event: asyncio.Event = app_state.get(
+            "shutdown_event", asyncio.Event()
+        )
+
+        while not shutdown_event.is_set():
+            # Check if client disconnected
+            if await request.is_disconnected():
+                break
+
+            try:
+                db = _get_db()
+                metrics = await db.get_health_metrics(
+                    backpressure_threshold=backpressure_threshold,
+                )
+
+                # Add worker pool status
+                wp = app_state.get("worker_pool")
+                if wp:
+                    wp_status = wp.get_status()
+                    metrics.retrieval_workers_paused = wp_status.get("retrieval_paused", False)
+                    metrics.validation_workers_paused = wp_status.get("validation_paused", False)
+
+                data = json.dumps(metrics.model_dump(), default=str)
+                yield f"data: {data}\n\n"
+
+            except Exception as exc:
+                logger.debug("Health stream error: %s", exc)
+                yield f"data: {{\"error\": \"{exc}\"}}\n\n"
+
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(), timeout=3.0
+                )
+                break  # Shutdown signaled
+            except asyncio.TimeoutError:
+                pass  # Normal: no shutdown, keep streaming
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/health")
+async def health_snapshot() -> JSONResponse:
+    """One-shot health metrics snapshot."""
+    config = _get_config()
+    db = _get_db()
+    metrics = await db.get_health_metrics(
+        backpressure_threshold=config.get(
+            "backpressure_threshold", DEFAULT_BACKPRESSURE_THRESHOLD
+        ),
+    )
+    return JSONResponse(metrics.model_dump())
+
+
+# ===========================================================================
+# STATIC FILE SERVING & UI
+# ===========================================================================
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index() -> HTMLResponse:
+    """Serve the single-page UI."""
+    template_path = os.path.join(
+        os.path.dirname(__file__), "templates", "index.html"
+    )
+    if not os.path.isfile(template_path):
+        return HTMLResponse(
+            content="<h1>Full-Text Acquisition System</h1>"
+            "<p>templates/index.html not found. Place it in the templates directory.</p>",
+            status_code=200,
+        )
+    with open(template_path, "r") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/api/status")
+async def system_status() -> JSONResponse:
+    """Overall system status for the UI to check on load."""
+    wp = app_state.get("worker_pool")
+    wizard: Optional[WizardResult] = app_state.get("wizard_result")
+
+    return JSONResponse({
+        "initialized": app_state.get("db") is not None,
+        "workers_running": wp.is_running if wp else False,
+        "workers_paused": wp.is_paused if wp else False,
+        "wizard_ok": all([
+            wizard.python_ok if wizard else False,
+            wizard.dependencies_ok if wizard else False,
+            wizard.config_ok if wizard else False,
+        ]),
+        "wizard_errors": wizard.errors if wizard else [],
+        "ocr_mode": wizard.ocr_mode if wizard else "disabled",
+        "platform": platform.system(),
+    })
+
+
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
+
+
+def main() -> None:
+    """Launch the application."""
+    uvicorn.run(
+        "full_text_acquisition.app:app",
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
