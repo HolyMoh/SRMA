@@ -3088,7 +3088,13 @@ class RetrievalEngine:
     ) -> str:
         """CHECK 6: Metadata-DOI cross-check.
 
-        Searches first 3 pages text + PDF metadata for target DOI.
+        Priority:
+            1. Target DOI literally present in first-3-pages text    → DOI_VERIFIED
+            2. Target DOI URL form present                            → DOI_VERIFIED
+            3. A different DOI present                                → VERSION_MISMATCH
+            4. rapidfuzz.token_set_ratio(title, first_3_pages) ≥ 85   → TITLE_VERIFIED
+            5. rapidfuzz.token_set_ratio(title, later_pages)   ≥ 85   → TITLE_VERIFIED_WEAK
+            6. Otherwise                                              → CONTENT_UNVERIFIED
 
         Returns IdentityStatus value.
         """
@@ -3128,19 +3134,57 @@ class RetrievalEngine:
                 )
                 return IdentityStatus.VERSION_MISMATCH.value
 
-        # Fuzzy title match (≥85%)
+        # Fuzzy title match (rapidfuzz.token_set_ratio, threshold 85)
         if paper.title:
             title_norm = normalize_title(paper.title)
             if title_norm and len(title_norm) > 10:
-                similarity = self._fuzzy_title_match(title_norm, text_lower)
-                if similarity >= TITLE_FUZZY_THRESHOLD:
+                # Phase 1: match against the first-3-pages text (the caller
+                # passes this in via `extracted_text`).
+                score_first3 = self._fuzzy_title_match(title_norm, text_lower)
+                if score_first3 >= TITLE_FUZZY_THRESHOLD:
                     await self._log_validation_check(
                         paper.canonical_id, run_id, "CHECK_6_IDENTITY",
                         True,
-                        f"Title fuzzy match: {similarity:.2f}",
+                        f"Title fuzzy match (first 3 pages): "
+                        f"{score_first3 * 100:.1f}%",
                         start_ms,
                     )
                     return IdentityStatus.TITLE_VERIFIED.value
+
+                # Phase 2: extract later pages and retry. If the title only
+                # appears in the body/references, it's likely an incidental
+                # mention rather than the actual title → downgrade confidence.
+                later_text = await self._extract_later_pages_text(
+                    paper.pdf_path
+                )
+                if later_text:
+                    score_later = self._fuzzy_title_match(
+                        title_norm, later_text.lower()
+                    )
+                    if score_later >= TITLE_FUZZY_THRESHOLD:
+                        await self._log(
+                            canonical_id=paper.canonical_id,
+                            run_id=run_id,
+                            method="CHECK_6_TITLE_WEAK",
+                            outcome=IdentityStatus.TITLE_VERIFIED_WEAK.value,
+                            details={
+                                "score_first_3_pages_pct": round(score_first3 * 100, 1),
+                                "score_later_pages_pct": round(score_later * 100, 1),
+                                "reason": (
+                                    "Title matched only outside first 3 pages "
+                                    "— likely incidental (references/body) "
+                                    "rather than actual title."
+                                ),
+                            },
+                        )
+                        await self._log_validation_check(
+                            paper.canonical_id, run_id, "CHECK_6_IDENTITY",
+                            True,
+                            f"Title fuzzy match (WEAK, later pages only): "
+                            f"{score_later * 100:.1f}%",
+                            start_ms,
+                        )
+                        return IdentityStatus.TITLE_VERIFIED_WEAK.value
 
         # No match at all
         await self._log_validation_check(
@@ -3149,20 +3193,91 @@ class RetrievalEngine:
         )
         return IdentityStatus.CONTENT_UNVERIFIED.value
 
+    async def _extract_later_pages_text(
+        self,
+        pdf_path: Optional[str],
+        skip_first: int = 3,
+        max_pages: int = 50,
+    ) -> str:
+        """Extract text from pages AFTER the first `skip_first` pages.
+
+        Used by Check 6 to detect titles that appear only in the body or
+        references (indicating an incidental match, not the real title).
+        Capped at `max_pages` pages to avoid runaway extraction on huge PDFs.
+        """
+        if not pdf_path or not os.path.isfile(pdf_path):
+            return ""
+
+        text = ""
+        try:
+            try:
+                import fitz  # PyMuPDF
+
+                doc = fitz.open(pdf_path)
+                total = len(doc)
+                end = min(total, skip_first + max_pages)
+                for i in range(skip_first, end):
+                    text += doc[i].get_text() + "\n"
+                doc.close()
+            except ImportError:
+                from pypdf import PdfReader
+
+                reader = PdfReader(pdf_path)
+                total = len(reader.pages)
+                end = min(total, skip_first + max_pages)
+                for i in range(skip_first, end):
+                    text += (reader.pages[i].extract_text() or "") + "\n"
+        except Exception as exc:
+            logger.debug(
+                "Later-pages text extraction failed for %s: %s",
+                pdf_path, exc,
+            )
+            return ""
+
+        return text
+
     @staticmethod
     def _fuzzy_title_match(title_norm: str, text_lower: str) -> float:
-        """Compute a simple token-overlap similarity between title and text.
+        """Fuzzy similarity between a paper title and a body of text.
 
-        Returns a float between 0.0 and 1.0.
+        Uses rapidfuzz.fuzz.token_set_ratio and returns a value in [0.0, 1.0]
+        to preserve the original function signature (callers compare against
+        TITLE_FUZZY_THRESHOLD = 0.85). token_set_ratio is robust to token
+        reordering and insertions (publisher headers, footnotes), whereas
+        the old token-overlap implementation over-accepted any document
+        containing the title words scattered anywhere.
+
+        If rapidfuzz is unavailable, falls back to a conservative
+        SequenceMatcher-based ratio that is stricter than pure token
+        overlap — we err on the side of FALSE NEGATIVE.
         """
-        title_tokens = set(title_norm.split())
-        title_tokens -= STOPWORDS
-        if not title_tokens:
+        if not title_norm or not text_lower:
             return 0.0
 
-        # Check what fraction of title tokens appear in the text
-        found = sum(1 for t in title_tokens if t in text_lower)
-        return found / len(title_tokens)
+        try:
+            from rapidfuzz import fuzz
+            # rapidfuzz returns 0–100; normalize to 0.0–1.0 for the
+            # existing 0.85 threshold in TITLE_FUZZY_THRESHOLD.
+            return float(fuzz.token_set_ratio(title_norm, text_lower)) / 100.0
+        except ImportError:
+            # Fallback: difflib SequenceMatcher over a sliding window of
+            # len(title)*2 characters — still much stricter than pure
+            # token overlap.
+            import difflib
+            title_len = len(title_norm)
+            best = 0.0
+            window = max(title_len * 2, 200)
+            step = max(title_len, 100)
+            for start in range(0, max(1, len(text_lower) - title_len), step):
+                snippet = text_lower[start:start + window]
+                ratio = difflib.SequenceMatcher(
+                    None, title_norm, snippet
+                ).ratio()
+                if ratio > best:
+                    best = ratio
+                if best >= 1.0:
+                    break
+            return best
 
     async def _check7_content_drift(
         self,
@@ -3273,6 +3388,13 @@ class RetrievalEngine:
             if ocr_applied:
                 return ValidationStatus.PARTIAL_OCR.value
             return ValidationStatus.VALID_TITLE.value
+
+        if identity_status == IdentityStatus.TITLE_VERIFIED_WEAK.value:
+            # Title only found outside the first 3 pages — treat as
+            # partial identity regardless of OCR. Flagged for review;
+            # does not auto-complete per the VERSION_MISMATCH /
+            # CONTENT_UNVERIFIED hard-constraint rule.
+            return ValidationStatus.VALID_TITLE_WEAK.value
 
         if identity_status == IdentityStatus.VERSION_MISMATCH.value:
             return ValidationStatus.VERSION_MISMATCH.value
@@ -3613,10 +3735,12 @@ class RetrievalEngine:
         # Refresh paper to get updated fields
         paper = await self._db.get_paper(paper.canonical_id) or paper
 
-        # HARD CONSTRAINT: VERSION_MISMATCH or CONTENT_UNVERIFIED → never auto-succeed
+        # HARD CONSTRAINT: VERSION_MISMATCH / CONTENT_UNVERIFIED /
+        # TITLE_VERIFIED_WEAK → never auto-succeed. User must override.
         if identity_status in (
             IdentityStatus.VERSION_MISMATCH.value,
             IdentityStatus.CONTENT_UNVERIFIED.value,
+            IdentityStatus.TITLE_VERIFIED_WEAK.value,
         ):
             # Still continue with scoring and storage, but don't mark COMPLETE
             pass

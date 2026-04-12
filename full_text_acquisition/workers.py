@@ -572,6 +572,7 @@ async def validation_worker(
                         if identity_status in (
                             "VERSION_MISMATCH",
                             "CONTENT_UNVERIFIED",
+                            "TITLE_VERIFIED_WEAK",
                         ):
                             # Leave at VALIDATED — user must override
                             await db.update_paper_run_outcome(
