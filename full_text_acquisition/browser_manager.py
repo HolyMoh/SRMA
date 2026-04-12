@@ -355,3 +355,217 @@ class BrowserManager:
             yield context
         finally:
             await self.close_disposable_context(context)
+
+    # -----------------------------------------------------------------------
+    # Persistent context (Tier 3/3.5) — per-session, headed, stealth
+    # -----------------------------------------------------------------------
+
+    async def create_persistent_context(self) -> Any:
+        """Create a headed, persistent browser context for SSO sessions.
+
+        Features:
+            - Headed Chromium (user can see and interact)
+            - Stealth scripts injected
+            - Cookies retained across papers for SSO
+            - Only one persistent context at a time
+
+        Destroys any existing persistent context before creating a new one.
+        Returns the BrowserContext.
+        """
+        async with self._lock:
+            # Close existing persistent context if any
+            if self._persistent_context is not None:
+                try:
+                    await self._persistent_context.close()
+                except Exception as exc:
+                    logger.debug(
+                        "Error closing old persistent context: %s", exc
+                    )
+                self._persistent_context = None
+
+        # Need a headed browser — close headless if running and relaunch
+        async with self._lock:
+            if self._browser is not None and self._browser.is_connected():
+                # Check if there are active disposable contexts
+                if self._disposable_contexts:
+                    logger.warning(
+                        "Launching headed browser while %d disposable "
+                        "contexts are active. They will continue on the "
+                        "existing browser instance.",
+                        len(self._disposable_contexts),
+                    )
+
+        browser = await self.ensure_browser(headless=False)
+
+        try:
+            context = await browser.new_context(
+                viewport=HEADED_VIEWPORT,
+                java_script_enabled=True,
+                accept_downloads=True,
+                ignore_https_errors=False,
+            )
+            await self._inject_stealth(context)
+
+            async with self._lock:
+                self._persistent_context = context
+
+            logger.info("Persistent SSO context created (headed)")
+            return context
+        except Exception as exc:
+            logger.error(
+                "Failed to create persistent context: %s: %s\n%s",
+                type(exc).__name__,
+                exc,
+                traceback.format_exc(),
+            )
+            raise
+
+    async def get_persistent_context(self) -> Any:
+        """Get the existing persistent context, or create one if absent.
+
+        Returns the BrowserContext for Tier 3/3.5 operations.
+        """
+        async with self._lock:
+            if self._persistent_context is not None:
+                try:
+                    # Verify context is still usable by checking pages
+                    _ = self._persistent_context.pages
+                    return self._persistent_context
+                except Exception:
+                    logger.warning(
+                        "Persistent context is no longer valid, recreating"
+                    )
+                    self._persistent_context = None
+
+        return await self.create_persistent_context()
+
+    async def destroy_persistent_context(self, reason: str = "shutdown") -> None:
+        """Destroy the persistent SSO context.
+
+        Called on:
+            - User logout
+            - SESSION_EXPIRED retries exhausted
+            - Graceful shutdown
+            - Manual re-authentication request
+
+        Args:
+            reason: Why the context is being destroyed (for logging).
+        """
+        async with self._lock:
+            if self._persistent_context is None:
+                return
+
+            try:
+                await self._persistent_context.close()
+            except Exception as exc:
+                logger.debug(
+                    "Error closing persistent context: %s", exc
+                )
+            finally:
+                self._persistent_context = None
+                logger.info(
+                    "Persistent SSO context destroyed (reason: %s)", reason
+                )
+
+    @property
+    def has_persistent_context(self) -> bool:
+        """Check whether a persistent SSO context is currently active."""
+        return self._persistent_context is not None
+
+    async def get_sso_page(self) -> Any:
+        """Get or create a page in the persistent context for SSO navigation.
+
+        If the persistent context has existing pages, returns the first one.
+        Otherwise creates a new page.
+        """
+        context = await self.get_persistent_context()
+        pages = context.pages
+        if pages:
+            return pages[0]
+        return await context.new_page()
+
+    async def initiate_sso_login(
+        self,
+        sso_url: str,
+        page_load_timeout_s: float = DEFAULT_PAGE_LOAD_TIMEOUT_S,
+    ) -> Any:
+        """Navigate the persistent context to the SSO login URL.
+
+        The user is expected to complete authentication manually in
+        the headed browser. This method only navigates to the URL.
+
+        ABSOLUTE RULE: Never access anything the user types.
+
+        Returns the page after navigation.
+        """
+        page = await self.get_sso_page()
+        try:
+            await page.goto(
+                sso_url,
+                timeout=page_load_timeout_s * 1000,
+                wait_until="domcontentloaded",
+            )
+            logger.info("SSO login page loaded: %s", sso_url)
+            return page
+        except Exception as exc:
+            logger.error(
+                "Failed to navigate to SSO URL %s: %s: %s\n%s",
+                sso_url,
+                type(exc).__name__,
+                exc,
+                traceback.format_exc(),
+            )
+            raise
+
+    async def check_sso_session_valid(self) -> bool:
+        """Check whether the persistent SSO session appears active.
+
+        Looks for signs that the user is logged in:
+            - Persistent context exists
+            - At least one page is open
+            - No obvious session-expired indicators on the current page
+
+        This is a heuristic check, not a guarantee.
+        """
+        async with self._lock:
+            if self._persistent_context is None:
+                return False
+
+        try:
+            pages = self._persistent_context.pages
+            if not pages:
+                return False
+
+            page = pages[0]
+            url = page.url
+
+            # If we're on a login page, session is likely expired
+            login_indicators = [
+                "/login", "/signin", "/auth", "/sso",
+                "login.microsoftonline.com",
+                "shibboleth",
+                "wayf",
+            ]
+            url_lower = url.lower()
+            for indicator in login_indicators:
+                if indicator in url_lower:
+                    return False
+
+            return True
+        except Exception:
+            return False
+
+    async def handle_session_expired(
+        self,
+        sso_url: str,
+    ) -> Any:
+        """Handle a SESSION_EXPIRED event by re-creating the persistent context.
+
+        Destroys the current context, creates a fresh one, and navigates
+        to the SSO URL for user re-authentication.
+
+        Returns the page for the new SSO login.
+        """
+        logger.warning("SSO session expired, initiating re-authentication")
+        await self.destroy_persistent_context(reason="SESSION_EXPIRED")
+        return await self.initiate_sso_login(sso_url)
