@@ -1,0 +1,1701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Full-Text Acquisition System</title>
+    <style>
+        /* ============================================================
+           CSS Reset & Base
+           ============================================================ */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg-primary: #f8f9fa;
+            --bg-card: #ffffff;
+            --bg-sidebar: #1e293b;
+            --text-primary: #1e293b;
+            --text-secondary: #64748b;
+            --text-light: #f8fafc;
+            --border: #e2e8f0;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --info: #06b6d4;
+            --score-high: #10b981;
+            --score-medium: #f59e0b;
+            --score-low: #ef4444;
+            --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+            --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1);
+            --radius: 8px;
+            --radius-sm: 4px;
+            --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            --mono: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+        }
+
+        body {
+            font-family: var(--font);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.5;
+            min-height: 100vh;
+        }
+
+        /* ============================================================
+           Layout
+           ============================================================ */
+        .app-container {
+            display: grid;
+            grid-template-columns: 240px 1fr;
+            min-height: 100vh;
+        }
+
+        .sidebar {
+            background: var(--bg-sidebar);
+            color: var(--text-light);
+            padding: 20px 0;
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
+        }
+
+        .sidebar h1 {
+            font-size: 14px;
+            font-weight: 700;
+            padding: 0 20px 20px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .sidebar nav { padding: 12px 0; }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            padding: 10px 20px;
+            color: var(--text-light);
+            opacity: 0.7;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-size: 14px;
+            border-left: 3px solid transparent;
+        }
+
+        .nav-item:hover { opacity: 1; background: rgba(255,255,255,0.05); }
+        .nav-item.active {
+            opacity: 1;
+            background: rgba(255,255,255,0.1);
+            border-left-color: var(--accent);
+        }
+
+        .nav-item .nav-icon { margin-right: 10px; font-size: 16px; width: 20px; text-align: center; }
+
+        .main-content {
+            padding: 24px 32px;
+            overflow-y: auto;
+            max-width: 1400px;
+        }
+
+        /* ============================================================
+           Panels
+           ============================================================ */
+        .panel {
+            display: none;
+            animation: fadeIn 0.2s ease;
+        }
+
+        .panel.active { display: block; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        .panel-header h2 { font-size: 24px; font-weight: 700; }
+
+        /* ============================================================
+           Cards
+           ============================================================ */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .card-header h3 { font-size: 16px; font-weight: 600; }
+
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 16px;
+        }
+
+        .metric-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px;
+            text-align: center;
+        }
+
+        .metric-value {
+            font-size: 28px;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+
+        .metric-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 4px;
+        }
+
+        /* ============================================================
+           Buttons
+           ============================================================ */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 16px;
+            border: none;
+            border-radius: var(--radius-sm);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+            gap: 6px;
+        }
+
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+
+        .btn-success { background: var(--success); color: white; }
+        .btn-success:hover:not(:disabled) { background: #059669; }
+
+        .btn-warning { background: var(--warning); color: white; }
+        .btn-warning:hover:not(:disabled) { background: #d97706; }
+
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-danger:hover:not(:disabled) { background: #dc2626; }
+
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+        }
+        .btn-outline:hover:not(:disabled) { background: var(--bg-primary); }
+
+        .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+        .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+
+        /* ============================================================
+           Forms
+           ============================================================ */
+        .form-group { margin-bottom: 16px; }
+
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            font-weight: 500;
+            margin-bottom: 4px;
+            color: var(--text-secondary);
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            font-size: 14px;
+            font-family: var(--font);
+            transition: border-color 0.15s;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .form-hint {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        /* ============================================================
+           Tables
+           ============================================================ */
+        .table-container { overflow-x: auto; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        th {
+            text-align: left;
+            padding: 10px 12px;
+            background: var(--bg-primary);
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid var(--border);
+            white-space: nowrap;
+            cursor: pointer;
+        }
+
+        td {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            max-width: 250px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        tr:hover { background: rgba(59,130,246,0.03); }
+
+        /* ============================================================
+           Status badges & score colors
+           ============================================================ */
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .badge-success { background: #d1fae5; color: #065f46; }
+        .badge-warning { background: #fef3c7; color: #92400e; }
+        .badge-danger  { background: #fee2e2; color: #991b1b; }
+        .badge-info    { background: #cffafe; color: #155e75; }
+        .badge-neutral { background: #f1f5f9; color: #475569; }
+
+        .score-high   { color: var(--score-high); font-weight: 700; }
+        .score-medium { color: var(--score-medium); font-weight: 700; }
+        .score-low    { color: var(--score-low); font-weight: 700; }
+
+        /* ============================================================
+           Tabs (filter bar)
+           ============================================================ */
+        .tab-bar {
+            display: flex;
+            gap: 0;
+            border-bottom: 2px solid var(--border);
+            margin-bottom: 16px;
+        }
+
+        .tab {
+            padding: 10px 20px;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            transition: all 0.15s;
+        }
+
+        .tab:hover { color: var(--text-primary); }
+        .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+        .tab .tab-count {
+            background: var(--bg-primary);
+            padding: 1px 6px;
+            border-radius: 8px;
+            font-size: 11px;
+            margin-left: 6px;
+        }
+
+        /* ============================================================
+           Upload drop zone
+           ============================================================ */
+        .drop-zone {
+            border: 2px dashed var(--border);
+            border-radius: var(--radius);
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: var(--accent);
+            background: rgba(59,130,246,0.03);
+        }
+
+        .drop-zone-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.4; }
+        .drop-zone-text { color: var(--text-secondary); font-size: 14px; }
+        .drop-zone-text strong { color: var(--accent); }
+
+        /* ============================================================
+           Progress bar
+           ============================================================ */
+        .progress-container { margin-bottom: 16px; }
+
+        .progress-bar-bg {
+            height: 8px;
+            background: var(--bg-primary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 4px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+
+        .progress-stats {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 6px;
+        }
+
+        /* ============================================================
+           Log area
+           ============================================================ */
+        .log-area {
+            background: #1e293b;
+            color: #94a3b8;
+            font-family: var(--mono);
+            font-size: 12px;
+            padding: 16px;
+            border-radius: var(--radius);
+            max-height: 300px;
+            overflow-y: auto;
+            line-height: 1.6;
+        }
+
+        .log-area .log-entry { padding: 1px 0; }
+        .log-entry .log-time { color: #64748b; }
+        .log-entry .log-ok   { color: #34d399; }
+        .log-entry .log-warn { color: #fbbf24; }
+        .log-entry .log-err  { color: #f87171; }
+        .log-entry .log-info { color: #60a5fa; }
+
+        /* ============================================================
+           CAPTCHA overlay
+           ============================================================ */
+        .captcha-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.85);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .captcha-overlay.active { display: flex; }
+
+        .captcha-modal {
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            padding: 40px;
+            text-align: center;
+            max-width: 500px;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .captcha-modal h2 { color: var(--warning); margin-bottom: 16px; font-size: 24px; }
+        .captcha-modal p { color: var(--text-secondary); margin-bottom: 24px; }
+
+        /* ============================================================
+           Modal (for overrides)
+           ============================================================ */
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 900;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-backdrop.active { display: flex; }
+
+        .modal {
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            padding: 24px;
+            width: 90%;
+            max-width: 480px;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .modal h3 { margin-bottom: 16px; }
+
+        /* ============================================================
+           Pagination
+           ============================================================ */
+        .pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 16px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .pagination .page-btns { display: flex; gap: 4px; }
+
+        /* ============================================================
+           Toast notifications
+           ============================================================ */
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .toast {
+            padding: 12px 20px;
+            border-radius: var(--radius-sm);
+            color: white;
+            font-size: 13px;
+            font-weight: 500;
+            box-shadow: var(--shadow-lg);
+            animation: slideIn 0.3s ease, fadeOut 0.3s ease 3s forwards;
+            max-width: 360px;
+        }
+
+        .toast-success { background: var(--success); }
+        .toast-warning { background: var(--warning); }
+        .toast-error   { background: var(--danger); }
+        .toast-info    { background: var(--info); }
+
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        @keyframes fadeOut {
+            from { opacity: 1; }
+            to { opacity: 0; }
+        }
+
+        /* ============================================================
+           Cooldown list
+           ============================================================ */
+        .cooldown-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+
+        .cooldown-item .publisher { font-weight: 600; }
+        .cooldown-item .rate { color: var(--danger); }
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width: 900px) {
+            .app-container {
+                grid-template-columns: 1fr;
+            }
+            .sidebar {
+                position: relative;
+                height: auto;
+                display: flex;
+                overflow-x: auto;
+                padding: 10px;
+            }
+            .sidebar h1 { display: none; }
+            .sidebar nav { display: flex; padding: 0; }
+            .nav-item { padding: 8px 14px; border-left: none; border-bottom: 2px solid transparent; }
+            .nav-item.active { border-bottom-color: var(--accent); border-left-color: transparent; }
+            .main-content { padding: 16px; }
+        }
+    </style>
+</head>
+<body>
+<div class="toast-container" id="toastContainer"></div>
+
+<div class="app-container">
+    <!-- ============================================================
+         SIDEBAR
+         ============================================================ -->
+    <aside class="sidebar">
+        <h1>FT Acquisition</h1>
+        <nav>
+            <div class="nav-item active" data-panel="upload">
+                <span class="nav-icon">&#128194;</span> Upload
+            </div>
+            <div class="nav-item" data-panel="settings">
+                <span class="nav-icon">&#9881;</span> Settings
+            </div>
+            <div class="nav-item" data-panel="health">
+                <span class="nav-icon">&#128200;</span> Health
+            </div>
+            <div class="nav-item" data-panel="run">
+                <span class="nav-icon">&#9654;</span> Run
+            </div>
+            <div class="nav-item" data-panel="sso">
+                <span class="nav-icon">&#128274;</span> SSO
+            </div>
+            <div class="nav-item" data-panel="results">
+                <span class="nav-icon">&#128203;</span> Results
+            </div>
+        </nav>
+        <div style="padding:20px; margin-top:auto; font-size:11px; opacity:0.4;">
+            <div id="sidebarOcr">OCR: checking...</div>
+            <div id="sidebarWorkers">Workers: idle</div>
+        </div>
+    </aside>
+
+    <main class="main-content">
+        <!-- ============================================================
+             PANEL 1: UPLOAD
+             ============================================================ -->
+        <div id="panelUpload" class="panel active">
+            <div class="panel-header">
+                <h2>Upload Papers</h2>
+            </div>
+
+            <div class="card">
+                <div class="drop-zone" id="dropZone">
+                    <div class="drop-zone-icon">&#128196;</div>
+                    <div class="drop-zone-text">
+                        <strong>Click to upload</strong> or drag and drop<br>
+                        CSV, TSV, or Excel (.xlsx) from Rayyan or Covidence
+                    </div>
+                    <input type="file" id="fileInput" accept=".csv,.tsv,.xlsx,.xls" style="display:none">
+                </div>
+            </div>
+
+            <!-- Upload progress -->
+            <div class="card" id="uploadProgress" style="display:none">
+                <h3>Processing...</h3>
+                <div class="progress-container" style="margin-top:12px">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="uploadProgressBar" style="width:50%"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Upload results -->
+            <div class="card" id="uploadResults" style="display:none">
+                <div class="card-header">
+                    <h3>Ingestion Summary</h3>
+                    <span class="badge badge-success" id="uploadRunId"></span>
+                </div>
+
+                <div class="card-grid" style="margin-bottom:16px">
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadTotal">0</div>
+                        <div class="metric-label">Total Submitted</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadDedup">0</div>
+                        <div class="metric-label">Duplicates Removed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadAlready">0</div>
+                        <div class="metric-label">Already Retrieved</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="uploadReady">0</div>
+                        <div class="metric-label">Ready for Retrieval</div>
+                    </div>
+                </div>
+
+                <!-- Column mapping -->
+                <div class="card-header"><h3>Detected Columns</h3></div>
+                <div class="form-row" id="columnMapping" style="margin-bottom:16px"></div>
+
+                <!-- Preview table -->
+                <div class="card-header"><h3>Preview (first 10 rows)</h3></div>
+                <div class="table-container">
+                    <table id="previewTable">
+                        <thead><tr id="previewHead"></tr></thead>
+                        <tbody id="previewBody"></tbody>
+                    </table>
+                </div>
+
+                <div style="margin-top:16px">
+                    <button class="btn btn-primary" id="btnStartAfterUpload">Start Retrieval</button>
+                </div>
+            </div>
+
+            <!-- Deduplication report -->
+            <div class="card" id="dedupReport" style="display:none">
+                <div class="card-header"><h3>Deduplication Report</h3></div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>Paper A</th><th>Paper B</th><th>Match Type</th><th>Score</th></tr>
+                        </thead>
+                        <tbody id="dedupBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             PANEL 2: SETTINGS
+             ============================================================ -->
+        <div id="panelSettings" class="panel">
+            <div class="panel-header">
+                <h2>Settings</h2>
+                <button class="btn btn-primary" id="btnSaveSettings">Save Settings</button>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>System Status</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>OCR Status</label>
+                        <div id="settingsOcrStatus" class="badge badge-neutral" style="font-size:13px">Checking...</div>
+                        <div class="form-hint">Read-only. Install Tesseract + Ghostscript to enable.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Playwright</label>
+                        <div id="settingsPlaywright" class="badge badge-neutral">Checking...</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Python Version</label>
+                        <div id="settingsPython"></div>
+                    </div>
+                    <div class="form-group">
+                        <label>Platform</label>
+                        <div id="settingsPlatform"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Timeouts (seconds)</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>API Request</label>
+                        <input type="number" class="form-control" id="cfgApiTimeout" step="1" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label>PDF Download</label>
+                        <input type="number" class="form-control" id="cfgPdfTimeout" step="1" min="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Page Load</label>
+                        <input type="number" class="form-control" id="cfgPageLoad" step="1" min="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Selector Wait</label>
+                        <input type="number" class="form-control" id="cfgSelectorTimeout" step="1" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label>PDF Validation</label>
+                        <input type="number" class="form-control" id="cfgValidationTimeout" step="1" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label>OCR Per Page</label>
+                        <input type="number" class="form-control" id="cfgOcrTimeout" step="1" min="5">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Concurrency & Limits</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Retrieval Workers (1-5)</label>
+                        <input type="number" class="form-control" id="cfgRetrievalConc" min="1" max="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Validation Workers (1-3)</label>
+                        <input type="number" class="form-control" id="cfgValidationConc" min="1" max="3">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Retries</label>
+                        <input type="number" class="form-control" id="cfgMaxRetries" min="1" max="10">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Total Attempts</label>
+                        <input type="number" class="form-control" id="cfgMaxAttempts" min="1" max="50">
+                    </div>
+                    <div class="form-group">
+                        <label>Backpressure Threshold</label>
+                        <input type="number" class="form-control" id="cfgBackpressure" min="1" max="100">
+                    </div>
+                    <div class="form-group">
+                        <label>Min Disk Space (MB)</label>
+                        <input type="number" class="form-control" id="cfgDiskSpace" min="100" step="100">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Publisher Cooldowns</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Failure Threshold (0-1)</label>
+                        <input type="number" class="form-control" id="cfgCooldownThreshold" min="0" max="1" step="0.05">
+                    </div>
+                    <div class="form-group">
+                        <label>Window Size</label>
+                        <input type="number" class="form-control" id="cfgCooldownWindow" min="5" max="100">
+                    </div>
+                    <div class="form-group">
+                        <label>Cooldown Minutes</label>
+                        <input type="number" class="form-control" id="cfgCooldownMinutes" min="1" max="60">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Institutional Access</h3></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>EZproxy URL</label>
+                        <input type="url" class="form-control" id="cfgEzproxy" placeholder="https://proxy.university.edu">
+                    </div>
+                    <div class="form-group">
+                        <label>OpenAthens URL</label>
+                        <input type="url" class="form-control" id="cfgOpenAthens" placeholder="https://...">
+                    </div>
+                    <div class="form-group">
+                        <label>Institutional Resolver</label>
+                        <input type="url" class="form-control" id="cfgResolver" placeholder="https://resolver.university.edu">
+                    </div>
+                    <div class="form-group">
+                        <label>Unpaywall Email</label>
+                        <input type="email" class="form-control" id="cfgUnpaywallEmail" placeholder="your@email.edu">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>API Cache</h3>
+                    <button class="btn btn-outline btn-sm" id="btnClearCache">Clear Cache</button>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Cache TTL (days)</label>
+                        <input type="number" class="form-control" id="cfgCacheTtl" min="1" max="90">
+                    </div>
+                    <div class="form-group">
+                        <label>Active Entries</label>
+                        <div id="cacheActiveCount" style="padding:8px 0; font-weight:600">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>Setup Wizard</h3>
+                    <button class="btn btn-outline btn-sm" id="btnRerunWizard">Re-run Wizard</button>
+                </div>
+                <div id="wizardResults" style="font-size:13px; color:var(--text-secondary)">
+                    Click "Re-run Wizard" to check system dependencies.
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             PANEL 3: HEALTH DASHBOARD
+             ============================================================ -->
+        <div id="panelHealth" class="panel">
+            <div class="panel-header">
+                <h2>Health Dashboard</h2>
+                <span class="badge badge-info" id="healthLive">LIVE</span>
+            </div>
+
+            <div class="card-grid" id="healthMetrics">
+                <div class="metric-card">
+                    <div class="metric-value" id="hSuccessRate">-</div>
+                    <div class="metric-label">Retrieval Success Rate</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hAvgAttempts">-</div>
+                    <div class="metric-label">Avg Attempts / Paper</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hAvgTime">-</div>
+                    <div class="metric-label">Avg Retrieval Time</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hCacheRate">-</div>
+                    <div class="metric-label">Cache Hit Rate</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hTotal">0</div>
+                    <div class="metric-label">Total Papers</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value score-high" id="hCompleted">0</div>
+                    <div class="metric-label">Completed</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value score-low" id="hFailed">0</div>
+                    <div class="metric-label">Failed</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="hManual">0</div>
+                    <div class="metric-label">Manual Required</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Queue Status</h3></div>
+                <div class="card-grid">
+                    <div class="metric-card">
+                        <div class="metric-value" id="hRetrievalQueue">0</div>
+                        <div class="metric-label">Retrieval Queue</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="hValidationQueue">0</div>
+                        <div class="metric-label">Validation Queue</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="hBackpressure">0 / 20</div>
+                        <div class="metric-label">Backpressure (Weighted / Threshold)</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="hDiskSpace">-</div>
+                        <div class="metric-label">Disk Space Free</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Active Cooldowns</h3></div>
+                <div id="healthCooldowns">
+                    <div style="color:var(--text-secondary); font-size:13px">No active cooldowns</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Paywall Detections by Publisher</h3></div>
+                <div id="healthPaywalls">
+                    <div style="color:var(--text-secondary); font-size:13px">No paywall events</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             PANEL 4: RUN CONTROL
+             ============================================================ -->
+        <div id="panelRun" class="panel">
+            <div class="panel-header">
+                <h2>Run Control</h2>
+                <div class="btn-group">
+                    <select class="form-control" id="runSelector" style="width:200px;display:inline-block">
+                        <option value="">Select Run...</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>Controls</h3>
+                    <span class="badge" id="runStatusBadge">IDLE</span>
+                </div>
+                <div class="btn-group" style="margin-bottom:16px">
+                    <button class="btn btn-success" id="btnStart">Start</button>
+                    <button class="btn btn-warning" id="btnPause" disabled>Pause</button>
+                    <button class="btn btn-primary" id="btnResume" disabled>Resume</button>
+                    <button class="btn btn-danger" id="btnCancel" disabled>Cancel</button>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-outline" id="btnRetryFailed">Retry Failed</button>
+                    <button class="btn btn-outline" id="btnRetryMismatch">Retry Mismatch</button>
+                    <button class="btn btn-outline" id="btnRetryManual">Retry Manual</button>
+                    <button class="btn btn-outline" id="btnRetryAll">Retry All Eligible</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Progress</h3></div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="runProgressBar"></div>
+                    </div>
+                    <div class="progress-stats">
+                        <span id="runProgressText">0 / 0 papers</span>
+                        <span id="runProgressPercent">0%</span>
+                    </div>
+                </div>
+
+                <div class="card-grid" style="margin-top:16px">
+                    <div class="metric-card">
+                        <div class="metric-value score-high" id="runCompleted">0</div>
+                        <div class="metric-label">Completed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value score-low" id="runFailed">0</div>
+                        <div class="metric-label">Failed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value score-medium" id="runManual">0</div>
+                        <div class="metric-label">Manual</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="runRetrieving">0</div>
+                        <div class="metric-label">In Progress</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Activity Log</h3></div>
+                <div class="log-area" id="runLogArea">
+                    <div class="log-entry"><span class="log-info">Waiting for run to start...</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             PANEL 5: SSO
+             ============================================================ -->
+        <div id="panelSso" class="panel">
+            <div class="panel-header">
+                <h2>Institutional SSO Access</h2>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>Session Status</h3>
+                    <span class="badge" id="ssoStatusBadge">Not Connected</span>
+                </div>
+
+                <div style="margin-bottom:20px; color:var(--text-secondary); font-size:14px; line-height:1.7">
+                    <p><strong>How it works:</strong></p>
+                    <ol style="padding-left:20px; margin-top:8px">
+                        <li>Click <strong>Start SSO Login</strong> to open your institution's login page in a headed browser.</li>
+                        <li>Complete authentication manually (username, password, MFA).</li>
+                        <li>Click <strong>Continue</strong> when finished. The system will <em>never</em> access what you type.</li>
+                        <li>Tier 3 and 3.5 retrieval will use your authenticated session.</li>
+                    </ol>
+                    <p style="margin-top:12px">
+                        If your session expires (403 errors), click <strong>Re-authenticate</strong> to start fresh.
+                    </p>
+                </div>
+
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="btnSsoStart">Start SSO Login</button>
+                    <button class="btn btn-success" id="btnSsoContinue" disabled>Continue</button>
+                    <button class="btn btn-warning" id="btnSsoReauth" disabled>Re-authenticate</button>
+                </div>
+
+                <div id="ssoMessage" style="margin-top:16px; font-size:13px; color:var(--text-secondary)"></div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Configuration</h3></div>
+                <p style="font-size:13px; color:var(--text-secondary); margin-bottom:12px">
+                    SSO URLs are configured in the Settings panel. At least one must be set for Tier 3 retrieval.
+                </p>
+                <div id="ssoConfigSummary" style="font-size:13px"></div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             PANEL 6: RESULTS
+             ============================================================ -->
+        <div id="panelResults" class="panel">
+            <div class="panel-header">
+                <h2>Results</h2>
+                <div class="btn-group">
+                    <select class="form-control" id="resultsRunFilter" style="width:180px;display:inline-block">
+                        <option value="">All Runs</option>
+                    </select>
+                    <button class="btn btn-outline btn-sm" id="btnExportExcel">Export Excel</button>
+                    <button class="btn btn-outline btn-sm" id="btnExportPrisma">Export PRISMA</button>
+                    <button class="btn btn-outline btn-sm" id="btnExportAudit">Export Audit JSON</button>
+                    <button class="btn btn-outline btn-sm" id="btnExportIntegration">Export Integration</button>
+                </div>
+            </div>
+
+            <!-- Filter tabs -->
+            <div class="tab-bar" id="resultsTabBar">
+                <div class="tab active" data-filter="">All <span class="tab-count" id="tabCountAll">0</span></div>
+                <div class="tab" data-filter="downloaded">Downloaded <span class="tab-count" id="tabCountDownloaded">0</span></div>
+                <div class="tab" data-filter="partial">Partial <span class="tab-count" id="tabCountPartial">0</span></div>
+                <div class="tab" data-filter="mismatch">Mismatch <span class="tab-count" id="tabCountMismatch">0</span></div>
+                <div class="tab" data-filter="failed">Failed <span class="tab-count" id="tabCountFailed">0</span></div>
+                <div class="tab" data-filter="manual">Manual <span class="tab-count" id="tabCountManual">0</span></div>
+            </div>
+
+            <div class="card" style="padding:0">
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th data-sort="title">Title</th>
+                                <th data-sort="first_author_lastname">Author</th>
+                                <th data-sort="year">Year</th>
+                                <th>DOI</th>
+                                <th data-sort="state">State</th>
+                                <th>Status</th>
+                                <th>Identity</th>
+                                <th>Version</th>
+                                <th data-sort="integrity_score">Score</th>
+                                <th>Source</th>
+                                <th>Suppl.</th>
+                                <th data-sort="attempt_count">Att.</th>
+                                <th>Failure</th>
+                                <th>Override</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Pagination -->
+            <div class="pagination">
+                <span id="resultsPagInfo">Showing 0-0 of 0</span>
+                <div class="page-btns">
+                    <button class="btn btn-outline btn-sm" id="btnPrevPage" disabled>&laquo; Prev</button>
+                    <button class="btn btn-outline btn-sm" id="btnNextPage" disabled>Next &raquo;</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             CAPTCHA OVERLAY (global, over everything)
+             ============================================================ -->
+    </main>
+</div>
+
+<div class="captcha-overlay" id="captchaOverlay">
+    <div class="captcha-modal">
+        <h2>&#9888; CAPTCHA Detected</h2>
+        <p>
+            Google Scholar has detected automated access.<br>
+            Please solve the CAPTCHA in the browser window, then click the button below.
+        </p>
+        <button class="btn btn-warning" id="btnCaptchaResolved" style="font-size:16px; padding:12px 32px">
+            CAPTCHA Resolved
+        </button>
+    </div>
+</div>
+
+<!-- Override modal -->
+<div class="modal-backdrop" id="overrideModal">
+    <div class="modal">
+        <h3 id="overrideModalTitle">Confirm Override</h3>
+        <input type="hidden" id="overrideCanonicalId">
+        <input type="hidden" id="overrideAction">
+        <div class="form-group" id="overrideReasonGroup">
+            <label>Reason (required for confirmation)</label>
+            <textarea class="form-control" id="overrideReason" rows="3"
+                      placeholder="Explain why this paper is correct despite the mismatch..."></textarea>
+        </div>
+        <div class="btn-group" style="justify-content:flex-end; margin-top:16px">
+            <button class="btn btn-outline" id="btnOverrideCancel">Cancel</button>
+            <button class="btn btn-primary" id="btnOverrideSubmit">Submit</button>
+        </div>
+    </div>
+</div>
+
+<script>
+/* ==================================================================
+   Full-Text Acquisition System — Frontend
+   ================================================================== */
+(function() {
+'use strict';
+
+/* ------------------------------------------------------------------
+   State
+   ------------------------------------------------------------------ */
+const state = {
+    currentPanel: 'upload',
+    runId: null,
+    runState: 'idle',
+    resultsFilter: '',
+    resultsSortBy: 'created_at',
+    resultsSortOrder: 'ASC',
+    resultsPage: 0,
+    resultsLimit: 100,
+    resultsTotalCount: 0,
+    sseSource: null,
+};
+
+/* ------------------------------------------------------------------
+   API helpers
+   ------------------------------------------------------------------ */
+async function api(method, url, body) {
+    const opts = { method, headers: {} };
+    if (body instanceof FormData) {
+        opts.body = body;
+    } else if (body !== undefined) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+    }
+    const resp = await fetch(url, opts);
+    if (!resp.ok) {
+        let detail = resp.statusText;
+        try { const j = await resp.json(); detail = j.detail || detail; } catch(e) {}
+        throw new Error(detail);
+    }
+    const ct = resp.headers.get('content-type') || '';
+    if (ct.includes('json')) return resp.json();
+    return resp;
+}
+
+const GET  = (u) => api('GET', u);
+const POST = (u, b) => api('POST', u, b);
+const PUT  = (u, b) => api('PUT', u, b);
+
+/* ------------------------------------------------------------------
+   Toast notifications
+   ------------------------------------------------------------------ */
+function toast(message, type) {
+    type = type || 'info';
+    const container = document.getElementById('toastContainer');
+    const el = document.createElement('div');
+    el.className = 'toast toast-' + type;
+    el.textContent = message;
+    container.appendChild(el);
+    setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 3500);
+}
+
+/* ------------------------------------------------------------------
+   Navigation
+   ------------------------------------------------------------------ */
+document.querySelectorAll('.nav-item').forEach(function(item) {
+    item.addEventListener('click', function() {
+        switchPanel(this.dataset.panel);
+    });
+});
+
+function switchPanel(name) {
+    state.currentPanel = name;
+    document.querySelectorAll('.nav-item').forEach(function(n) {
+        n.classList.toggle('active', n.dataset.panel === name);
+    });
+    document.querySelectorAll('.panel').forEach(function(p) {
+        p.classList.toggle('active', p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1));
+    });
+    if (name === 'results') loadResults();
+    if (name === 'settings') loadSettings();
+    if (name === 'health') startSSE();
+    if (name === 'run') loadRuns();
+    if (name === 'sso') loadSsoStatus();
+}
+
+/* ------------------------------------------------------------------
+   Upload
+   ------------------------------------------------------------------ */
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('click', function() { fileInput.click(); });
+dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('dragover'); });
+dropZone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleUpload(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', function() {
+    if (fileInput.files.length) handleUpload(fileInput.files[0]);
+});
+
+async function handleUpload(file) {
+    document.getElementById('uploadProgress').style.display = 'block';
+    document.getElementById('uploadResults').style.display = 'none';
+    document.getElementById('dedupReport').style.display = 'none';
+    document.getElementById('uploadProgressBar').style.width = '60%';
+
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const data = await POST('/api/upload', fd);
+
+        document.getElementById('uploadProgressBar').style.width = '100%';
+        setTimeout(function() { document.getElementById('uploadProgress').style.display = 'none'; }, 500);
+
+        state.runId = data.run_id;
+        document.getElementById('uploadRunId').textContent = data.run_id;
+        document.getElementById('uploadTotal').textContent = data.total_submitted;
+        document.getElementById('uploadDedup').textContent = data.deduplication_report.duplicates_removed;
+        document.getElementById('uploadAlready').textContent = data.already_retrieved_count;
+        document.getElementById('uploadReady').textContent = data.ready_for_retrieval_count;
+
+        // Column mapping
+        const mapDiv = document.getElementById('columnMapping');
+        mapDiv.innerHTML = '';
+        const det = data.detected_columns;
+        ['doi_column','title_column','authors_column','year_column','journal_column'].forEach(function(key) {
+            const val = det[key] || '(not detected)';
+            const label = key.replace('_column','').toUpperCase();
+            mapDiv.innerHTML += '<div class="form-group"><label>' + label + '</label><div style="font-weight:600">' + escHtml(val) + '</div></div>';
+        });
+
+        // Preview
+        if (data.preview_rows.length) {
+            const keys = Object.keys(data.preview_rows[0]);
+            document.getElementById('previewHead').innerHTML = keys.map(function(k) { return '<th>' + escHtml(k) + '</th>'; }).join('');
+            document.getElementById('previewBody').innerHTML = data.preview_rows.map(function(row) {
+                return '<tr>' + keys.map(function(k) { return '<td>' + escHtml(row[k] || '') + '</td>'; }).join('') + '</tr>';
+            }).join('');
+        }
+
+        // Dedup report
+        if (data.deduplication_report.matches.length) {
+            document.getElementById('dedupReport').style.display = 'block';
+            document.getElementById('dedupBody').innerHTML = data.deduplication_report.matches.map(function(m) {
+                return '<tr><td>' + escHtml(m.paper_a_title) + '</td><td>' + escHtml(m.paper_b_title) +
+                       '</td><td>' + escHtml(m.match_type) + '</td><td>' + (m.similarity_score != null ? m.similarity_score : '-') + '</td></tr>';
+            }).join('');
+        }
+
+        document.getElementById('uploadResults').style.display = 'block';
+        toast('Upload complete: ' + data.ready_for_retrieval_count + ' papers ready', 'success');
+    } catch (err) {
+        document.getElementById('uploadProgress').style.display = 'none';
+        toast('Upload failed: ' + err.message, 'error');
+    }
+}
+
+document.getElementById('btnStartAfterUpload').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/run/start?run_id=' + encodeURIComponent(state.runId));
+        toast('Run started: ' + data.run_id, 'success');
+        state.runState = 'running';
+        switchPanel('run');
+        updateRunButtons();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Settings
+   ------------------------------------------------------------------ */
+async function loadSettings() {
+    try {
+        const data = await GET('/api/settings');
+        const c = data.config;
+        document.getElementById('cfgApiTimeout').value = c.api_timeout_s || '';
+        document.getElementById('cfgPdfTimeout').value = c.pdf_download_timeout_s || '';
+        document.getElementById('cfgPageLoad').value = c.page_load_timeout_s || '';
+        document.getElementById('cfgSelectorTimeout').value = c.selector_timeout_s || '';
+        document.getElementById('cfgValidationTimeout').value = c.pdf_validation_timeout_s || '';
+        document.getElementById('cfgOcrTimeout').value = c.ocr_per_page_timeout_s || '';
+        document.getElementById('cfgRetrievalConc').value = c.retrieval_concurrency || '';
+        document.getElementById('cfgValidationConc').value = c.validation_concurrency || '';
+        document.getElementById('cfgMaxRetries').value = c.max_retries || '';
+        document.getElementById('cfgMaxAttempts').value = c.max_total_attempts || '';
+        document.getElementById('cfgBackpressure').value = c.backpressure_threshold || '';
+        document.getElementById('cfgDiskSpace').value = Math.round((c.min_disk_space_bytes || 0) / 1048576);
+        document.getElementById('cfgCooldownThreshold').value = c.cooldown_failure_threshold || '';
+        document.getElementById('cfgCooldownWindow').value = c.cooldown_window_size || '';
+        document.getElementById('cfgCooldownMinutes').value = c.cooldown_minutes || '';
+        document.getElementById('cfgEzproxy').value = c.sso_proxy_url || '';
+        document.getElementById('cfgOpenAthens').value = c.openathens_url || '';
+        document.getElementById('cfgResolver').value = c.institutional_resolver_url || '';
+        document.getElementById('cfgUnpaywallEmail').value = c.unpaywall_email || '';
+        document.getElementById('cfgCacheTtl').value = c.cache_ttl_days || '';
+
+        const ocrEl = document.getElementById('settingsOcrStatus');
+        ocrEl.textContent = data.ocr_available ? (data.ghostscript_available ? 'Full OCR' : 'Tesseract Only') : 'Disabled';
+        ocrEl.className = 'badge ' + (data.ocr_available ? 'badge-success' : 'badge-warning');
+        document.getElementById('sidebarOcr').textContent = 'OCR: ' + ocrEl.textContent;
+
+        const pwEl = document.getElementById('settingsPlaywright');
+        pwEl.textContent = data.playwright_installed ? 'Installed' : 'Missing';
+        pwEl.className = 'badge ' + (data.playwright_installed ? 'badge-success' : 'badge-danger');
+        document.getElementById('settingsPython').textContent = data.python_version;
+        document.getElementById('settingsPlatform').textContent = data.platform;
+
+        try {
+            const cs = await GET('/api/cache/stats');
+            document.getElementById('cacheActiveCount').textContent = cs.active_entries + ' entries';
+        } catch(e) {}
+    } catch (err) { toast('Failed to load settings: ' + err.message, 'error'); }
+}
+
+document.getElementById('btnSaveSettings').addEventListener('click', async function() {
+    const diskMb = parseInt(document.getElementById('cfgDiskSpace').value) || 1024;
+    const body = {};
+    const fields = [
+        ['api_timeout_s', 'cfgApiTimeout', parseFloat],
+        ['pdf_download_timeout_s', 'cfgPdfTimeout', parseFloat],
+        ['page_load_timeout_s', 'cfgPageLoad', parseFloat],
+        ['selector_timeout_s', 'cfgSelectorTimeout', parseFloat],
+        ['pdf_validation_timeout_s', 'cfgValidationTimeout', parseFloat],
+        ['ocr_per_page_timeout_s', 'cfgOcrTimeout', parseFloat],
+        ['retrieval_concurrency', 'cfgRetrievalConc', parseInt],
+        ['validation_concurrency', 'cfgValidationConc', parseInt],
+        ['max_retries', 'cfgMaxRetries', parseInt],
+        ['max_total_attempts', 'cfgMaxAttempts', parseInt],
+        ['backpressure_threshold', 'cfgBackpressure', parseInt],
+        ['cooldown_failure_threshold', 'cfgCooldownThreshold', parseFloat],
+        ['cooldown_window_size', 'cfgCooldownWindow', parseInt],
+        ['cooldown_minutes', 'cfgCooldownMinutes', parseInt],
+        ['cache_ttl_days', 'cfgCacheTtl', parseInt],
+    ];
+    fields.forEach(function(f) {
+        const v = f[2](document.getElementById(f[1]).value);
+        if (!isNaN(v)) body[f[0]] = v;
+    });
+    body.min_disk_space_bytes = diskMb * 1048576;
+    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail']];
+    strFields.forEach(function(f) { const v = document.getElementById(f[1]).value; if (v) body[f[0]] = v; });
+
+    try {
+        await PUT('/api/settings', body);
+        toast('Settings saved', 'success');
+    } catch (err) { toast('Save failed: ' + err.message, 'error'); }
+});
+
+document.getElementById('btnClearCache').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/cache/clear');
+        toast('Cache cleared: ' + data.entries_deleted + ' entries', 'success');
+        document.getElementById('cacheActiveCount').textContent = '0 entries';
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnRerunWizard').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/wizard');
+        document.getElementById('wizardResults').innerHTML = '<pre style="font-size:12px;white-space:pre-wrap">' + escHtml(JSON.stringify(data, null, 2)) + '</pre>';
+        toast('Wizard complete', data.errors && data.errors.length ? 'warning' : 'success');
+        loadSettings();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Health Dashboard — SSE
+   ------------------------------------------------------------------ */
+function startSSE() {
+    if (state.sseSource) return;
+    state.sseSource = new EventSource('/api/health/stream');
+    state.sseSource.onmessage = function(event) {
+        try {
+            const m = JSON.parse(event.data);
+            if (m.error) return;
+            document.getElementById('hSuccessRate').textContent = (m.retrieval_success_rate * 100).toFixed(1) + '%';
+            document.getElementById('hAvgAttempts').textContent = m.avg_attempts_per_paper.toFixed(1);
+            document.getElementById('hAvgTime').textContent = (m.avg_retrieval_time_ms / 1000).toFixed(1) + 's';
+            document.getElementById('hCacheRate').textContent = (m.cache_hit_rate * 100).toFixed(1) + '%';
+            document.getElementById('hTotal').textContent = m.total_papers;
+            document.getElementById('hCompleted').textContent = m.completed_papers;
+            document.getElementById('hFailed').textContent = m.failed_papers;
+            document.getElementById('hManual').textContent = m.manual_required_papers;
+            document.getElementById('hRetrievalQueue').textContent = m.retrieval_queue_depth;
+            document.getElementById('hValidationQueue').textContent = m.validation_queue_depth;
+            document.getElementById('hBackpressure').textContent = m.backpressure_weighted_depth + ' / ' + m.backpressure_threshold;
+            document.getElementById('hDiskSpace').textContent = formatBytes(m.disk_space_remaining_bytes);
+            document.getElementById('sidebarWorkers').textContent = 'Workers: ' + m.retrieval_workers_active + 'R / ' + m.validation_workers_active + 'V';
+
+            // Run panel progress
+            if (state.runState === 'running') {
+                const total = m.total_papers || 1;
+                const done = m.completed_papers + m.failed_papers + m.manual_required_papers;
+                const pct = Math.round((done / total) * 100);
+                document.getElementById('runProgressBar').style.width = pct + '%';
+                document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
+                document.getElementById('runProgressPercent').textContent = pct + '%';
+                document.getElementById('runCompleted').textContent = m.completed_papers;
+                document.getElementById('runFailed').textContent = m.failed_papers;
+                document.getElementById('runManual').textContent = m.manual_required_papers;
+                document.getElementById('runRetrieving').textContent = m.retrieval_workers_active;
+            }
+
+            // Cooldowns
+            const cdDiv = document.getElementById('healthCooldowns');
+            if (m.active_cooldowns && m.active_cooldowns.length) {
+                cdDiv.innerHTML = m.active_cooldowns.map(function(cd) {
+                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(cd.publisher) +
+                           '</span><span class="rate">' + (cd.failure_rate * 100).toFixed(0) + '% fail</span>' +
+                           '<span>' + Math.ceil(cd.time_remaining_s / 60) + 'm left</span>' +
+                           '<button class="btn btn-outline btn-sm" onclick="forceCooldownReset(\'' + escAttr(cd.publisher) + '\')">Reset</button></div>';
+                }).join('');
+            } else { cdDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No active cooldowns</div>'; }
+
+            // Paywalls
+            const pwDiv = document.getElementById('healthPaywalls');
+            const pws = m.paywall_counts_by_publisher;
+            if (pws && Object.keys(pws).length) {
+                pwDiv.innerHTML = Object.entries(pws).map(function(e) {
+                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(e[0]) + '</span><span>' + e[1] + ' detections</span></div>';
+                }).join('');
+            } else { pwDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No paywall events</div>'; }
+        } catch(e) {}
+    };
+    state.sseSource.onerror = function() {
+        if (state.sseSource) { state.sseSource.close(); state.sseSource = null; }
+        setTimeout(function() { if (state.currentPanel === 'health') startSSE(); }, 5000);
+    };
+}
+
+window.forceCooldownReset = async function(pub) {
+    try { await POST('/api/cooldown/reset?publisher=' + encodeURIComponent(pub)); toast('Cooldown reset for ' + pub, 'success'); } catch (err) { toast(err.message, 'error'); }
+};
+
+/* ------------------------------------------------------------------
+   Run Control
+   ------------------------------------------------------------------ */
+async function loadRuns() {
+    try {
+        const data = await GET('/api/runs');
+        const sel = document.getElementById('runSelector');
+        sel.innerHTML = '<option value="">Select Run...</option>';
+        (data.runs || []).forEach(function(r) {
+            const opt = document.createElement('option'); opt.value = r.run_id;
+            opt.textContent = r.run_id + ' (' + r.status + ')'; sel.appendChild(opt);
+        });
+        if (state.runId) sel.value = state.runId;
+        const rsel = document.getElementById('resultsRunFilter');
+        rsel.innerHTML = '<option value="">All Runs</option>';
+        (data.runs || []).forEach(function(r) {
+            const opt = document.createElement('option'); opt.value = r.run_id; opt.textContent = r.run_id; rsel.appendChild(opt);
+        });
+    } catch(e) {}
+}
+
+document.getElementById('runSelector').addEventListener('change', function() { state.runId = this.value || null; });
+
+function updateRunButtons() {
+    const s = state.runState;
+    document.getElementById('btnStart').disabled = s === 'running';
+    document.getElementById('btnPause').disabled = s !== 'running';
+    document.getElementById('btnResume').disabled = s !== 'paused';
+    document.getElementById('btnCancel').disabled = s === 'idle';
+    const badge = document.getElementById('runStatusBadge');
+    badge.textContent = s.toUpperCase();
+    badge.className = 'badge ' + ({running:'badge-success', paused:'badge-warning'}[s] || 'badge-neutral');
+}
+
+function addLogEntry(text, level) {
+    const area = document.getElementById('runLogArea');
+    const time = new Date().toLocaleTimeString();
+    area.innerHTML += '<div class="log-entry"><span class="log-time">[' + time + ']</span> <span class="log-' + (level||'info') + '">' + escHtml(text) + '</span></div>';
+    area.scrollTop = area.scrollHeight;
+}
+
+document.getElementById('btnStart').addEventListener('click', async function() {
+    try {
+        const rid = state.runId ? '?run_id=' + encodeURIComponent(state.runId) : '';
+        const data = await POST('/api/run/start' + rid);
+        state.runId = data.run_id; state.runState = 'running'; updateRunButtons();
+        addLogEntry('Run started: ' + data.run_id, 'info'); startSSE(); toast('Run started', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnPause').addEventListener('click', async function() {
+    try { await POST('/api/run/pause'); state.runState = 'paused'; updateRunButtons(); addLogEntry('Run paused', 'warn'); toast('Paused', 'warning'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnResume').addEventListener('click', async function() {
+    try { await POST('/api/run/resume'); state.runState = 'running'; updateRunButtons(); addLogEntry('Run resumed', 'info'); toast('Resumed', 'success'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnCancel').addEventListener('click', async function() {
+    try { const data = await POST('/api/run/cancel'); state.runState = 'idle'; updateRunButtons(); addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err'); toast('Cancelled', 'warning'); } catch (err) { toast(err.message, 'error'); }
+});
+['btnRetryFailed','btnRetryMismatch','btnRetryManual','btnRetryAll'].forEach(function(id) {
+    const typeMap = { btnRetryFailed:'failed', btnRetryMismatch:'mismatch', btnRetryManual:'manual', btnRetryAll:'all_eligible' };
+    document.getElementById(id).addEventListener('click', async function() {
+        try { const data = await POST('/api/retry', { retry_type: typeMap[id] }); toast(data.papers_reset + ' papers queued', 'success'); addLogEntry('Retry ' + typeMap[id] + ': ' + data.papers_reset, 'info'); } catch (err) { toast(err.message, 'error'); }
+    });
+});
+
+/* ------------------------------------------------------------------
+   SSO
+   ------------------------------------------------------------------ */
+async function loadSsoStatus() {
+    try {
+        const data = await GET('/api/sso/status');
+        const badge = document.getElementById('ssoStatusBadge');
+        if (data.session_valid) { badge.textContent = 'Active'; badge.className = 'badge badge-success'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = false; }
+        else if (data.has_context) { badge.textContent = 'Pending'; badge.className = 'badge badge-warning'; document.getElementById('btnSsoContinue').disabled = false; document.getElementById('btnSsoReauth').disabled = false; }
+        else { badge.textContent = 'Not Connected'; badge.className = 'badge badge-neutral'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = true; }
+    } catch(e) {}
+}
+document.getElementById('btnSsoStart').addEventListener('click', async function() {
+    try { const data = await POST('/api/sso/start'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('SSO page opened', 'info'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnSsoContinue').addEventListener('click', async function() {
+    try { const data = await POST('/api/sso/continue'); document.getElementById('ssoMessage').textContent = data.message; loadSsoStatus(); toast(data.status === 'sso_active' ? 'SSO confirmed' : 'Session uncertain', data.status === 'sso_active' ? 'success' : 'warning'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnSsoReauth').addEventListener('click', async function() {
+    try { const data = await POST('/api/sso/reauth'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('Re-auth started', 'info'); } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   CAPTCHA
+   ------------------------------------------------------------------ */
+document.getElementById('btnCaptchaResolved').addEventListener('click', async function() {
+    try { await POST('/api/captcha/resolved'); document.getElementById('captchaOverlay').classList.remove('active'); toast('CAPTCHA resolved', 'success'); } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Results
+   ------------------------------------------------------------------ */
+async function loadResults() {
+    try {
+        const runFilter = document.getElementById('resultsRunFilter').value;
+        const params = new URLSearchParams({ limit: state.resultsLimit, offset: state.resultsPage * state.resultsLimit, sort_by: state.resultsSortBy, sort_order: state.resultsSortOrder });
+        if (runFilter) params.set('run_id', runFilter);
+        if (state.resultsFilter) params.set('state_filter', state.resultsFilter);
+
+        const data = await GET('/api/papers?' + params.toString());
+        state.resultsTotalCount = data.total_count;
+        const tbody = document.getElementById('resultsBody');
+        if (!data.papers.length) {
+            tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--text-secondary);padding:32px">No papers found</td></tr>';
+        } else {
+            tbody.innerHTML = data.papers.map(renderPaperRow).join('');
+        }
+        const start = state.resultsPage * state.resultsLimit + 1;
+        const end = Math.min(start + data.papers.length - 1, data.total_count);
+        document.getElementById('resultsPagInfo').textContent = 'Showing ' + (data.papers.length ? start : 0) + '-' + end + ' of ' + data.total_count;
+        document.getElementById('btnPrevPage').disabled = state.resultsPage === 0;
+        document.getElementById('btnNextPage').disabled = end >= data.total_count;
+        document.getElementById('tabCountAll').textContent = data.total_count;
+    } catch (err) { toast('Failed to load results: ' + err.message, 'error'); }
+}
+
+function renderPaperRow(p) {
+    const sc = p.confidence_level === 'HIGH' ? 'score-high' : p.confidence_level === 'MEDIUM' ? 'score-medium' : 'score-low';
+    const flagged = p.identity_status === 'VERSION_MISMATCH' || p.identity_status === 'CONTENT_UNVERIFIED';
+    const actions = flagged && !p.user_override ?
+        '<button class="btn btn-sm btn-success" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'confirm_correct\')">OK</button> ' +
+        '<button class="btn btn-sm btn-warning" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'re_retrieve\')">Redo</button>' : '';
+    const stBadge = '<span class="badge ' + ({COMPLETE:'badge-success',FAILED:'badge-danger',MANUAL_REQUIRED:'badge-warning',RETRIEVING:'badge-info',VALIDATING:'badge-info',RETRIEVED:'badge-info'}[p.state]||'badge-neutral') + '">' + escHtml(p.state||'') + '</span>';
+    const vsBadge = p.validation_status ? '<span class="badge ' + (p.validation_status.startsWith('VALID')?'badge-success':p.validation_status==='INVALID'?'badge-danger':'badge-warning') + '">' + escHtml(p.validation_status) + '</span>' : '';
+    const idBadge = p.identity_status ? '<span class="badge ' + (flagged?'badge-warning':'badge-success') + '">' + escHtml(p.identity_status) + '</span>' : '';
+    return '<tr><td title="' + escAttr(p.title||'') + '">' + escHtml((p.title||'').substring(0,50)) + (p.title && p.title.length>50?'...':'') + '</td>' +
+        '<td>' + escHtml(p.authors ? p.authors.split(';')[0].trim().substring(0,25) : '') + '</td>' +
+        '<td>' + (p.year||'') + '</td><td title="' + escAttr(p.doi||'') + '">' + escHtml((p.doi||'').substring(0,20)) + '</td>' +
+        '<td>' + stBadge + '</td><td>' + vsBadge + '</td><td>' + idBadge + '</td>' +
+        '<td>' + escHtml(p.version_type||'') + '</td><td class="' + sc + '">' + (p.integrity_score!=null?p.integrity_score:'') + '</td>' +
+        '<td>' + escHtml(p.retrieval_tier||'') + '</td><td>' + (p.supplement_count||0) + '</td><td>' + p.attempt_count + '</td>' +
+        '<td>' + escHtml(p.last_failure_code||'') + '</td><td>' + escHtml(p.user_override||'') + '</td><td>' + actions + '</td></tr>';
+}
+
+document.querySelectorAll('#resultsTabBar .tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+        document.querySelectorAll('#resultsTabBar .tab').forEach(function(t) { t.classList.remove('active'); });
+        tab.classList.add('active'); state.resultsFilter = tab.dataset.filter; state.resultsPage = 0; loadResults();
+    });
+});
+document.querySelectorAll('th[data-sort]').forEach(function(th) {
+    th.addEventListener('click', function() {
+        if (state.resultsSortBy === th.dataset.sort) { state.resultsSortOrder = state.resultsSortOrder === 'ASC' ? 'DESC' : 'ASC'; }
+        else { state.resultsSortBy = th.dataset.sort; state.resultsSortOrder = 'ASC'; }
+        state.resultsPage = 0; loadResults();
+    });
+});
+document.getElementById('btnPrevPage').addEventListener('click', function() { if (state.resultsPage > 0) { state.resultsPage--; loadResults(); } });
+document.getElementById('btnNextPage').addEventListener('click', function() { state.resultsPage++; loadResults(); });
+document.getElementById('resultsRunFilter').addEventListener('change', function() { state.resultsPage = 0; loadResults(); });
+
+/* Override modal */
+window.showOverride = function(cid, action) {
+    document.getElementById('overrideCanonicalId').value = cid;
+    document.getElementById('overrideAction').value = action;
+    document.getElementById('overrideModalTitle').textContent = action === 'confirm_correct' ? 'Confirm Paper is Correct' : 'Re-retrieve Paper';
+    document.getElementById('overrideReasonGroup').style.display = action === 'confirm_correct' ? 'block' : 'none';
+    document.getElementById('overrideReason').value = '';
+    document.getElementById('overrideModal').classList.add('active');
+};
+document.getElementById('btnOverrideCancel').addEventListener('click', function() { document.getElementById('overrideModal').classList.remove('active'); });
+document.getElementById('btnOverrideSubmit').addEventListener('click', async function() {
+    try {
+        await POST('/api/override', { canonical_id: document.getElementById('overrideCanonicalId').value, action: document.getElementById('overrideAction').value, reason: document.getElementById('overrideReason').value });
+        document.getElementById('overrideModal').classList.remove('active'); toast('Override applied', 'success'); loadResults();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Exports
+   ------------------------------------------------------------------ */
+document.getElementById('btnExportExcel').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/excel' + (r ? '?run_id=' + encodeURIComponent(r) : '');
+});
+document.getElementById('btnExportPrisma').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; if (!r) { toast('Select a run for PRISMA export', 'warning'); return; }
+    window.location.href = '/api/export/prisma?run_id=' + encodeURIComponent(r);
+});
+document.getElementById('btnExportAudit').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/audit' + (r ? '?run_id=' + encodeURIComponent(r) : '');
+});
+document.getElementById('btnExportIntegration').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/integration' + (r ? '?run_id=' + encodeURIComponent(r) : '');
+});
+
+/* ------------------------------------------------------------------
+   Utility
+   ------------------------------------------------------------------ */
+function escHtml(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function escAttr(s) { return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;'); }
+function formatBytes(b) {
+    if (!b || b <= 0) return '0 B';
+    const u = ['B','KB','MB','GB','TB'], i = Math.floor(Math.log(b) / Math.log(1024));
+    return (b / Math.pow(1024, i)).toFixed(1) + ' ' + u[i];
+}
+
+/* ------------------------------------------------------------------
+   Init
+   ------------------------------------------------------------------ */
+(async function init() {
+    try {
+        const s = await GET('/api/status');
+        if (s.wizard_errors && s.wizard_errors.length) s.wizard_errors.forEach(function(e) { toast(e, 'warning'); });
+        document.getElementById('sidebarOcr').textContent = 'OCR: ' + s.ocr_mode;
+        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); startSSE(); }
+    } catch(e) { toast('Could not connect to server', 'error'); }
+    updateRunButtons();
+})();
+
+})();
+</script>
+</body>
+</html>
