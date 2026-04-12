@@ -221,6 +221,7 @@ VERSION_SCORES: Dict[str, int] = {
 IDENTITY_SCORES: Dict[str, int] = {
     "DOI_VERIFIED": 25,
     "TITLE_VERIFIED": 15,
+    "TITLE_VERIFIED_WEAK": 8,
     "CONTENT_UNVERIFIED": 0,
     "VERSION_MISMATCH": 0,
 }
@@ -361,7 +362,8 @@ class ValidationStatus(str, enum.Enum):
     """Final validation status after Step 3 checks."""
 
     VALID = "VALID"                          # DOI verified
-    VALID_TITLE = "VALID_TITLE"              # Title verified (≥85% fuzzy)
+    VALID_TITLE = "VALID_TITLE"              # Title verified (≥85% fuzzy, in first 3 pages)
+    VALID_TITLE_WEAK = "VALID_TITLE_WEAK"    # Title match found only on later pages
     VALID_OCR = "VALID_OCR"                  # OCR applied, then verified
     PARTIAL_SIZE = "PARTIAL_SIZE"            # File size < 50KB
     PARTIAL_IMAGE = "PARTIAL_IMAGE"          # Image-only, OCR unavailable
@@ -378,6 +380,7 @@ class IdentityStatus(str, enum.Enum):
 
     DOI_VERIFIED = "DOI_VERIFIED"
     TITLE_VERIFIED = "TITLE_VERIFIED"
+    TITLE_VERIFIED_WEAK = "TITLE_VERIFIED_WEAK"  # match found only outside first 3 pages
     VERSION_MISMATCH = "VERSION_MISMATCH"
     CONTENT_UNVERIFIED = "CONTENT_UNVERIFIED"
 

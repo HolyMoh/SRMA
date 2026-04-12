@@ -19,6 +19,9 @@ pypdf>=3.17.0
 # === Excel support (required for upload + export) ===
 openpyxl>=3.1.0
 
+# === Fuzzy title matching (Check 6) ===
+rapidfuzz>=3.0.0
+
 # === OCR (optional — install tesseract + ghostscript system packages) ===
 # ocrmypdf>=16.0.0
 # pytesseract>=0.3.10

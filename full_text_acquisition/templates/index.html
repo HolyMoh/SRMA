@@ -667,7 +667,30 @@
                 </div>
 
                 <div style="margin-top:16px">
-                    <button class="btn btn-primary" id="btnStartAfterUpload">Start Retrieval</button>
+                    <button class="btn btn-primary" id="btnStartAfterUpload"
+                            title="Start retrieval for this run">Start Retrieval</button>
+                </div>
+            </div>
+
+            <!-- Enrichment progress (shown while background enrichment runs) -->
+            <div class="card" id="enrichmentProgress" style="display:none">
+                <div class="card-header">
+                    <h3>Metadata Enrichment</h3>
+                    <span class="badge badge-info" id="enrichmentBadge">In Progress</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="enrichProgressBar" style="width:0%"></div>
+                    </div>
+                    <div class="progress-stats">
+                        <span id="enrichProgressText">Enriching 0/0 papers...</span>
+                        <span id="enrichProgressPercent">0%</span>
+                    </div>
+                </div>
+                <div style="margin-top:8px; font-size:12px; color:var(--text-secondary)">
+                    Fetching metadata from OpenAlex and CrossRef. The UI stays responsive —
+                    you can browse other panels while this runs. <strong>Start Retrieval</strong>
+                    is disabled until enrichment completes.
                 </div>
             </div>
 
@@ -1019,47 +1042,92 @@
         </div>
 
         <!-- ============================================================
-             PANEL 5: SSO
+             PANEL 5: SSO — User-Controlled, System-Assisted
              ============================================================ -->
         <div id="panelSso" class="panel">
             <div class="panel-header">
                 <h2>Institutional SSO Access</h2>
+                <span class="badge" id="ssoPhaseBadge">idle</span>
             </div>
 
+            <!-- Security reminder — always visible -->
+            <div class="card" style="border-left: 3px solid var(--success); background: #f0fdf4">
+                <div style="font-size:13px; line-height:1.6">
+                    <strong style="color:var(--success)">&#128274; Your credentials stay private</strong><br>
+                    The system opens a real browser window for you. <strong>You</strong> type your login.
+                    We never read, log, store, or screenshot anything in that browser. The browser
+                    context is destroyed when you end the session — no cookies are kept.
+                </div>
+            </div>
+
+            <!-- STEP 1: QUEUE VISIBILITY -->
             <div class="card">
                 <div class="card-header">
-                    <h3>Session Status</h3>
-                    <span class="badge" id="ssoStatusBadge">Not Connected</span>
+                    <h3>Step 1 &middot; SSO Queue</h3>
+                    <button class="btn btn-outline btn-sm" id="btnSsoReloadQueue">Refresh</button>
                 </div>
-
-                <div style="margin-bottom:20px; color:var(--text-secondary); font-size:14px; line-height:1.7">
-                    <p><strong>How it works:</strong></p>
-                    <ol style="padding-left:20px; margin-top:8px">
-                        <li>Click <strong>Start SSO Login</strong> to open your institution's login page in a headed browser.</li>
-                        <li>Complete authentication manually (username, password, MFA).</li>
-                        <li>Click <strong>Continue</strong> when finished. The system will <em>never</em> access what you type.</li>
-                        <li>Tier 3 and 3.5 retrieval will use your authenticated session.</li>
-                    </ol>
-                    <p style="margin-top:12px">
-                        If your session expires (403 errors), click <strong>Re-authenticate</strong> to start fresh.
-                    </p>
+                <div id="ssoQueueSummary" style="font-size:14px; margin-bottom:12px; color:var(--text-secondary)">
+                    Loading...
                 </div>
-
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="btnSsoStart">Start SSO Login</button>
-                    <button class="btn btn-success" id="btnSsoContinue" disabled>Continue</button>
-                    <button class="btn btn-warning" id="btnSsoReauth" disabled>Re-authenticate</button>
-                </div>
-
-                <div id="ssoMessage" style="margin-top:16px; font-size:13px; color:var(--text-secondary)"></div>
+                <div id="ssoQueueList" style="max-height:320px; overflow-y:auto; font-size:12px"></div>
+                <div id="ssoProxyPrefix" style="font-size:11px; color:var(--text-secondary); margin-top:8px; font-family:var(--mono)"></div>
             </div>
 
+            <!-- STEP 2: SESSION INITIALIZATION -->
             <div class="card">
-                <div class="card-header"><h3>Configuration</h3></div>
-                <p style="font-size:13px; color:var(--text-secondary); margin-bottom:12px">
-                    SSO URLs are configured in the Settings panel. At least one must be set for Tier 3 retrieval.
-                </p>
-                <div id="ssoConfigSummary" style="font-size:13px"></div>
+                <div class="card-header">
+                    <h3>Step 2 &middot; Session</h3>
+                    <span class="badge" id="ssoSessionBadge">Not started</span>
+                </div>
+                <div id="ssoSessionMessage" style="font-size:13px; color:var(--text-secondary); margin-bottom:12px;min-height:20px">
+                    Click Start SSO Session to open the browser at your institution's login page.
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="btnSsoSessionStart">Start SSO Session</button>
+                    <button class="btn btn-danger" id="btnSsoSessionEnd" disabled>End SSO Session</button>
+                </div>
+                <div id="ssoSessionTimer" style="margin-top:12px; font-size:12px; color:var(--text-secondary)"></div>
+            </div>
+
+            <!-- STEP 3: LIVE DOWNLOAD PROGRESS -->
+            <div class="card" id="ssoDownloadCard" style="display:none">
+                <div class="card-header">
+                    <h3>Step 3 &middot; Download Progress</h3>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="ssoProgressBar" style="width:0%"></div>
+                    </div>
+                    <div class="progress-stats">
+                        <span id="ssoProgressText">0 / 0 papers</span>
+                        <span id="ssoProgressPercent">0%</span>
+                    </div>
+                </div>
+                <div class="card-grid" style="margin-top:16px">
+                    <div class="metric-card">
+                        <div class="metric-value score-high" id="ssoSucceeded">0</div>
+                        <div class="metric-label">Succeeded</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value score-medium" id="ssoManualStill">0</div>
+                        <div class="metric-label">Still Manual</div>
+                    </div>
+                </div>
+                <div id="ssoCurrentPaper" style="margin-top:12px; font-size:13px; padding:10px; background:var(--bg-primary); border-radius:var(--radius-sm)"></div>
+            </div>
+
+            <!-- STEP 5: MANUAL FALLBACK -->
+            <div class="card" id="ssoManualCard">
+                <div class="card-header">
+                    <h3>Step 5 &middot; Manual Fallback</h3>
+                    <div class="btn-group">
+                        <button class="btn btn-outline btn-sm" id="btnSsoReloadManual">Refresh</button>
+                        <button class="btn btn-outline btn-sm" id="btnSsoExportManualCsv">Export CSV</button>
+                    </div>
+                </div>
+                <div id="ssoManualList" style="max-height:360px; overflow-y:auto; font-size:12px">
+                    Loading...
+                </div>
             </div>
         </div>
 
@@ -1077,6 +1145,8 @@
                     <button class="btn btn-outline btn-sm" id="btnExportPrisma">Export PRISMA</button>
                     <button class="btn btn-outline btn-sm" id="btnExportAudit">Export Audit JSON</button>
                     <button class="btn btn-outline btn-sm" id="btnExportIntegration">Export Integration</button>
+                    <button class="btn btn-primary btn-sm" id="btnExportBundle"
+                            title="Submission bundle: config, audit log, PRISMA, PDFs, supplements, SHA-256 manifest">Download Submission Bundle</button>
                 </div>
             </div>
 
@@ -1185,8 +1255,9 @@ const state = {
     resultsLimit: 100,
     resultsTotalCount: 0,
     sseSource: null,
-    statusPollInterval: null,
-    lastStatusCounts: null,
+    lastCountersSnap: null,
+    enrichmentSseSource: null,
+    enrichmentInProgress: false,
 };
 
 /* ------------------------------------------------------------------
@@ -1245,9 +1316,9 @@ function switchPanel(name) {
     document.querySelectorAll('.panel').forEach(function(p) {
         p.classList.toggle('active', p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1));
     });
+    // Unified SSE is always on; individual panels only trigger one-shot loads
     if (name === 'results') loadResults();
     if (name === 'settings') loadSettings();
-    if (name === 'health') startSSE();
     if (name === 'run') loadRuns();
     if (name === 'sso') loadSsoStatus();
 }
@@ -1321,10 +1392,106 @@ async function handleUpload(file) {
 
         document.getElementById('uploadResults').style.display = 'block';
         await loadStateBreakdown();
-        toast('Upload complete: ' + data.ready_for_retrieval_count + ' papers ready', 'success');
+        // Background enrichment runs on the server — open the SSE stream to track it
+        try {
+            const enr = await GET('/api/enrichment/status');
+            if (enr && enr.in_progress) {
+                startEnrichmentSSE();
+            } else {
+                setStartButtonEnrichmentLock(false);
+            }
+        } catch (e) {
+            setStartButtonEnrichmentLock(false);
+        }
+        toast('Upload accepted: ' + data.total_after_dedup + ' papers ingested. Enriching metadata in background...', 'success');
     } catch (err) {
         document.getElementById('uploadProgress').style.display = 'none';
         toast('Upload failed: ' + err.message, 'error');
+    }
+}
+
+/* ------------------------------------------------------------------
+   Enrichment progress (SSE-driven, background task on server)
+   ------------------------------------------------------------------ */
+function setStartButtonEnrichmentLock(locked) {
+    const btn = document.getElementById('btnStartAfterUpload');
+    if (!btn) return;
+    if (locked) {
+        btn.disabled = true;
+        btn.title = 'Waiting for enrichment to complete';
+        btn.dataset.enrichLocked = '1';
+    } else {
+        btn.disabled = false;
+        btn.title = 'Start retrieval for this run';
+        delete btn.dataset.enrichLocked;
+    }
+}
+
+function renderEnrichmentStatus(s) {
+    const total = s.total || 0;
+    const done = s.completed || 0;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    document.getElementById('enrichProgressBar').style.width = pct + '%';
+    document.getElementById('enrichProgressPercent').textContent = pct + '%';
+    if (s.in_progress) {
+        document.getElementById('enrichProgressText').textContent =
+            'Enriching ' + done + '/' + total + ' papers... (' +
+            (s.enriched_count || 0) + ' enriched, ' +
+            (s.failed_count || 0) + ' no metadata)';
+        const badge = document.getElementById('enrichmentBadge');
+        badge.textContent = 'In Progress';
+        badge.className = 'badge badge-info';
+    } else {
+        document.getElementById('enrichProgressText').textContent =
+            'Done: ' + (s.enriched_count || 0) + ' enriched, ' +
+            (s.failed_count || 0) + ' without metadata (' + total + ' total)';
+        const badge = document.getElementById('enrichmentBadge');
+        badge.textContent = 'Complete';
+        badge.className = 'badge badge-success';
+    }
+}
+
+function startEnrichmentSSE() {
+    if (state.enrichmentSseSource) return;
+    document.getElementById('enrichmentProgress').style.display = 'block';
+    setStartButtonEnrichmentLock(true);
+    state.enrichmentInProgress = true;
+
+    state.enrichmentSseSource = new EventSource('/api/enrichment/stream');
+    state.enrichmentSseSource.onmessage = function(event) {
+        try {
+            const s = JSON.parse(event.data);
+            renderEnrichmentStatus(s);
+
+            if (!s.in_progress) {
+                // Final event received — unlock and close
+                state.enrichmentInProgress = false;
+                setStartButtonEnrichmentLock(false);
+                stopEnrichmentSSE();
+                toast('Enrichment complete: ' + (s.enriched_count || 0) + '/' +
+                      (s.total || 0) + ' enriched', 'success');
+                // Refresh state breakdown to show new READY_FOR_RETRIEVAL counts
+                if (typeof loadStateBreakdown === 'function') {
+                    loadStateBreakdown();
+                }
+            }
+        } catch (e) {
+            // Ignore parse errors
+        }
+    };
+    state.enrichmentSseSource.onerror = function() {
+        stopEnrichmentSSE();
+        // Reconnect if enrichment is still in progress
+        setTimeout(function() {
+            if (state.enrichmentInProgress) startEnrichmentSSE();
+        }, 3000);
+    };
+}
+
+function stopEnrichmentSSE() {
+    if (state.enrichmentSseSource) {
+        state.enrichmentSseSource.close();
+        state.enrichmentSseSource = null;
     }
 }
 
@@ -1333,7 +1500,7 @@ async function handleUpload(file) {
    ------------------------------------------------------------------ */
 async function loadStateBreakdown() {
     try {
-        const s = await GET('/api/run/status');
+        const s = await GET('/api/stream/snapshot');
         const counts = s.state_counts || {};
         document.getElementById('stateBreakdownCard').style.display = 'block';
 
@@ -1415,6 +1582,10 @@ document.getElementById('btnResetRetryAll').addEventListener('click', async func
 });
 
 document.getElementById('btnStartAfterUpload').addEventListener('click', async function() {
+    if (state.enrichmentInProgress) {
+        toast('Waiting for enrichment to complete', 'warning');
+        return;
+    }
     try {
         const data = await POST('/api/run/start?run_id=' + encodeURIComponent(state.runId));
         toast('Run started: ' + data.run_id, 'success');
@@ -1522,68 +1693,170 @@ document.getElementById('btnRerunWizard').addEventListener('click', async functi
 });
 
 /* ------------------------------------------------------------------
-   Health Dashboard — SSE
-   ------------------------------------------------------------------ */
+   Unified SSE — single source of truth for ALL live updates
+   ------------------------------------------------------------------
+
+   /api/stream delivers:
+       - Health metrics (success rate, queue depths, cache rate, etc.)
+       - State counts (every PaperState → count)
+       - Worker pool (running/paused, counters, run_id)
+       - Enrichment status (in_progress + counters)
+
+   The frontend treats this as the only authority for live state;
+   POST endpoints (start/pause/resume/cancel/retry/override) still
+   exist for actions, but the SSE stream is what updates the UI.
+*/
 function startSSE() {
     if (state.sseSource) return;
-    state.sseSource = new EventSource('/api/health/stream');
+    state.sseSource = new EventSource('/api/stream');
     state.sseSource.onmessage = function(event) {
         try {
             const m = JSON.parse(event.data);
             if (m.error) return;
-            document.getElementById('hSuccessRate').textContent = (m.retrieval_success_rate * 100).toFixed(1) + '%';
-            document.getElementById('hAvgAttempts').textContent = m.avg_attempts_per_paper.toFixed(1);
-            document.getElementById('hAvgTime').textContent = (m.avg_retrieval_time_ms / 1000).toFixed(1) + 's';
-            document.getElementById('hCacheRate').textContent = (m.cache_hit_rate * 100).toFixed(1) + '%';
-            document.getElementById('hTotal').textContent = m.total_papers;
-            document.getElementById('hCompleted').textContent = m.completed_papers;
-            document.getElementById('hFailed').textContent = m.failed_papers;
-            document.getElementById('hManual').textContent = m.manual_required_papers;
-            document.getElementById('hRetrievalQueue').textContent = m.retrieval_queue_depth;
-            document.getElementById('hValidationQueue').textContent = m.validation_queue_depth;
-            document.getElementById('hBackpressure').textContent = m.backpressure_weighted_depth + ' / ' + m.backpressure_threshold;
-            document.getElementById('hDiskSpace').textContent = formatBytes(m.disk_space_remaining_bytes);
-            document.getElementById('sidebarWorkers').textContent = 'Workers: ' + m.retrieval_workers_active + 'R / ' + m.validation_workers_active + 'V';
-
-            // Run panel progress
-            if (state.runState === 'running') {
-                const total = m.total_papers || 1;
-                const done = m.completed_papers + m.failed_papers + m.manual_required_papers;
-                const pct = Math.round((done / total) * 100);
-                document.getElementById('runProgressBar').style.width = pct + '%';
-                document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
-                document.getElementById('runProgressPercent').textContent = pct + '%';
-                document.getElementById('runCompleted').textContent = m.completed_papers;
-                document.getElementById('runFailed').textContent = m.failed_papers;
-                document.getElementById('runManual').textContent = m.manual_required_papers;
-                document.getElementById('runRetrieving').textContent = m.retrieval_workers_active;
-            }
-
-            // Cooldowns
-            const cdDiv = document.getElementById('healthCooldowns');
-            if (m.active_cooldowns && m.active_cooldowns.length) {
-                cdDiv.innerHTML = m.active_cooldowns.map(function(cd) {
-                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(cd.publisher) +
-                           '</span><span class="rate">' + (cd.failure_rate * 100).toFixed(0) + '% fail</span>' +
-                           '<span>' + Math.ceil(cd.time_remaining_s / 60) + 'm left</span>' +
-                           '<button class="btn btn-outline btn-sm" onclick="forceCooldownReset(\'' + escAttr(cd.publisher) + '\')">Reset</button></div>';
-                }).join('');
-            } else { cdDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No active cooldowns</div>'; }
-
-            // Paywalls
-            const pwDiv = document.getElementById('healthPaywalls');
-            const pws = m.paywall_counts_by_publisher;
-            if (pws && Object.keys(pws).length) {
-                pwDiv.innerHTML = Object.entries(pws).map(function(e) {
-                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(e[0]) + '</span><span>' + e[1] + ' detections</span></div>';
-                }).join('');
-            } else { pwDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No paywall events</div>'; }
-        } catch(e) {}
+            handleStreamEvent(m);
+        } catch (e) {
+            // Silently ignore malformed events
+        }
     };
     state.sseSource.onerror = function() {
         if (state.sseSource) { state.sseSource.close(); state.sseSource = null; }
-        setTimeout(function() { if (state.currentPanel === 'health') startSSE(); }, 5000);
+        // Reconnect after a delay — stream is authoritative, we must
+        // keep it alive as long as the page is open
+        setTimeout(function() { startSSE(); }, 3000);
     };
+}
+
+function stopSSE() {
+    if (state.sseSource) {
+        state.sseSource.close();
+        state.sseSource = null;
+    }
+}
+
+function handleStreamEvent(m) {
+    const wp = m.worker_pool || {};
+    const counters = wp.counters || {};
+
+    // --- Health Dashboard ---
+    document.getElementById('hSuccessRate').textContent = (m.retrieval_success_rate * 100).toFixed(1) + '%';
+    document.getElementById('hAvgAttempts').textContent = m.avg_attempts_per_paper.toFixed(1);
+    document.getElementById('hAvgTime').textContent = (m.avg_retrieval_time_ms / 1000).toFixed(1) + 's';
+    document.getElementById('hCacheRate').textContent = (m.cache_hit_rate * 100).toFixed(1) + '%';
+    document.getElementById('hTotal').textContent = m.total_papers;
+    document.getElementById('hCompleted').textContent = m.complete || m.completed_papers || 0;
+    document.getElementById('hFailed').textContent = m.failed || m.failed_papers || 0;
+    document.getElementById('hManual').textContent = m.manual_required || m.manual_required_papers || 0;
+    document.getElementById('hRetrievalQueue').textContent = m.ready_for_retrieval || m.retrieval_queue_depth || 0;
+    document.getElementById('hValidationQueue').textContent = m.retrieved || m.validation_queue_depth || 0;
+    document.getElementById('hBackpressure').textContent = m.backpressure_weighted_depth + ' / ' + m.backpressure_threshold;
+    document.getElementById('hDiskSpace').textContent = formatBytes(m.disk_space_remaining_bytes);
+
+    // --- Sidebar worker status ---
+    const retActive = wp.retrieval_workers_active || m.retrieval_workers_active || 0;
+    const valActive = wp.validation_workers_active || m.validation_workers_active || 0;
+    const paused = wp.paused || m.retrieval_workers_paused || false;
+    document.getElementById('sidebarWorkers').textContent =
+        'Workers: ' + retActive + 'R / ' + valActive + 'V' +
+        (paused ? ' (paused)' : '');
+
+    // --- Run panel: state reconciliation ---
+    // Reconcile runState from the authoritative worker_pool.running flag.
+    // This catches completions (workers exhausted the queue) and external
+    // cancellations without the UI needing to poll.
+    if (wp.running === true) {
+        const newState = wp.paused ? 'paused' : 'running';
+        if (state.runState !== newState) {
+            state.runState = newState;
+            updateRunButtons();
+        }
+        if (wp.run_id && state.runId !== wp.run_id) {
+            state.runId = wp.run_id;
+        }
+    } else if (wp.running === false && state.runState !== 'idle') {
+        // Workers have stopped — transition to idle
+        state.runState = 'idle';
+        updateRunButtons();
+        addLogEntry('Run finished (workers stopped)', 'info');
+    }
+
+    // --- Run panel: progress and counters ---
+    const complete = m.complete || 0;
+    const failed = m.failed || 0;
+    const manual = m.manual_required || 0;
+    const retrieving = m.retrieving || 0;
+    const total = m.total_papers || 1;
+    const done = complete + failed + manual;
+    const pct = Math.round((done / total) * 100);
+    document.getElementById('runProgressBar').style.width = pct + '%';
+    document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
+    document.getElementById('runProgressPercent').textContent = pct + '%';
+    document.getElementById('runCompleted').textContent = complete;
+    document.getElementById('runFailed').textContent = failed;
+    document.getElementById('runManual').textContent = manual;
+    document.getElementById('runRetrieving').textContent = retrieving;
+
+    // --- Activity log: emit entries on counter deltas ---
+    const snap = JSON.stringify({
+        r: counters.retrieved || 0,
+        f: counters.failed || 0,
+        m: counters.manual || 0,
+        v: counters.validated || 0,
+        vf: counters.val_failed || 0,
+        retQ: m.ready_for_retrieval || 0,
+        retG: retrieving,
+        valQ: m.retrieved || 0,
+        valG: m.validating || 0,
+    });
+    if (state.lastCountersSnap !== snap) {
+        const prev = state.lastCountersSnap ? JSON.parse(state.lastCountersSnap) : null;
+        state.lastCountersSnap = snap;
+        const now = JSON.parse(snap);
+        if (prev) {
+            if (now.r > prev.r) addLogEntry('Retrieved +' + (now.r - prev.r) + ' (queue: ' + now.retQ + ')', 'ok');
+            if (now.f > prev.f) addLogEntry('Failed +' + (now.f - prev.f), 'err');
+            if (now.m > prev.m) addLogEntry('Manual required +' + (now.m - prev.m), 'warn');
+            if (now.v > prev.v) addLogEntry('Validated +' + (now.v - prev.v), 'ok');
+            if (now.vf > prev.vf) addLogEntry('Validation failed +' + (now.vf - prev.vf), 'err');
+        } else if (state.runState === 'running') {
+            addLogEntry('Queue: retrieval=' + now.retQ + ' (active ' + now.retG + ') | validation=' + now.valQ + ' (active ' + now.valG + ')', 'info');
+        }
+    }
+
+    // --- Cooldowns ---
+    const cdDiv = document.getElementById('healthCooldowns');
+    if (m.active_cooldowns && m.active_cooldowns.length) {
+        cdDiv.innerHTML = m.active_cooldowns.map(function(cd) {
+            return '<div class="cooldown-item"><span class="publisher">' + escHtml(cd.publisher) +
+                   '</span><span class="rate">' + (cd.failure_rate * 100).toFixed(0) + '% fail</span>' +
+                   '<span>' + Math.ceil(cd.time_remaining_s / 60) + 'm left</span>' +
+                   '<button class="btn btn-outline btn-sm" onclick="forceCooldownReset(\'' + escAttr(cd.publisher) + '\')">Reset</button></div>';
+        }).join('');
+    } else {
+        cdDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No active cooldowns</div>';
+    }
+
+    // --- Paywalls ---
+    const pwDiv = document.getElementById('healthPaywalls');
+    const pws = m.paywall_counts_by_publisher;
+    if (pws && Object.keys(pws).length) {
+        pwDiv.innerHTML = Object.entries(pws).map(function(e) {
+            return '<div class="cooldown-item"><span class="publisher">' + escHtml(e[0]) + '</span><span>' + e[1] + ' detections</span></div>';
+        }).join('');
+    } else {
+        pwDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No paywall events</div>';
+    }
+
+    // --- Enrichment: unlock Start Retrieval the moment the server
+    //     reports in_progress=false, without a separate round-trip ---
+    if (m.enrichment && state.enrichmentInProgress && !m.enrichment.in_progress) {
+        state.enrichmentInProgress = false;
+        setStartButtonEnrichmentLock(false);
+    }
+
+    // --- SSO: live session state drives every element on the SSO panel ---
+    if (m.sso && typeof renderSsoFromStream === 'function') {
+        renderSsoFromStream(m.sso);
+    }
 }
 
 window.forceCooldownReset = async function(pub) {
@@ -1642,101 +1915,35 @@ document.getElementById('btnStart').addEventListener('click', async function() {
         addLogEntry('Ready for retrieval: ' + data.ready_for_retrieval + ' papers', 'info');
         addLogEntry('Awaiting validation: ' + data.awaiting_validation + ' papers', 'info');
         addLogEntry('Workers spinning up...', 'info');
+        // SSE is the single source of truth — stream updates everything
         startSSE();
-        startStatusPoll();
         toast('Run started', 'success');
     } catch (err) { toast(err.message, 'error'); }
 });
 
-/* ------------------------------------------------------------------
-   Run status polling (independent of SSE)
-   ------------------------------------------------------------------ */
-function startStatusPoll() {
-    stopStatusPoll();
-    state.statusPollInterval = setInterval(pollRunStatus, 2500);
-    pollRunStatus();  // immediate first fetch
-}
-
-function stopStatusPoll() {
-    if (state.statusPollInterval) {
-        clearInterval(state.statusPollInterval);
-        state.statusPollInterval = null;
-    }
-}
-
-async function pollRunStatus() {
-    try {
-        const s = await GET('/api/run/status');
-        const wp = s.worker_pool || {};
-
-        // Update sidebar worker status
-        const retActive = wp.retrieval_workers_active || 0;
-        const valActive = wp.validation_workers_active || 0;
-        document.getElementById('sidebarWorkers').textContent =
-            'Workers: ' + retActive + 'R / ' + valActive + 'V' +
-            (wp.paused ? ' (paused)' : '');
-
-        // Update progress metric cards
-        document.getElementById('runCompleted').textContent = s.complete || 0;
-        document.getElementById('runFailed').textContent = s.failed || 0;
-        document.getElementById('runManual').textContent = s.manual_required || 0;
-        document.getElementById('runRetrieving').textContent = s.retrieving || 0;
-
-        // Progress bar
-        const done = (s.complete || 0) + (s.failed || 0) + (s.manual_required || 0);
-        const total = s.total_papers || 1;
-        const pct = Math.round((done / total) * 100);
-        document.getElementById('runProgressBar').style.width = pct + '%';
-        document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
-        document.getElementById('runProgressPercent').textContent = pct + '%';
-
-        // Emit log entry when counts change
-        const counters = wp.counters || {};
-        const snap = JSON.stringify({
-            r: counters.retrieved || 0,
-            f: counters.failed || 0,
-            m: counters.manual || 0,
-            v: counters.validated || 0,
-            vf: counters.val_failed || 0,
-            retQ: s.ready_for_retrieval,
-            retG: s.retrieving,
-            valQ: s.retrieved,
-            valG: s.validating,
-        });
-        if (state.lastStatusCounts !== snap) {
-            const prev = state.lastStatusCounts ? JSON.parse(state.lastStatusCounts) : null;
-            state.lastStatusCounts = snap;
-            const now = JSON.parse(snap);
-            if (prev) {
-                if (now.r > prev.r) addLogEntry('Retrieved +' + (now.r - prev.r) + ' (queue: ' + now.retQ + ')', 'ok');
-                if (now.f > prev.f) addLogEntry('Failed +' + (now.f - prev.f), 'err');
-                if (now.m > prev.m) addLogEntry('Manual required +' + (now.m - prev.m), 'warn');
-                if (now.v > prev.v) addLogEntry('Validated +' + (now.v - prev.v), 'ok');
-                if (now.vf > prev.vf) addLogEntry('Validation failed +' + (now.vf - prev.vf), 'err');
-            } else {
-                addLogEntry('Queue: retrieval=' + now.retQ + ' (active ' + now.retG + ') | validation=' + now.valQ + ' (active ' + now.valG + ')', 'info');
-            }
-        }
-
-        // Detect run completion
-        if (state.runState === 'running' && !wp.running) {
-            state.runState = 'idle';
-            updateRunButtons();
-            addLogEntry('Run finished', 'info');
-            stopStatusPoll();
-        }
-    } catch (err) {
-        // Ignore transient errors
-    }
-}
 document.getElementById('btnPause').addEventListener('click', async function() {
-    try { await POST('/api/run/pause'); state.runState = 'paused'; updateRunButtons(); addLogEntry('Run paused', 'warn'); toast('Paused', 'warning'); } catch (err) { toast(err.message, 'error'); }
+    try {
+        await POST('/api/run/pause');
+        // Don't flip state.runState here — the SSE event will reconcile it
+        // from the authoritative worker_pool.paused flag. We only log.
+        addLogEntry('Pause requested', 'warn');
+        toast('Pausing...', 'warning');
+    } catch (err) { toast(err.message, 'error'); }
 });
 document.getElementById('btnResume').addEventListener('click', async function() {
-    try { await POST('/api/run/resume'); state.runState = 'running'; updateRunButtons(); addLogEntry('Run resumed', 'info'); toast('Resumed', 'success'); } catch (err) { toast(err.message, 'error'); }
+    try {
+        await POST('/api/run/resume');
+        addLogEntry('Resume requested', 'info');
+        toast('Resuming...', 'success');
+    } catch (err) { toast(err.message, 'error'); }
 });
 document.getElementById('btnCancel').addEventListener('click', async function() {
-    try { const data = await POST('/api/run/cancel'); state.runState = 'idle'; updateRunButtons(); addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err'); toast('Cancelled', 'warning'); stopStatusPoll(); } catch (err) { toast(err.message, 'error'); }
+    try {
+        const data = await POST('/api/run/cancel');
+        // SSE will observe wp.running==false and transition to idle
+        addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err');
+        toast('Cancelled', 'warning');
+    } catch (err) { toast(err.message, 'error'); }
 });
 ['btnRetryFailed','btnRetryMismatch','btnRetryManual','btnRetryAll'].forEach(function(id) {
     const typeMap = { btnRetryFailed:'failed', btnRetryMismatch:'mismatch', btnRetryManual:'manual', btnRetryAll:'all_eligible' };
@@ -1746,49 +1953,196 @@ document.getElementById('btnCancel').addEventListener('click', async function() 
 });
 
 /* ------------------------------------------------------------------
-   SSO
-   ------------------------------------------------------------------ */
-async function loadSsoStatus() {
-    try {
-        const data = await GET('/api/sso/status');
-        const badge = document.getElementById('ssoStatusBadge');
-        if (data.session_valid) { badge.textContent = 'Active'; badge.className = 'badge badge-success'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = false; }
-        else if (data.has_context) { badge.textContent = 'Pending'; badge.className = 'badge badge-warning'; document.getElementById('btnSsoContinue').disabled = false; document.getElementById('btnSsoReauth').disabled = false; }
-        else { badge.textContent = 'Not Connected'; badge.className = 'badge badge-neutral'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = true; }
-    } catch(e) {}
+   SSO — 5-step user-controlled flow
+   ------------------------------------------------------------------
+   The SSE stream pushes payload.sso (phase/queue/current_paper/...)
+   so most live UI is driven from handleStreamEvent → renderSsoFromStream.
+   The functions below handle:
+     - panel-load one-shot reads (queue list, manual fallback list)
+     - button click handlers for start/end/mark-retrieved/csv
+*/
 
-    // Load SSO queue count
+async function loadSsoStatus() {
+    // Fired on panel switch — load the queue and the manual-fallback list.
+    // Live session state comes from the SSE stream.
     try {
-        const q = await GET('/api/sso/queue-count');
-        const configLines = [];
-        if (q.sso_configured) {
-            configLines.push('<div style="color:var(--success)">&#10003; SSO URL configured</div>');
-        } else {
-            configLines.push('<div style="color:var(--warning)">&#9888; No SSO URL configured — set EZproxy/OpenAthens/resolver URL in Settings first.</div>');
-        }
-        configLines.push('<div style="margin-top:12px;padding:12px;background:var(--bg-primary);border-radius:var(--radius-sm)">');
-        configLines.push('<div style="font-weight:600;font-size:14px;margin-bottom:4px">SSO Queue</div>');
-        configLines.push('<div style="font-size:22px;font-weight:700;color:var(--accent)">' + q.pending_retrieval + ' papers</div>');
-        configLines.push('<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">will be attempted after you log in once</div>');
-        if (q.previously_failed_paywall > 0) {
-            configLines.push('<div style="font-size:12px;color:var(--warning);margin-top:8px">&#9888; ' + q.previously_failed_paywall + ' previously hit paywalls in Tier 2 — these will retry via your SSO session.</div>');
-        }
-        configLines.push('</div>');
-        configLines.push('<div style="margin-top:12px;font-size:12px;color:var(--text-secondary);line-height:1.6"><strong>Session reuse:</strong> ' + q.session_reuse_note + '</div>');
-        document.getElementById('ssoConfigSummary').innerHTML = configLines.join('');
-    } catch(e) {
-        document.getElementById('ssoConfigSummary').innerHTML = '<div style="color:var(--text-secondary);font-size:13px">Could not load SSO queue count.</div>';
+        const q = await GET('/api/sso/queue');
+        renderSsoQueue(q);
+    } catch (err) {
+        document.getElementById('ssoQueueSummary').innerHTML =
+            '<span style="color:var(--danger)">Could not load queue: ' + escHtml(err.message) + '</span>';
+    }
+    try {
+        const m = await GET('/api/sso/manual-fallback');
+        renderSsoManualFallback(m);
+    } catch (err) {
+        document.getElementById('ssoManualList').innerHTML =
+            '<span style="color:var(--danger)">Could not load manual list: ' + escHtml(err.message) + '</span>';
     }
 }
-document.getElementById('btnSsoStart').addEventListener('click', async function() {
-    try { const data = await POST('/api/sso/start'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('SSO page opened', 'info'); } catch (err) { toast(err.message, 'error'); }
+
+function renderSsoQueue(q) {
+    const total = q.total || 0;
+    document.getElementById('ssoProxyPrefix').textContent = 'EZproxy prefix in use: ' + (q.proxy_prefix || '(none)');
+    if (total === 0) {
+        document.getElementById('ssoQueueSummary').innerHTML =
+            '<span style="color:var(--success)">&#10003; No papers need SSO right now.</span>';
+        document.getElementById('ssoQueueList').innerHTML = '';
+        return;
+    }
+    document.getElementById('ssoQueueSummary').innerHTML =
+        '<strong>' + total + ' papers</strong> need institutional access (MANUAL_REQUIRED). ' +
+        'The system will attempt each one through your EZproxy session.';
+
+    const rows = q.papers.map(function(p) {
+        const ezproxy = p.expected_ezproxy_url || '';
+        return '<div style="padding:10px;border-bottom:1px solid var(--border)">' +
+            '<div style="font-weight:500;margin-bottom:2px">' + escHtml(p.title || '(no title)') + '</div>' +
+            '<div style="color:var(--text-secondary);margin-bottom:2px">' +
+                escHtml(p.first_author || '') + ' ' + (p.year || '') +
+                (p.journal ? ' &middot; ' + escHtml(p.journal) : '') +
+                (p.publisher ? ' &middot; <span class="badge badge-neutral">' + escHtml(p.publisher) + '</span>' : '') +
+            '</div>' +
+            (p.doi ? '<div style="font-family:var(--mono);font-size:11px"><a href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">' + escHtml(p.doi) + '</a></div>' : '') +
+            (ezproxy ? '<div style="font-family:var(--mono);font-size:11px;color:var(--text-secondary);margin-top:2px;word-break:break-all">EZproxy: ' + escHtml(ezproxy) + '</div>' : '') +
+            '</div>';
+    }).join('');
+    document.getElementById('ssoQueueList').innerHTML = rows;
+}
+
+function renderSsoManualFallback(data) {
+    const total = data.total || 0;
+    if (total === 0) {
+        document.getElementById('ssoManualList').innerHTML =
+            '<div style="color:var(--success);font-size:13px;padding:8px">&#10003; Nothing left. All SSO-queued papers have been handled.</div>';
+        return;
+    }
+    const rows = data.papers.map(function(p) {
+        return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
+            '<div style="font-weight:500;margin-bottom:4px">' + escHtml(p.title || '(no title)') + '</div>' +
+            '<div style="color:var(--text-secondary);font-size:11px;margin-bottom:4px">' +
+                escHtml(p.first_author || '') + ' ' + (p.year || '') +
+                (p.publisher ? ' &middot; ' + escHtml(p.publisher) : '') +
+                (p.last_failure_code ? ' &middot; <span class="badge badge-warning">' + escHtml(p.last_failure_code) + '</span>' : '') +
+            '</div>' +
+            (p.doi ? '<div style="font-family:var(--mono);font-size:11px;margin-bottom:2px">DOI: <a href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">' + escHtml(p.doi) + '</a></div>' : '') +
+            (p.ezproxy_url ? '<div style="font-family:var(--mono);font-size:11px;margin-bottom:6px"><a href="' + escAttr(p.ezproxy_url) + '" target="_blank" rel="noopener">Open via EZproxy &rarr;</a></div>' : '') +
+            '<button class="btn btn-sm btn-success" onclick="ssoMarkRetrieved(\'' + escAttr(p.canonical_id) + '\')">Mark as Retrieved</button>' +
+            '</div>';
+    }).join('');
+    document.getElementById('ssoManualList').innerHTML = rows;
+}
+
+// SSE-driven renderer for the live session state (phase, progress, timer).
+// Called from handleStreamEvent.
+function renderSsoFromStream(sso) {
+    if (!sso) return;
+
+    // Phase badge (top-right of panel)
+    const phaseBadge = document.getElementById('ssoPhaseBadge');
+    phaseBadge.textContent = sso.phase || 'idle';
+    phaseBadge.className = 'badge ' + ({
+        idle: 'badge-neutral',
+        waiting_login: 'badge-warning',
+        downloading: 'badge-info',
+        paused_reauth: 'badge-warning',
+        ended: 'badge-neutral',
+    }[sso.phase] || 'badge-neutral');
+
+    // Session card
+    const sessionBadge = document.getElementById('ssoSessionBadge');
+    if (sso.active) {
+        if (sso.session_expired) {
+            sessionBadge.textContent = 'Session expired'; sessionBadge.className = 'badge badge-danger';
+        } else if (sso.login_detected_at) {
+            sessionBadge.textContent = 'Active'; sessionBadge.className = 'badge badge-success';
+        } else {
+            sessionBadge.textContent = 'Waiting for login'; sessionBadge.className = 'badge badge-warning';
+        }
+    } else {
+        sessionBadge.textContent = 'Not started'; sessionBadge.className = 'badge badge-neutral';
+    }
+    document.getElementById('btnSsoSessionStart').disabled = !!sso.active;
+    document.getElementById('btnSsoSessionEnd').disabled = !sso.active;
+
+    if (sso.last_message) {
+        document.getElementById('ssoSessionMessage').textContent = sso.last_message;
+    }
+
+    // Session timer
+    if (sso.login_detected_at && sso.active) {
+        const secs = Math.max(0, Math.floor(sso.session_duration_s || 0));
+        const mins = Math.floor(secs / 60);
+        const rem = secs % 60;
+        document.getElementById('ssoSessionTimer').textContent =
+            'Session active for ' + mins + 'm ' + rem + 's';
+    } else if (sso.ended_at) {
+        document.getElementById('ssoSessionTimer').textContent = 'Session ended.';
+    } else {
+        document.getElementById('ssoSessionTimer').textContent = '';
+    }
+
+    // Download card — only show once downloading or beyond
+    const showDownload = ['downloading', 'paused_reauth', 'ended'].indexOf(sso.phase) >= 0;
+    document.getElementById('ssoDownloadCard').style.display = showDownload ? 'block' : 'none';
+
+    const total = sso.queue_total || 0;
+    const done = sso.queue_processed || 0;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    document.getElementById('ssoProgressBar').style.width = pct + '%';
+    document.getElementById('ssoProgressText').textContent = done + ' / ' + total + ' papers';
+    document.getElementById('ssoProgressPercent').textContent = pct + '%';
+    document.getElementById('ssoSucceeded').textContent = sso.queue_succeeded || 0;
+    document.getElementById('ssoManualStill').textContent = sso.queue_manual || 0;
+
+    // Current paper block
+    const cur = document.getElementById('ssoCurrentPaper');
+    if (sso.current_paper_id) {
+        cur.style.color = sso.session_expired ? 'var(--danger)' : 'var(--text-primary)';
+        cur.innerHTML =
+            '<strong>' + (sso.session_expired ? 'Paused on:' : 'Processing:') + '</strong> ' +
+            escHtml(sso.current_paper_title || sso.current_paper_id);
+    } else if (sso.phase === 'ended') {
+        cur.innerHTML = '<strong>Queue finished.</strong> See Step 5 for any remaining manual items.';
+    } else {
+        cur.innerHTML = '';
+    }
+}
+
+document.getElementById('btnSsoSessionStart').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/sso/session/start');
+        toast('SSO browser opened — log in with your credentials', 'info');
+        document.getElementById('ssoSessionMessage').textContent = data.message || '';
+    } catch (err) { toast(err.message, 'error'); }
 });
-document.getElementById('btnSsoContinue').addEventListener('click', async function() {
-    try { const data = await POST('/api/sso/continue'); document.getElementById('ssoMessage').textContent = data.message; loadSsoStatus(); toast(data.status === 'sso_active' ? 'SSO confirmed' : 'Session uncertain', data.status === 'sso_active' ? 'success' : 'warning'); } catch (err) { toast(err.message, 'error'); }
+document.getElementById('btnSsoSessionEnd').addEventListener('click', async function() {
+    if (!confirm('End the SSO session? The browser will close and any unprocessed papers will remain in the SSO queue for next time.')) return;
+    try {
+        const data = await POST('/api/sso/session/end');
+        toast('Session ended. ' + (data.queue_succeeded || 0) + ' retrieved, ' + (data.queue_manual || 0) + ' still manual', 'success');
+        loadSsoStatus();  // refresh queue + manual list
+    } catch (err) { toast(err.message, 'error'); }
 });
-document.getElementById('btnSsoReauth').addEventListener('click', async function() {
-    try { const data = await POST('/api/sso/reauth'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('Re-auth started', 'info'); } catch (err) { toast(err.message, 'error'); }
+document.getElementById('btnSsoReloadQueue').addEventListener('click', async function() {
+    try { const q = await GET('/api/sso/queue'); renderSsoQueue(q); } catch (err) { toast(err.message, 'error'); }
 });
+document.getElementById('btnSsoReloadManual').addEventListener('click', async function() {
+    try { const m = await GET('/api/sso/manual-fallback'); renderSsoManualFallback(m); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnSsoExportManualCsv').addEventListener('click', function() {
+    window.location.href = '/api/sso/manual-fallback/csv';
+});
+
+window.ssoMarkRetrieved = async function(canonicalId) {
+    const note = prompt('Optional note (e.g. how you got it):') || '';
+    try {
+        await POST('/api/sso/paper/' + encodeURIComponent(canonicalId) + '/mark-retrieved?note=' + encodeURIComponent(note));
+        toast('Marked as manually retrieved', 'success');
+        const m = await GET('/api/sso/manual-fallback');
+        renderSsoManualFallback(m);
+    } catch (err) { toast(err.message, 'error'); }
+};
 
 /* ------------------------------------------------------------------
    CAPTCHA
@@ -1892,6 +2246,15 @@ document.getElementById('btnExportAudit').addEventListener('click', function() {
 document.getElementById('btnExportIntegration').addEventListener('click', function() {
     const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/integration' + (r ? '?run_id=' + encodeURIComponent(r) : '');
 });
+document.getElementById('btnExportBundle').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value;
+    if (!r) {
+        toast('Select a specific run to build the submission bundle', 'warning');
+        return;
+    }
+    toast('Preparing submission bundle — this may take a moment for large runs...', 'info');
+    window.location.href = '/api/export/bundle?run_id=' + encodeURIComponent(r);
+});
 
 /* ------------------------------------------------------------------
    Utility
@@ -1912,7 +2275,18 @@ function formatBytes(b) {
         const s = await GET('/api/status');
         if (s.wizard_errors && s.wizard_errors.length) s.wizard_errors.forEach(function(e) { toast(e, 'warning'); });
         document.getElementById('sidebarOcr').textContent = 'OCR: ' + s.ocr_mode;
-        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); startSSE(); startStatusPoll(); }
+        // Always open the unified SSE stream — it drives the whole UI
+        startSSE();
+        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); }
+
+        // Reconnect enrichment SSE if a background task is still running
+        try {
+            const enr = await GET('/api/enrichment/status');
+            if (enr && enr.in_progress) {
+                document.getElementById('uploadResults').style.display = 'block';
+                startEnrichmentSSE();
+            }
+        } catch (e) {}
     } catch(e) { toast('Could not connect to server', 'error'); }
     updateRunButtons();
 })();

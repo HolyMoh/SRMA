@@ -48,6 +48,7 @@ from full_text_acquisition.database import Database
 from full_text_acquisition.models import (
     COLUMN_ALIASES,
     CURRENT_CONFIG_VERSION,
+    DEFAULT_BACKPRESSURE_THRESHOLD,
     DEFAULT_CACHE_TTL_DAYS,
     DEFAULT_CONFIG,
     AuditLogEntry,
@@ -437,6 +438,40 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     app_state["engine"] = engine
     app_state["worker_pool"] = worker_pool
     app_state["shutdown_event"] = asyncio.Event()
+    app_state["enrichment_status"] = {
+        "in_progress": False,
+        "run_id": None,
+        "total": 0,
+        "completed": 0,
+        "enriched_count": 0,
+        "failed_count": 0,
+        "started_at": None,
+        "completed_at": None,
+    }
+    app_state["enrichment_task"] = None
+
+    # SSO session state — SERIALIZABLE SUBSET ONLY.
+    # Never includes credentials, cookies, page content, or screenshots.
+    # Only tracks progress and UI state.
+    app_state["sso_session"] = {
+        "active": False,
+        "phase": "idle",               # idle | waiting_login | downloading | paused_reauth | ended
+        "proxy_url": "",               # The EZproxy prefix in use
+        "login_url": "",               # Where we navigated the browser on Start
+        "started_at": None,
+        "login_detected_at": None,
+        "ended_at": None,
+        "queue_total": 0,
+        "queue_processed": 0,
+        "queue_succeeded": 0,
+        "queue_manual": 0,
+        "current_paper_id": None,
+        "current_paper_title": None,
+        "last_message": "",
+        "session_expired": False,
+    }
+    app_state["sso_task"] = None
+    app_state["sso_cancel_event"] = None
 
     logger.info(
         "Startup complete: %d interrupted resets, %d missing files reconciled",
@@ -712,20 +747,11 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     # Bulk insert new papers
     inserted = await db.insert_papers_bulk(papers)
 
-    # Transition INGESTED → NORMALIZED for all new papers
+    # Transition INGESTED → NORMALIZED for all new papers (synchronous, fast)
     for paper in papers:
         await db.transition_state(paper.canonical_id, PaperState.NORMALIZED.value)
 
-    # Metadata enrichment
-    enrichment = await _enrich_papers(papers, db, config)
-
-    # Transition NORMALIZED → ENRICHED → IDENTITY_ASSIGNED → READY_FOR_RETRIEVAL
-    for paper in papers:
-        await db.transition_state(paper.canonical_id, PaperState.ENRICHED.value)
-        await db.transition_state(paper.canonical_id, PaperState.IDENTITY_ASSIGNED.value)
-        await db.transition_state(paper.canonical_id, PaperState.READY_FOR_RETRIEVAL.value)
-
-    # Create paper_runs for new papers
+    # Create paper_runs for new papers (synchronous, fast)
     paper_runs = [
         PaperRun(canonical_id=p.canonical_id, run_id=run_id, submitted_in_this_run=True)
         for p in papers
@@ -735,6 +761,32 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     # Update run count
     total_ready = inserted
     await db.update_run_submitted_count(run_id, len(rows))
+
+    # Launch enrichment + downstream state transitions in the background.
+    # The response below returns immediately; the UI polls /api/enrichment/status
+    # (or consumes /api/enrichment/stream) to observe progress. Each paper
+    # transitions NORMALIZED → ENRICHED → IDENTITY_ASSIGNED → READY_FOR_RETRIEVAL
+    # as its enrichment finishes.
+    if papers:
+        app_state["enrichment_status"] = {
+            "in_progress": True,
+            "run_id": run_id,
+            "total": len(papers),
+            "completed": 0,
+            "enriched_count": 0,
+            "failed_count": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+        }
+        canonical_ids = [p.canonical_id for p in papers]
+        task = asyncio.create_task(
+            _enrich_papers_background(canonical_ids, run_id),
+            name=f"enrichment-{run_id}",
+        )
+        app_state["enrichment_task"] = task
+    # No papers to enrich → status stays with in_progress=False
+
+    enrichment: Optional[EnrichmentResult] = None  # Populated async; kept None in response
 
     # Build preview (first 10 rows)
     preview = []
@@ -819,6 +871,140 @@ def _get_field(
         return None
     value = row.get(column_name, "")
     return value.strip() if value else None
+
+
+async def _enrich_papers_background(
+    canonical_ids: List[str],
+    run_id: str,
+) -> None:
+    """Background task: enrich papers + advance state to READY_FOR_RETRIEVAL.
+
+    For each paper:
+        1. OpenAlex API (primary)
+        2. CrossRef API (fallback)
+        3. Transition NORMALIZED → ENRICHED → IDENTITY_ASSIGNED → READY_FOR_RETRIEVAL
+        4. Update live progress in app_state["enrichment_status"]
+
+    Papers without a DOI skip API calls but still transition through the pipeline.
+    All failures are non-fatal — a paper that can't be enriched still advances.
+    """
+    db = app_state.get("db")
+    engine = app_state.get("engine")
+    config = app_state.get("config", DEFAULT_CONFIG)
+    status = app_state.get("enrichment_status")
+
+    if db is None or engine is None or status is None:
+        logger.error("Enrichment background: app_state not initialized")
+        return
+
+    logger.info(
+        "Enrichment background: starting for run=%s, %d papers",
+        run_id, len(canonical_ids),
+    )
+
+    try:
+        for cid in canonical_ids:
+            # Refresh paper from DB in case worker tasks touched it
+            paper = await db.get_paper(cid)
+            if paper is None:
+                status["completed"] += 1
+                continue
+
+            enriched = False
+
+            # Skip API calls for papers without a DOI
+            if paper.doi:
+                # Try OpenAlex first
+                try:
+                    oa_url = f"https://api.openalex.org/works/doi:{paper.doi}"
+                    oa_data, _ = await engine._api_request(
+                        url=oa_url,
+                        doi=paper.doi,
+                        api_name="openalex",
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        tier="ENRICHMENT",
+                    )
+                    if oa_data:
+                        filled = await _apply_enrichment_openalex(paper, oa_data, db)
+                        if filled:
+                            enriched = True
+                except Exception as exc:
+                    logger.debug(
+                        "OpenAlex enrichment failed for %s: %s", paper.doi, exc
+                    )
+
+                # Fallback to CrossRef
+                if not enriched:
+                    try:
+                        cr_url = f"https://api.crossref.org/works/{paper.doi}"
+                        cr_data, _ = await engine._api_request(
+                            url=cr_url,
+                            doi=paper.doi,
+                            api_name="crossref",
+                            canonical_id=paper.canonical_id,
+                            run_id=run_id,
+                            tier="ENRICHMENT",
+                        )
+                        if cr_data:
+                            msg = cr_data.get("message", cr_data)
+                            filled = await _apply_enrichment_crossref(paper, msg, db)
+                            if filled:
+                                enriched = True
+                    except Exception as exc:
+                        logger.debug(
+                            "CrossRef enrichment failed for %s: %s", paper.doi, exc
+                        )
+
+            # Always advance through the state machine even if enrichment failed
+            try:
+                await db.transition_state(cid, PaperState.ENRICHED.value)
+                await db.transition_state(cid, PaperState.IDENTITY_ASSIGNED.value)
+                await db.transition_state(cid, PaperState.READY_FOR_RETRIEVAL.value)
+            except Exception as exc:
+                logger.error(
+                    "State transition failed for %s during enrichment: %s",
+                    cid, exc,
+                )
+
+            # Update progress counters
+            if enriched:
+                status["enriched_count"] += 1
+            else:
+                status["failed_count"] += 1
+            status["completed"] += 1
+
+    except asyncio.CancelledError:
+        logger.info("Enrichment background: cancelled")
+        raise
+    except Exception as exc:
+        logger.error(
+            "Enrichment background: unhandled exception: %s\n%s",
+            exc, traceback.format_exc(),
+        )
+    finally:
+        status["in_progress"] = False
+        status["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await db.log_audit(AuditLogEntry(
+                run_id=run_id,
+                outcome="ENRICHMENT_COMPLETE",
+                details=json.dumps({
+                    "total": status["total"],
+                    "completed": status["completed"],
+                    "enriched": status["enriched_count"],
+                    "failed": status["failed_count"],
+                }),
+            ))
+        except Exception:
+            pass
+
+        logger.info(
+            "Enrichment background: complete for run=%s (%d/%d enriched, %d without metadata)",
+            run_id, status["enriched_count"], status["total"],
+            status["failed_count"],
+        )
 
 
 async def _enrich_papers(
@@ -1252,32 +1438,6 @@ async def list_runs(
     })
 
 
-@app.get("/api/run/status")
-async def run_status() -> JSONResponse:
-    """Return live worker pool status + state counts for frontend polling.
-
-    Independent of SSE — called every ~2s by the UI when a run is active.
-    """
-    db = _get_db()
-    wp = _get_worker_pool()
-
-    state_counts = await db.count_papers_by_state()
-    wp_status = wp.get_status()
-
-    return JSONResponse({
-        "worker_pool": wp_status,
-        "state_counts": state_counts,
-        "total_papers": sum(state_counts.values()),
-        "ready_for_retrieval": state_counts.get(PaperState.READY_FOR_RETRIEVAL.value, 0),
-        "retrieving": state_counts.get(PaperState.RETRIEVING.value, 0),
-        "retrieved": state_counts.get(PaperState.RETRIEVED.value, 0),
-        "validating": state_counts.get(PaperState.VALIDATING.value, 0),
-        "complete": state_counts.get(PaperState.COMPLETE.value, 0),
-        "failed": state_counts.get(PaperState.FAILED.value, 0),
-        "manual_required": state_counts.get(PaperState.MANUAL_REQUIRED.value, 0),
-    })
-
-
 @app.get("/api/run/{run_id}")
 async def get_run_detail(run_id: str) -> JSONResponse:
     """Get detailed information about a specific run."""
@@ -1492,6 +1652,595 @@ async def sso_queue_count() -> JSONResponse:
             "or close the app."
         ),
     })
+
+
+# ===========================================================================
+# SSO OVERHAUL — User-Controlled, System-Assisted
+# ===========================================================================
+#
+# Philosophy: the USER stays in full control of credentials. The SYSTEM
+# does all the mechanical work (URL construction, navigation, PDF
+# extraction, progress tracking). We never read, log, or store anything
+# the user types, and we never store cookies outside the Playwright
+# context (which is destroyed on session end).
+
+# Default EZproxy prefix. Overridden by config.sso_proxy_url if set.
+# UofT's EZproxy is the reference implementation.
+DEFAULT_EZPROXY_PREFIX = "https://myaccess.library.utoronto.ca/login?url="
+DEFAULT_EZPROXY_LOGIN_URL = "https://myaccess.library.utoronto.ca/login"
+# Well-known open-access DOI used to probe login state. PLOS ONE's first
+# article — publicly available, fast to load, and will resolve through
+# any functioning institutional proxy.
+SSO_LOGIN_PROBE_DOI = "10.1371/journal.pone.0000308"
+DEFAULT_SSO_INTER_PAPER_DELAY_S = 3.0
+SSO_LOGIN_POLL_INTERVAL_S = 3.0
+SSO_REAUTH_POLL_INTERVAL_S = 5.0
+
+
+def _ezproxy_prefix() -> str:
+    """Return the configured EZproxy prefix, or the UofT default.
+
+    Callers append the target article URL to this prefix.
+    """
+    raw = (_get_config().get("sso_proxy_url") or "").strip()
+    if not raw:
+        return DEFAULT_EZPROXY_PREFIX
+    # Normalize to "...login?url=" form: users may paste either
+    # `https://proxy.uni.edu` or `https://proxy.uni.edu/login?url=`.
+    if raw.endswith("?url=") or raw.endswith("url="):
+        return raw
+    raw_stripped = raw.rstrip("/")
+    if raw_stripped.endswith("/login"):
+        return f"{raw_stripped}?url="
+    return f"{raw_stripped}/login?url="
+
+
+def _ezproxy_login_url() -> str:
+    """Bare login URL (no ?url= suffix) — where Start SSO Session lands."""
+    prefix = _ezproxy_prefix()
+    if "?" in prefix:
+        return prefix.split("?", 1)[0]
+    return prefix
+
+
+def _build_ezproxy_url(article_url: str) -> str:
+    """Wrap an article URL with the EZproxy prefix."""
+    return f"{_ezproxy_prefix()}{article_url}"
+
+
+def _sso_test_url() -> str:
+    """EZproxy-wrapped URL of the login probe DOI."""
+    return _build_ezproxy_url(f"https://doi.org/{SSO_LOGIN_PROBE_DOI}")
+
+
+# ---------------------------------------------------------------------------
+# STEP 1 — Queue visibility
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/sso/queue")
+async def sso_queue(
+    run_id: Optional[str] = Query(default=None),
+) -> JSONResponse:
+    """List papers in the SSO queue (MANUAL_REQUIRED).
+
+    For each paper returns:
+        canonical_id, doi, title, first_author, year, journal,
+        publisher, last_failure_code, expected_ezproxy_url, doi_url
+
+    The expected_ezproxy_url is what the system will navigate the
+    browser to when it processes the paper.
+    """
+    db = _get_db()
+    papers = await db.get_manual_required_papers(run_id=run_id)
+
+    prefix = _ezproxy_prefix()
+    items: List[Dict[str, Any]] = []
+    for p in papers:
+        doi_url = f"https://doi.org/{p.doi}" if p.doi else None
+        ezproxy_url = f"{prefix}{doi_url}" if doi_url else None
+        items.append({
+            "canonical_id": p.canonical_id,
+            "doi": p.doi,
+            "doi_url": doi_url,
+            "title": p.title,
+            "first_author": p.first_author_lastname,
+            "year": p.year,
+            "journal": p.journal,
+            "publisher": p.publisher,
+            "last_failure_code": p.last_failure_code,
+            "expected_ezproxy_url": ezproxy_url,
+            "attempt_count": p.attempt_count,
+        })
+
+    return JSONResponse({
+        "total": len(items),
+        "proxy_prefix": prefix,
+        "login_url": _ezproxy_login_url(),
+        "papers": items,
+    })
+
+
+# ---------------------------------------------------------------------------
+# STEP 2 — Session initialization
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/sso/session/start")
+async def sso_session_start() -> JSONResponse:
+    """STEP 2 — Open the authenticated browser and begin the SSO flow.
+
+    Opens a headed Playwright Chromium window with stealth injected.
+    Navigates to the EZproxy bare login URL (no ?url= suffix).
+    Starts a background task that:
+      - Polls the browser (every 3s) for login completion
+      - Once detected, processes the SSO queue paper-by-paper
+      - Handles session expiry mid-queue (pause + wait for re-login)
+      - Emits live progress into app_state['sso_session'] for SSE
+
+    SECURITY:
+      - We navigate the browser; the USER types credentials.
+      - We never read input fields, cookies, or body text except for
+        structural detection (URL + known-paywall selectors).
+    """
+    bm: BrowserManager = app_state.get("browser_manager")
+    db: Database = _get_db()
+    engine: RetrievalEngine = _get_engine()
+    sso: Dict[str, Any] = app_state["sso_session"]
+
+    if bm is None or db is None or engine is None:
+        raise HTTPException(status_code=503, detail="System not initialized")
+
+    if sso.get("active"):
+        raise HTTPException(
+            status_code=409,
+            detail="An SSO session is already active. End it before starting a new one.",
+        )
+
+    login_url = _ezproxy_login_url()
+    proxy_prefix = _ezproxy_prefix()
+
+    try:
+        await bm.initiate_sso_login(login_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to open SSO login page: {exc}",
+        )
+
+    # Reset session state
+    cancel_event = asyncio.Event()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sso.update({
+        "active": True,
+        "phase": "waiting_login",
+        "proxy_url": proxy_prefix,
+        "login_url": login_url,
+        "started_at": now_iso,
+        "login_detected_at": None,
+        "ended_at": None,
+        "queue_total": 0,
+        "queue_processed": 0,
+        "queue_succeeded": 0,
+        "queue_manual": 0,
+        "current_paper_id": None,
+        "current_paper_title": None,
+        "last_message": "Browser opened. Log in with your institution credentials. We never see what you type.",
+        "session_expired": False,
+    })
+    app_state["sso_cancel_event"] = cancel_event
+
+    # Launch background worker (queue processing after login detection)
+    task = asyncio.create_task(
+        _sso_queue_processor(cancel_event),
+        name="sso-queue-processor",
+    )
+    app_state["sso_task"] = task
+
+    await db.log_audit(AuditLogEntry(
+        outcome="SSO_SESSION_STARTED",
+        details=json.dumps({
+            "login_url": login_url,
+            "proxy_prefix": proxy_prefix,
+        }),
+    ))
+
+    return JSONResponse({
+        "status": "session_started",
+        "login_url": login_url,
+        "proxy_prefix": proxy_prefix,
+        "message": sso["last_message"],
+    })
+
+
+@app.get("/api/sso/session/status")
+async def sso_session_status_detailed() -> JSONResponse:
+    """One-shot snapshot of the SSO session status.
+
+    The same data is pushed continuously via the unified SSE stream
+    (/api/stream → payload.sso). This endpoint exists for page-load
+    bootstrap and ad-hoc reads.
+    """
+    sso = dict(app_state.get("sso_session") or {})
+    # Never expose internal task handles
+    sso.pop("_internal", None)
+    return JSONResponse(sso)
+
+
+@app.post("/api/sso/session/end")
+async def sso_session_end() -> JSONResponse:
+    """STEP 4b — Close the SSO browser and save progress.
+
+    Destroys the Playwright persistent context. Papers not reached
+    before session end remain MANUAL_REQUIRED for the next session.
+    """
+    bm: BrowserManager = app_state.get("browser_manager")
+    sso = app_state["sso_session"]
+    cancel_event: Optional[asyncio.Event] = app_state.get("sso_cancel_event")
+    task: Optional[asyncio.Task] = app_state.get("sso_task")
+
+    if not sso.get("active"):
+        raise HTTPException(status_code=409, detail="No active SSO session")
+
+    # Signal the worker to stop
+    if cancel_event:
+        cancel_event.set()
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # Destroy browser context (security: no persistence outside session)
+    if bm is not None:
+        try:
+            await bm.destroy_persistent_context(reason="user_ended_session")
+        except Exception as exc:
+            logger.debug("Error destroying persistent context: %s", exc)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sso.update({
+        "active": False,
+        "phase": "ended",
+        "ended_at": now_iso,
+        "last_message": "Session ended. Browser closed.",
+        "current_paper_id": None,
+        "current_paper_title": None,
+    })
+    app_state["sso_task"] = None
+    app_state["sso_cancel_event"] = None
+
+    try:
+        await _get_db().log_audit(AuditLogEntry(
+            outcome="SSO_SESSION_ENDED",
+            details=json.dumps({
+                "queue_processed": sso.get("queue_processed", 0),
+                "queue_succeeded": sso.get("queue_succeeded", 0),
+                "queue_manual": sso.get("queue_manual", 0),
+            }),
+        ))
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "status": "session_ended",
+        "queue_processed": sso.get("queue_processed", 0),
+        "queue_succeeded": sso.get("queue_succeeded", 0),
+        "queue_manual": sso.get("queue_manual", 0),
+    })
+
+
+# ---------------------------------------------------------------------------
+# STEP 5 — Manual fallback helpers
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/sso/paper/{canonical_id}/mark-retrieved")
+async def sso_mark_retrieved(
+    canonical_id: str,
+    note: str = Query(default=""),
+) -> JSONResponse:
+    """User signals they manually obtained a paper's PDF.
+
+    Records an audit entry and sets user_override='MANUALLY_RETRIEVED'
+    on the paper. The paper stays in MANUAL_REQUIRED — it's still
+    not in the system's PDF store, but reviewers can see it's resolved.
+    """
+    db = _get_db()
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.update_paper_fields(
+        canonical_id,
+        user_override="MANUALLY_RETRIEVED",
+        override_reason=note or "User marked as manually retrieved outside the system",
+        override_timestamp=now_iso,
+    )
+    await db.log_audit(AuditLogEntry(
+        canonical_id=canonical_id,
+        outcome="MANUALLY_RETRIEVED",
+        details=json.dumps({"note": note or ""}),
+    ))
+
+    return JSONResponse({
+        "status": "marked",
+        "canonical_id": canonical_id,
+    })
+
+
+@app.get("/api/sso/manual-fallback")
+async def sso_manual_fallback() -> JSONResponse:
+    """List of papers still needing manual retrieval after SSO session ends."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+
+    prefix = _ezproxy_prefix()
+    items = []
+    for p in papers:
+        if p.user_override == "MANUALLY_RETRIEVED":
+            continue  # already resolved by user
+        doi_url = f"https://doi.org/{p.doi}" if p.doi else None
+        items.append({
+            "canonical_id": p.canonical_id,
+            "title": p.title,
+            "first_author": p.first_author_lastname,
+            "year": p.year,
+            "doi": p.doi,
+            "doi_url": doi_url,
+            "ezproxy_url": f"{prefix}{doi_url}" if doi_url else None,
+            "publisher": p.publisher,
+            "last_failure_code": p.last_failure_code,
+        })
+    return JSONResponse({"total": len(items), "papers": items})
+
+
+@app.get("/api/sso/manual-fallback/csv")
+async def sso_manual_fallback_csv() -> Any:
+    """CSV export of the manual-fallback list for external retrieval tracking."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+
+    prefix = _ezproxy_prefix()
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"sso_manual_fallback_{timestamp}.csv"
+    filepath = os.path.join(export_dir, filename)
+
+    with open(filepath, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "canonical_id", "title", "first_author", "year", "doi",
+            "doi_url", "ezproxy_url", "publisher", "last_failure_code",
+            "user_override",
+        ])
+        for p in papers:
+            doi_url = f"https://doi.org/{p.doi}" if p.doi else ""
+            w.writerow([
+                p.canonical_id, p.title, p.first_author_lastname,
+                p.year or "", p.doi or "", doi_url,
+                f"{prefix}{doi_url}" if doi_url else "",
+                p.publisher, p.last_failure_code or "",
+                p.user_override or "",
+            ])
+    return FileResponse(filepath, media_type="text/csv", filename=filename)
+
+
+# ---------------------------------------------------------------------------
+# STEP 3 — Background queue processor
+# ---------------------------------------------------------------------------
+
+
+async def _sso_queue_processor(cancel_event: asyncio.Event) -> None:
+    """Background task: detect login, then process SSO queue.
+
+    Phases:
+        waiting_login  → probe every 3s until browser is authenticated
+        downloading    → iterate MANUAL_REQUIRED papers
+        paused_reauth  → session expired mid-queue; poll for re-login
+        ended          → terminal
+
+    Per-paper loop:
+        1. Check session validity (if expired: enter paused_reauth)
+        2. Reset paper to READY_FOR_RETRIEVAL so engine.tier3 can run
+        3. Run engine.tier3_institutional_sso — this constructs the
+           EZproxy URL, navigates, applies publisher-specific PDF
+           extraction, downloads and atomically stores the PDF
+        4. On success: advance through validation pipeline → COMPLETE
+        5. On block/paywall: revert to MANUAL_REQUIRED with audit
+        6. Sleep configured inter-paper delay before next
+    """
+    bm: BrowserManager = app_state.get("browser_manager")
+    db: Database = app_state.get("db")
+    engine: RetrievalEngine = app_state.get("engine")
+    sso: Dict[str, Any] = app_state["sso_session"]
+    config = _get_config()
+    inter_paper_delay = float(
+        config.get("sso_inter_paper_delay_s", DEFAULT_SSO_INTER_PAPER_DELAY_S)
+    )
+
+    # --- Phase: waiting_login ---
+    sso["phase"] = "waiting_login"
+    sso["last_message"] = "Waiting for you to log in..."
+    login_detected = False
+    while not cancel_event.is_set() and not login_detected:
+        try:
+            result = await bm.probe_sso_login(_sso_test_url())
+            if result.get("authenticated"):
+                login_detected = True
+                sso["login_detected_at"] = datetime.now(timezone.utc).isoformat()
+                sso["last_message"] = "\u2713 Session active — starting downloads"
+                break
+        except Exception as exc:
+            logger.debug("SSO login probe error: %s", exc)
+
+        try:
+            await asyncio.wait_for(
+                cancel_event.wait(), timeout=SSO_LOGIN_POLL_INTERVAL_S
+            )
+            break  # cancelled
+        except asyncio.TimeoutError:
+            pass
+
+    if cancel_event.is_set():
+        return
+
+    # --- Phase: downloading ---
+    sso["phase"] = "downloading"
+
+    # Load queue
+    try:
+        papers = await db.get_manual_required_papers()
+    except Exception as exc:
+        sso["phase"] = "ended"
+        sso["last_message"] = f"Could not load queue: {exc}"
+        return
+    sso["queue_total"] = len(papers)
+
+    run_id = f"sso-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+
+    for idx, paper in enumerate(papers, start=1):
+        if cancel_event.is_set():
+            break
+
+        # --- session validity recheck ---
+        try:
+            probe = await bm.probe_sso_login(_sso_test_url())
+            if not probe.get("authenticated"):
+                sso["session_expired"] = True
+                sso["phase"] = "paused_reauth"
+                sso["last_message"] = "Session expired. Please log in again in the browser."
+
+                # Wait for re-login
+                while not cancel_event.is_set():
+                    try:
+                        probe2 = await bm.probe_sso_login(_sso_test_url())
+                        if probe2.get("authenticated"):
+                            sso["session_expired"] = False
+                            sso["phase"] = "downloading"
+                            sso["last_message"] = "\u2713 Session restored — resuming downloads"
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(
+                            cancel_event.wait(),
+                            timeout=SSO_REAUTH_POLL_INTERVAL_S,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
+                if cancel_event.is_set():
+                    break
+        except Exception as exc:
+            logger.debug("SSO session probe failed: %s", exc)
+
+        sso["current_paper_id"] = paper.canonical_id
+        sso["current_paper_title"] = paper.title
+        sso["queue_processed"] = idx
+        sso["last_message"] = f"Paper {idx}/{len(papers)} — downloading..."
+
+        # Reset paper state so tier3 can run — MANUAL_REQUIRED → READY_FOR_RETRIEVAL
+        try:
+            await db.reset_paper_for_retry(paper.canonical_id)
+        except Exception as exc:
+            logger.debug("Reset paper %s failed: %s", paper.canonical_id, exc)
+            continue
+
+        # Claim for retrieval so state machine is happy
+        worker_id = "sso-worker"
+        claimed = await db.claim_retrieval_task(paper.canonical_id, worker_id)
+        if not claimed:
+            # Another worker might have it — skip
+            continue
+
+        # Refresh paper (state is now RETRIEVING)
+        fresh = await db.get_paper(paper.canonical_id)
+        if fresh is None:
+            continue
+
+        # Run Tier 3 (SSO) only — reuses EZproxy URL construction +
+        # publisher-specific PDF extraction + atomic write
+        try:
+            success, failure_code = await engine.tier3_institutional_sso(
+                fresh, run_id
+            )
+        except Exception as exc:
+            logger.error("SSO retrieval error for %s: %s", paper.canonical_id, exc)
+            success, failure_code = False, "SSO_FAILED"
+
+        if success:
+            # Advance state RETRIEVING → RETRIEVED so validation kicks in
+            await db.transition_state(
+                paper.canonical_id, PaperState.RETRIEVED.value, run_id=run_id,
+            )
+            # Run validation pipeline inline so the paper reaches COMPLETE
+            try:
+                claimed_v = await db.claim_validation_task(
+                    paper.canonical_id, worker_id
+                )
+                if claimed_v:
+                    refreshed = await db.get_paper(paper.canonical_id)
+                    if refreshed:
+                        vstatus, istatus, score = await engine.run_validation_pipeline(
+                            refreshed, run_id
+                        )
+                        await db.transition_state(
+                            paper.canonical_id, PaperState.VALIDATED.value,
+                            run_id=run_id,
+                        )
+                        # Auto-complete unless flagged
+                        if istatus not in (
+                            "VERSION_MISMATCH", "CONTENT_UNVERIFIED",
+                            "TITLE_VERIFIED_WEAK",
+                        ):
+                            await db.transition_state(
+                                paper.canonical_id, PaperState.COMPLETE.value,
+                                run_id=run_id,
+                            )
+            except Exception as exc:
+                logger.debug("SSO validation error for %s: %s", paper.canonical_id, exc)
+            sso["queue_succeeded"] += 1
+        else:
+            # Revert to MANUAL_REQUIRED so user can act
+            try:
+                await db.transition_state(
+                    paper.canonical_id, PaperState.MANUAL_REQUIRED.value,
+                    failure_code=failure_code or "SSO_FAILED",
+                    run_id=run_id,
+                )
+            except Exception:
+                pass
+            sso["queue_manual"] += 1
+
+        # Inter-paper delay
+        if cancel_event.is_set():
+            break
+        try:
+            await asyncio.wait_for(
+                cancel_event.wait(), timeout=inter_paper_delay
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    sso["current_paper_id"] = None
+    sso["current_paper_title"] = None
+    if not cancel_event.is_set():
+        sso["phase"] = "ended"
+        sso["last_message"] = (
+            f"Queue complete: {sso['queue_succeeded']} succeeded, "
+            f"{sso['queue_manual']} still manual"
+        )
 
 
 # ===========================================================================
@@ -1810,6 +2559,305 @@ async def export_integration(
     )
 
 
+@app.get("/api/export/bundle")
+async def export_bundle(
+    run_id: str = Query(..., description="Run ID to export (required)"),
+) -> FileResponse:
+    """Reproducible submission bundle for journal submission.
+
+    Produces a single ZIP file containing everything a reviewer needs
+    to verify the acquisition run:
+
+        /config_snapshot.json      Exact config used at run start
+        /audit_log.jsonl           Full audit trail (JSONL)
+        /prisma_report.csv         PRISMA 2020 compliance report
+        /integration_export.json   Structured per-paper export
+        /sha256_manifest.txt       SHA-256 of every PDF (sha256sum format)
+        /pdfs/                     All successfully retrieved PDFs
+        /supplements/              All supplement files
+        /README.txt                Explanation of each artifact
+
+    SHA-256 manifest follows the `sha256sum` format:
+        {64-hex-hash}  {filename}
+    Each line can be verified with:  sha256sum -c sha256_manifest.txt
+    """
+    import hashlib
+    import zipfile
+
+    db = _get_db()
+
+    # Verify run exists
+    run_record = await db.get_run(run_id)
+    if run_record is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    bundle_filename = f"submission_bundle_{run_id}_{timestamp}.zip"
+    bundle_path = os.path.join(export_dir, bundle_filename)
+
+    # Gather data
+    papers = await db.get_papers_by_run(run_id, limit=10000)
+    prisma = await db.generate_prisma_report(run_id)
+    audit_entries = await db.export_audit_log_jsonl(run_id=run_id)
+    integration = await db.build_integration_export_bulk(
+        run_id=run_id, limit=10000
+    )
+
+    config_snapshot_json = run_record.config_snapshot or "{}"
+
+    # Build PRISMA CSV in memory
+    prisma_rows = [
+        ("Category", "Count"),
+        ("Run ID", prisma.run_id),
+        ("Total Sought", prisma.total_sought),
+        ("Verified (Retrieved + Validated)", prisma.verified),
+        ("Flagged (Needs Review)", prisma.flagged),
+        ("Not Retrieved - No OA Source", prisma.not_retrieved_no_oa),
+        ("Not Retrieved - Paywall", prisma.not_retrieved_paywall),
+        ("Not Retrieved - Access Denied", prisma.not_retrieved_access_denied),
+        ("Not Retrieved - Not Found", prisma.not_retrieved_not_found),
+        ("Not Retrieved - Timeout", prisma.not_retrieved_timeout),
+        ("Not Retrieved - Other", prisma.not_retrieved_other),
+        ("Manual Required", prisma.manual_required),
+        ("Already Retrieved (Prior Run)", prisma.already_retrieved),
+        ("User Overrides - Confirmed", prisma.user_overrides_confirmed),
+        ("User Overrides - Re-retrieved", prisma.user_overrides_reretried),
+    ]
+    prisma_buf = io.StringIO()
+    csv.writer(prisma_buf).writerows(prisma_rows)
+    prisma_csv = prisma_buf.getvalue()
+
+    # Audit log JSONL (one JSON object per line)
+    audit_jsonl = "\n".join(
+        json.dumps(e, default=str) for e in audit_entries
+    )
+    if audit_jsonl:
+        audit_jsonl += "\n"
+
+    # Integration JSON
+    integration_json = json.dumps(
+        [e.model_dump() for e in integration],
+        indent=2, default=str,
+    )
+
+    # ---- Build the zip ----
+    manifest_entries: List[str] = []  # lines for sha256_manifest.txt
+    included_pdfs = 0
+    included_supplements = 0
+    skipped_missing = 0
+
+    def sha256_of_file(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    with zipfile.ZipFile(
+        bundle_path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as zf:
+        # Primary artifacts
+        zf.writestr("config_snapshot.json", config_snapshot_json)
+        zf.writestr("audit_log.jsonl", audit_jsonl)
+        zf.writestr("prisma_report.csv", prisma_csv)
+        zf.writestr("integration_export.json", integration_json)
+
+        # PDFs
+        for paper in papers:
+            if not paper.pdf_path or not os.path.isfile(paper.pdf_path):
+                if paper.pdf_path:
+                    skipped_missing += 1
+                continue
+            # Use the stored filename, or derive from path
+            arc_name = paper.pdf_filename or os.path.basename(paper.pdf_path)
+            arc_path = f"pdfs/{arc_name}"
+            zf.write(paper.pdf_path, arc_path)
+            sha = paper.sha256_checksum or sha256_of_file(paper.pdf_path)
+            manifest_entries.append(f"{sha}  {arc_path}")
+            included_pdfs += 1
+
+            # Supplements
+            supplements = await db.get_supplements_for_paper(paper.canonical_id)
+            for sup in supplements:
+                if not sup.file_path or not os.path.isfile(sup.file_path):
+                    continue
+                # Namespace supplements by canonical_id so names don't collide
+                safe_cid = paper.canonical_id.replace(":", "_").replace("/", "_")
+                sup_arc = f"supplements/{safe_cid}/{sup.filename}"
+                zf.write(sup.file_path, sup_arc)
+                sup_sha = sup.sha256_checksum or sha256_of_file(sup.file_path)
+                manifest_entries.append(f"{sup_sha}  {sup_arc}")
+                included_supplements += 1
+
+        # Manifest — also cover the JSON/CSV artifacts so a reviewer can
+        # verify the whole bundle end-to-end.
+        def sha_str(s: str) -> str:
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()
+        manifest_entries.insert(0, f"{sha_str(config_snapshot_json)}  config_snapshot.json")
+        manifest_entries.insert(1, f"{sha_str(audit_jsonl)}  audit_log.jsonl")
+        manifest_entries.insert(2, f"{sha_str(prisma_csv)}  prisma_report.csv")
+        manifest_entries.insert(3, f"{sha_str(integration_json)}  integration_export.json")
+        manifest_text = "\n".join(manifest_entries) + "\n"
+        zf.writestr("sha256_manifest.txt", manifest_text)
+
+        # README for reviewers
+        readme = _build_bundle_readme(
+            run_record=run_record,
+            prisma=prisma,
+            included_pdfs=included_pdfs,
+            included_supplements=included_supplements,
+            skipped_missing=skipped_missing,
+            total_audit_entries=len(audit_entries),
+            total_papers=len(papers),
+        )
+        zf.writestr("README.txt", readme)
+
+    # Audit log entry for the export itself
+    await db.log_audit(AuditLogEntry(
+        run_id=run_id,
+        outcome="BUNDLE_EXPORTED",
+        details=json.dumps({
+            "bundle": bundle_filename,
+            "pdfs_included": included_pdfs,
+            "supplements_included": included_supplements,
+            "pdfs_missing_on_disk": skipped_missing,
+        }),
+    ))
+
+    return FileResponse(
+        bundle_path,
+        media_type="application/zip",
+        filename=bundle_filename,
+    )
+
+
+def _build_bundle_readme(
+    run_record: RunRecord,
+    prisma: PrismaReport,
+    included_pdfs: int,
+    included_supplements: int,
+    skipped_missing: int,
+    total_audit_entries: int,
+    total_papers: int,
+) -> str:
+    """Human-readable README explaining the bundle contents."""
+    now = datetime.now(timezone.utc).isoformat()
+    lines = [
+        "FULL-TEXT ACQUISITION — SUBMISSION BUNDLE",
+        "=" * 52,
+        "",
+        f"Run ID:              {run_record.run_id}",
+        f"Run started:         {run_record.started_at}",
+        f"Run completed:       {run_record.completed_at or '(still open)'}",
+        f"Run status:          {run_record.status}",
+        f"Bundle generated:    {now}",
+        "",
+        f"Papers submitted:    {run_record.total_submitted}",
+        f"Papers in bundle:    {total_papers}",
+        f"PDFs included:       {included_pdfs}",
+        f"Supplements included:{included_supplements}",
+        f"PDFs missing on disk (state/disk drift): {skipped_missing}",
+        f"Audit log entries:   {total_audit_entries}",
+        "",
+        "-" * 52,
+        "PRISMA 2020 SUMMARY",
+        "-" * 52,
+        f"Total sought:        {prisma.total_sought}",
+        f"Verified:            {prisma.verified}",
+        f"Flagged:             {prisma.flagged}",
+        f"Manual required:     {prisma.manual_required}",
+        f"Already retrieved:   {prisma.already_retrieved}",
+        f"Overrides (confirmed):   {prisma.user_overrides_confirmed}",
+        f"Overrides (re-retried):  {prisma.user_overrides_reretried}",
+        "",
+        "Not retrieved, by category:",
+        f"  No OA source:      {prisma.not_retrieved_no_oa}",
+        f"  Paywall:           {prisma.not_retrieved_paywall}",
+        f"  Access denied:     {prisma.not_retrieved_access_denied}",
+        f"  Not found:         {prisma.not_retrieved_not_found}",
+        f"  Timeout:           {prisma.not_retrieved_timeout}",
+        f"  Other:             {prisma.not_retrieved_other}",
+        "",
+        "-" * 52,
+        "FILES IN THIS BUNDLE",
+        "-" * 52,
+        "",
+        "config_snapshot.json",
+        "  The exact configuration used at the start of this run. Contains",
+        "  all timeouts, concurrency settings, rate limits, cooldown",
+        "  parameters, and institutional URLs. Does NOT contain credentials",
+        "  (the system never stores them).",
+        "",
+        "audit_log.jsonl",
+        "  Complete event trail for this run. One JSON object per line.",
+        "  Each entry records: timestamp, paper canonical_id, tier,",
+        "  method, URL attempted, HTTP status, content type, outcome,",
+        "  failure_code, execution time, and retry count. This is the",
+        "  authoritative record of what the system did.",
+        "",
+        "prisma_report.csv",
+        "  PRISMA 2020 compliance report. Drop this into your systematic",
+        "  review flow diagram. All 'not retrieved' reasons are",
+        "  subcategorized by cause (no OA / paywall / access denied /",
+        "  not found / timeout / other).",
+        "",
+        "integration_export.json",
+        "  Structured per-paper export ready for downstream tools",
+        "  (ASReview, extraction pipelines, risk-of-bias assessment).",
+        "  Each paper carries canonical_id, DOIs, PMID, OpenAlex ID,",
+        "  PDF path inside this bundle, SHA-256, page count, version",
+        "  type (published / accepted / preprint), integrity score,",
+        "  identity status, user override (if any), and the full",
+        "  retrieval log for that paper.",
+        "",
+        "sha256_manifest.txt",
+        "  SHA-256 hash of every file in this bundle, in the standard",
+        "  `sha256sum` format:",
+        "      {64-hex-hash}  {path}",
+        "  Verify end-to-end integrity with:",
+        "      sha256sum -c sha256_manifest.txt",
+        "  (Run this from the directory where you extracted the bundle.)",
+        "",
+        "pdfs/",
+        "  All successfully retrieved and validated PDFs for this run.",
+        "  Filename convention: FirstAuthorLastName_Year_First4Words.pdf",
+        "  Content-drifted versions use a _v{N} suffix.",
+        "",
+        "supplements/",
+        "  Supplementary materials, organized by paper canonical_id.",
+        "  PDFs in this tree were validated the same way as primary",
+        "  PDFs. Non-PDF supplements (DOCX, XLSX, CSV, ZIP) were",
+        "  accepted based on size check only; their validation_status",
+        "  is SUPPLEMENT_NON_PDF in the integration export.",
+        "",
+        "-" * 52,
+        "REPRODUCIBILITY",
+        "-" * 52,
+        "",
+        "The exact config and seeded randomness (seed = hash(run_id))",
+        "used for this run are preserved in config_snapshot.json.",
+        "Re-running with the same inputs and the same config should",
+        "produce the same retrieval attempts — though third-party API",
+        "responses may naturally have evolved since then (new open-access",
+        "releases, changed publisher URLs, expired cache entries).",
+        "",
+        "VERSION_MISMATCH and CONTENT_UNVERIFIED papers were never",
+        "auto-completed — any paper in those states required a",
+        "recorded user override, visible in the audit log and the",
+        "integration export.",
+        "",
+        "The system never accessed paywalls without a user-mediated",
+        "institutional session, never captured or injected credentials,",
+        "and followed publisher rate limits and robots.txt.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 # ===========================================================================
 # SETTINGS ENDPOINTS
 # ===========================================================================
@@ -1948,51 +2996,204 @@ async def reset_cooldown(
 # ===========================================================================
 
 
-@app.get("/api/health/stream")
-async def health_stream(request: Request) -> StreamingResponse:
-    """Server-Sent Events stream for live health metrics.
+@app.get("/api/enrichment/status")
+async def enrichment_status() -> JSONResponse:
+    """Return current enrichment background-task status (single snapshot)."""
+    status = app_state.get("enrichment_status") or {
+        "in_progress": False,
+        "run_id": None,
+        "total": 0,
+        "completed": 0,
+        "enriched_count": 0,
+        "failed_count": 0,
+        "started_at": None,
+        "completed_at": None,
+    }
+    return JSONResponse(status)
 
-    Sends a health metrics JSON event every 3 seconds.
-    Connection closes when the client disconnects or shutdown is signaled.
+
+@app.get("/api/enrichment/stream")
+async def enrichment_stream(request: Request) -> StreamingResponse:
+    """SSE stream of enrichment progress.
+
+    Emits a status JSON every ~1s while enrichment is in progress.
+    Sends one final event when in_progress becomes False, then closes.
+    Closes immediately if the client disconnects or shutdown is signaled.
     """
-    config = _get_config()
-    backpressure_threshold = config.get(
-        "backpressure_threshold", DEFAULT_BACKPRESSURE_THRESHOLD
-    )
 
     async def event_generator() -> AsyncIterator[str]:
         shutdown_event: asyncio.Event = app_state.get(
             "shutdown_event", asyncio.Event()
         )
 
+        # Always emit the current status first so late subscribers see it
+        sent_final = False
         while not shutdown_event.is_set():
-            # Check if client disconnected
+            if await request.is_disconnected():
+                break
+
+            status = app_state.get("enrichment_status") or {
+                "in_progress": False,
+                "total": 0,
+                "completed": 0,
+                "enriched_count": 0,
+                "failed_count": 0,
+            }
+            yield f"data: {json.dumps(status, default=str)}\n\n"
+
+            # Stop streaming once enrichment is complete (after one final event)
+            if not status.get("in_progress"):
+                if sent_final:
+                    break
+                sent_final = True  # loop once more to give clients the final state
+
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+                break  # shutdown signaled
+            except asyncio.TimeoutError:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _build_stream_snapshot() -> Dict[str, Any]:
+    """Produce a single-event snapshot of the unified SSE payload.
+
+    Shared by /api/stream (streams it repeatedly) and /api/stream/snapshot
+    (returns it once). Having a single builder means the snapshot shape
+    is guaranteed to match the stream shape — no risk of drift.
+    """
+    config = _get_config()
+    backpressure_threshold = config.get(
+        "backpressure_threshold", DEFAULT_BACKPRESSURE_THRESHOLD
+    )
+
+    db = _get_db()
+    metrics = await db.get_health_metrics(
+        backpressure_threshold=backpressure_threshold,
+    )
+    payload: Dict[str, Any] = metrics.model_dump()
+
+    state_counts = await db.count_papers_by_state()
+    payload["state_counts"] = state_counts
+    payload["total_papers"] = sum(state_counts.values())
+    payload["ready_for_retrieval"] = state_counts.get(PaperState.READY_FOR_RETRIEVAL.value, 0)
+    payload["retrieving"] = state_counts.get(PaperState.RETRIEVING.value, 0)
+    payload["retrieved"] = state_counts.get(PaperState.RETRIEVED.value, 0)
+    payload["validating"] = state_counts.get(PaperState.VALIDATING.value, 0)
+    payload["complete"] = state_counts.get(PaperState.COMPLETE.value, 0)
+    payload["failed"] = state_counts.get(PaperState.FAILED.value, 0)
+    payload["manual_required"] = state_counts.get(PaperState.MANUAL_REQUIRED.value, 0)
+
+    wp = app_state.get("worker_pool")
+    if wp is not None:
+        wp_status = wp.get_status()
+        payload["worker_pool"] = wp_status
+        payload["retrieval_workers_paused"] = wp_status.get("retrieval_paused", False)
+        payload["validation_workers_paused"] = wp_status.get("validation_paused", False)
+    else:
+        payload["worker_pool"] = {
+            "running": False, "paused": False,
+            "retrieval_workers_active": 0, "validation_workers_active": 0,
+            "counters": {}, "run_id": None,
+        }
+
+    enrichment = app_state.get("enrichment_status") or {}
+    payload["enrichment"] = {
+        "in_progress": bool(enrichment.get("in_progress")),
+        "total": enrichment.get("total", 0),
+        "completed": enrichment.get("completed", 0),
+        "enriched_count": enrichment.get("enriched_count", 0),
+        "failed_count": enrichment.get("failed_count", 0),
+    }
+
+    # SSO session (serializable subset only — no credentials/cookies/DOM)
+    sso = app_state.get("sso_session") or {}
+    session_duration_s = 0.0
+    if sso.get("login_detected_at"):
+        try:
+            started = datetime.fromisoformat(sso["login_detected_at"])
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            session_duration_s = (datetime.now(timezone.utc) - started).total_seconds()
+        except (ValueError, TypeError):
+            pass
+    payload["sso"] = {
+        "active": bool(sso.get("active")),
+        "phase": sso.get("phase", "idle"),
+        "proxy_url": sso.get("proxy_url", ""),
+        "started_at": sso.get("started_at"),
+        "login_detected_at": sso.get("login_detected_at"),
+        "session_duration_s": round(session_duration_s, 1),
+        "queue_total": sso.get("queue_total", 0),
+        "queue_processed": sso.get("queue_processed", 0),
+        "queue_succeeded": sso.get("queue_succeeded", 0),
+        "queue_manual": sso.get("queue_manual", 0),
+        "current_paper_id": sso.get("current_paper_id"),
+        "current_paper_title": sso.get("current_paper_title"),
+        "last_message": sso.get("last_message", ""),
+        "session_expired": bool(sso.get("session_expired")),
+    }
+    return payload
+
+
+@app.get("/api/stream/snapshot")
+async def stream_snapshot() -> JSONResponse:
+    """Single-event snapshot of the unified stream payload.
+
+    Useful for one-off UI fetches (e.g. the Upload-panel State Breakdown
+    Refresh button) without opening a full SSE connection. NOT polled
+    periodically — that would re-introduce the duplication this fix
+    eliminated.
+    """
+    return JSONResponse(await _build_stream_snapshot())
+
+
+@app.get("/api/stream")
+@app.get("/api/health/stream")  # Back-compat alias
+async def unified_stream(request: Request) -> StreamingResponse:
+    """Unified Server-Sent Events stream for ALL live run data.
+
+    Single source of truth for:
+      - Health metrics (success rate, queue depths, cache rate, etc.)
+      - Worker pool state (running/paused + counters for retrieved/
+        failed/manual/validated/val_failed)
+      - Full paper state counts (every PaperState → count)
+      - Backpressure state (weighted depth vs threshold, retrieval_paused)
+      - Disk space state
+      - Active publisher cooldowns
+
+    Emits one event every 2 seconds. Automatically closes on client
+    disconnect or shutdown. No separate polling endpoint is needed —
+    the frontend drives all UI updates from this single stream.
+    """
+    async def event_generator() -> AsyncIterator[str]:
+        shutdown_event: asyncio.Event = app_state.get(
+            "shutdown_event", asyncio.Event()
+        )
+
+        while not shutdown_event.is_set():
             if await request.is_disconnected():
                 break
 
             try:
-                db = _get_db()
-                metrics = await db.get_health_metrics(
-                    backpressure_threshold=backpressure_threshold,
-                )
-
-                # Add worker pool status
-                wp = app_state.get("worker_pool")
-                if wp:
-                    wp_status = wp.get_status()
-                    metrics.retrieval_workers_paused = wp_status.get("retrieval_paused", False)
-                    metrics.validation_workers_paused = wp_status.get("validation_paused", False)
-
-                data = json.dumps(metrics.model_dump(), default=str)
-                yield f"data: {data}\n\n"
-
+                payload = await _build_stream_snapshot()
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
             except Exception as exc:
-                logger.debug("Health stream error: %s", exc)
-                yield f"data: {{\"error\": \"{exc}\"}}\n\n"
+                logger.debug("Unified stream error: %s", exc)
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
             try:
                 await asyncio.wait_for(
-                    shutdown_event.wait(), timeout=3.0
+                    shutdown_event.wait(), timeout=2.0
                 )
                 break  # Shutdown signaled
             except asyncio.TimeoutError:
