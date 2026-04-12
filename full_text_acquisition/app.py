@@ -334,3 +334,222 @@ async def run_wizard(config: Dict[str, Any], db: Database) -> WizardResult:
 def _check_binary(name: str) -> bool:
     """Check if a binary is available on the system PATH."""
     return shutil.which(name) is not None
+
+
+# ---------------------------------------------------------------------------
+# FastAPI lifespan (startup + shutdown)
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    """Full startup sequence and graceful shutdown.
+
+    Startup (10 steps):
+        1. Set WAL + foreign_keys pragmas (in db.initialize)
+        2. Run config version check and migration
+        3. Run first-launch wizard
+        4. Run startup filesystem reconciliation
+        5. Reset interrupted states
+        6. Start SQLite write queue worker (in db.initialize)
+        7. Initialize RetrievalEngine
+        8. Initialize WorkerPool
+        9. Store references in app_state
+        10. Auto-open browser
+
+    Shutdown (8 steps):
+        1. Stop accepting new papers
+        2. Signal shutdown
+        3. Drain workers (30s timeout)
+        4. Force-stop remaining
+        5. Reset RETRIEVING/VALIDATING states
+        6. Flush write queue
+        7. Close browser manager
+        8. Close database and log
+    """
+    # ---- STARTUP ----
+    setup_logging()
+    logger.info("=" * 60)
+    logger.info("Full-Text Acquisition System starting...")
+    logger.info("=" * 60)
+
+    # Load config
+    config = load_config()
+
+    # Initialize database (steps 1, 6: WAL, FK, schema, write queue)
+    db_path = config.get("database_path", "./acquisition.db")
+    db = Database(db_path)
+    await db.initialize()
+
+    # Step 2: Config migration
+    try:
+        config = await db.run_config_migration(config)
+        save_config(config)
+    except ValueError as exc:
+        logger.critical("Config version error: %s — exiting", exc)
+        await db.close()
+        sys.exit(1)
+
+    # Step 3: First-launch wizard
+    wizard = await run_wizard(config, db)
+    app_state["wizard_result"] = wizard
+
+    if wizard.errors:
+        for err in wizard.errors:
+            logger.warning("Wizard issue: %s", err)
+
+    # Step 4: Reset interrupted states
+    resets = await db.reset_interrupted_states()
+
+    # Step 5: Startup filesystem reconciliation
+    missing = await db.reconcile_filesystem()
+
+    # Initialize browser manager
+    browser_mgr = BrowserManager.get_instance()
+
+    # Step 7: Initialize RetrievalEngine
+    output_dir = config.get("output_directory", "./downloads")
+    supplement_dir = config.get("supplement_directory", "./downloads/Supplements")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(supplement_dir, exist_ok=True)
+
+    engine = RetrievalEngine(
+        db=db,
+        browser_manager=browser_mgr,
+        config=config,
+        output_directory=output_dir,
+        supplement_directory=supplement_dir,
+    )
+    engine.tesseract_available = wizard.tesseract_available
+    engine.ghostscript_available = wizard.ghostscript_available
+
+    # Step 8: Initialize WorkerPool
+    worker_pool = WorkerPool(
+        db=db,
+        engine=engine,
+        config=config,
+        output_dir=output_dir,
+    )
+
+    # Step 9: Store in app_state
+    app_state["config"] = config
+    app_state["db"] = db
+    app_state["browser_manager"] = browser_mgr
+    app_state["engine"] = engine
+    app_state["worker_pool"] = worker_pool
+    app_state["shutdown_event"] = asyncio.Event()
+
+    logger.info(
+        "Startup complete: %d interrupted resets, %d missing files reconciled",
+        len(resets), len(missing),
+    )
+
+    # Step 10: Auto-open browser (non-blocking)
+    try:
+        webbrowser.open("http://localhost:8000")
+    except Exception:
+        logger.info("Could not auto-open browser — navigate to http://localhost:8000")
+
+    yield
+
+    # ---- SHUTDOWN ----
+    logger.info("Shutdown sequence initiated...")
+
+    # Step 1-2: Signal shutdown
+    shutdown_event: asyncio.Event = app_state.get("shutdown_event", asyncio.Event())
+    shutdown_event.set()
+
+    # Step 3-4: Drain workers
+    wp: Optional[WorkerPool] = app_state.get("worker_pool")
+    interrupted_count = 0
+    if wp and wp.is_running:
+        interrupted_count = await wp.stop(timeout_s=30.0)
+
+    # Step 5: Reset states (handled by wp.stop → db.reset_shutdown_states)
+
+    # Step 6: Flush write queue
+    db_ref: Optional[Database] = app_state.get("db")
+    if db_ref:
+        await db_ref.flush_write_queue()
+
+    # Step 7: Close browser manager
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    if bm:
+        await bm.close_all()
+
+    # Step 8: Close RetrievalEngine HTTP client
+    eng: Optional[RetrievalEngine] = app_state.get("engine")
+    if eng:
+        await eng.close()
+
+    # Close database
+    if db_ref:
+        await db_ref.close()
+
+    logger.info(
+        "Shutdown complete: %d papers interrupted",
+        interrupted_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Create FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Full-Text Acquisition System",
+    description="Deterministic, auditable evidence acquisition for SRMAs",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# ---------------------------------------------------------------------------
+# Signal handlers
+# ---------------------------------------------------------------------------
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    """Install SIGTERM and SIGINT handlers for graceful shutdown."""
+    shutdown_event = app_state.get("shutdown_event")
+    if not shutdown_event:
+        return
+
+    def _signal_handler(sig: int) -> None:
+        sig_name = signal.Signals(sig).name
+        logger.info("Received %s — initiating graceful shutdown", sig_name)
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler, sig)
+        except (NotImplementedError, RuntimeError):
+            # Windows doesn't support add_signal_handler
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Helper to get app state components
+# ---------------------------------------------------------------------------
+
+def _get_db() -> Database:
+    db = app_state.get("db")
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    return db
+
+
+def _get_engine() -> RetrievalEngine:
+    engine = app_state.get("engine")
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    return engine
+
+
+def _get_worker_pool() -> WorkerPool:
+    wp = app_state.get("worker_pool")
+    if wp is None:
+        raise HTTPException(status_code=503, detail="Worker pool not initialized")
+    return wp
+
+
+def _get_config() -> Dict[str, Any]:
+    return app_state.get("config", DEFAULT_CONFIG)
