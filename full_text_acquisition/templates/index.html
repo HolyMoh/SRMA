@@ -1143,3 +1143,559 @@
         </div>
     </div>
 </div>
+
+<script>
+/* ==================================================================
+   Full-Text Acquisition System — Frontend
+   ================================================================== */
+(function() {
+'use strict';
+
+/* ------------------------------------------------------------------
+   State
+   ------------------------------------------------------------------ */
+const state = {
+    currentPanel: 'upload',
+    runId: null,
+    runState: 'idle',
+    resultsFilter: '',
+    resultsSortBy: 'created_at',
+    resultsSortOrder: 'ASC',
+    resultsPage: 0,
+    resultsLimit: 100,
+    resultsTotalCount: 0,
+    sseSource: null,
+};
+
+/* ------------------------------------------------------------------
+   API helpers
+   ------------------------------------------------------------------ */
+async function api(method, url, body) {
+    const opts = { method, headers: {} };
+    if (body instanceof FormData) {
+        opts.body = body;
+    } else if (body !== undefined) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+    }
+    const resp = await fetch(url, opts);
+    if (!resp.ok) {
+        let detail = resp.statusText;
+        try { const j = await resp.json(); detail = j.detail || detail; } catch(e) {}
+        throw new Error(detail);
+    }
+    const ct = resp.headers.get('content-type') || '';
+    if (ct.includes('json')) return resp.json();
+    return resp;
+}
+
+const GET  = (u) => api('GET', u);
+const POST = (u, b) => api('POST', u, b);
+const PUT  = (u, b) => api('PUT', u, b);
+
+/* ------------------------------------------------------------------
+   Toast notifications
+   ------------------------------------------------------------------ */
+function toast(message, type) {
+    type = type || 'info';
+    const container = document.getElementById('toastContainer');
+    const el = document.createElement('div');
+    el.className = 'toast toast-' + type;
+    el.textContent = message;
+    container.appendChild(el);
+    setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 3500);
+}
+
+/* ------------------------------------------------------------------
+   Navigation
+   ------------------------------------------------------------------ */
+document.querySelectorAll('.nav-item').forEach(function(item) {
+    item.addEventListener('click', function() {
+        switchPanel(this.dataset.panel);
+    });
+});
+
+function switchPanel(name) {
+    state.currentPanel = name;
+    document.querySelectorAll('.nav-item').forEach(function(n) {
+        n.classList.toggle('active', n.dataset.panel === name);
+    });
+    document.querySelectorAll('.panel').forEach(function(p) {
+        p.classList.toggle('active', p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1));
+    });
+    if (name === 'results') loadResults();
+    if (name === 'settings') loadSettings();
+    if (name === 'health') startSSE();
+    if (name === 'run') loadRuns();
+    if (name === 'sso') loadSsoStatus();
+}
+
+/* ------------------------------------------------------------------
+   Upload
+   ------------------------------------------------------------------ */
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('click', function() { fileInput.click(); });
+dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('dragover'); });
+dropZone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleUpload(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', function() {
+    if (fileInput.files.length) handleUpload(fileInput.files[0]);
+});
+
+async function handleUpload(file) {
+    document.getElementById('uploadProgress').style.display = 'block';
+    document.getElementById('uploadResults').style.display = 'none';
+    document.getElementById('dedupReport').style.display = 'none';
+    document.getElementById('uploadProgressBar').style.width = '60%';
+
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const data = await POST('/api/upload', fd);
+
+        document.getElementById('uploadProgressBar').style.width = '100%';
+        setTimeout(function() { document.getElementById('uploadProgress').style.display = 'none'; }, 500);
+
+        state.runId = data.run_id;
+        document.getElementById('uploadRunId').textContent = data.run_id;
+        document.getElementById('uploadTotal').textContent = data.total_submitted;
+        document.getElementById('uploadDedup').textContent = data.deduplication_report.duplicates_removed;
+        document.getElementById('uploadAlready').textContent = data.already_retrieved_count;
+        document.getElementById('uploadReady').textContent = data.ready_for_retrieval_count;
+
+        // Column mapping
+        const mapDiv = document.getElementById('columnMapping');
+        mapDiv.innerHTML = '';
+        const det = data.detected_columns;
+        ['doi_column','title_column','authors_column','year_column','journal_column'].forEach(function(key) {
+            const val = det[key] || '(not detected)';
+            const label = key.replace('_column','').toUpperCase();
+            mapDiv.innerHTML += '<div class="form-group"><label>' + label + '</label><div style="font-weight:600">' + escHtml(val) + '</div></div>';
+        });
+
+        // Preview
+        if (data.preview_rows.length) {
+            const keys = Object.keys(data.preview_rows[0]);
+            document.getElementById('previewHead').innerHTML = keys.map(function(k) { return '<th>' + escHtml(k) + '</th>'; }).join('');
+            document.getElementById('previewBody').innerHTML = data.preview_rows.map(function(row) {
+                return '<tr>' + keys.map(function(k) { return '<td>' + escHtml(row[k] || '') + '</td>'; }).join('') + '</tr>';
+            }).join('');
+        }
+
+        // Dedup report
+        if (data.deduplication_report.matches.length) {
+            document.getElementById('dedupReport').style.display = 'block';
+            document.getElementById('dedupBody').innerHTML = data.deduplication_report.matches.map(function(m) {
+                return '<tr><td>' + escHtml(m.paper_a_title) + '</td><td>' + escHtml(m.paper_b_title) +
+                       '</td><td>' + escHtml(m.match_type) + '</td><td>' + (m.similarity_score != null ? m.similarity_score : '-') + '</td></tr>';
+            }).join('');
+        }
+
+        document.getElementById('uploadResults').style.display = 'block';
+        toast('Upload complete: ' + data.ready_for_retrieval_count + ' papers ready', 'success');
+    } catch (err) {
+        document.getElementById('uploadProgress').style.display = 'none';
+        toast('Upload failed: ' + err.message, 'error');
+    }
+}
+
+document.getElementById('btnStartAfterUpload').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/run/start?run_id=' + encodeURIComponent(state.runId));
+        toast('Run started: ' + data.run_id, 'success');
+        state.runState = 'running';
+        switchPanel('run');
+        updateRunButtons();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Settings
+   ------------------------------------------------------------------ */
+async function loadSettings() {
+    try {
+        const data = await GET('/api/settings');
+        const c = data.config;
+        document.getElementById('cfgApiTimeout').value = c.api_timeout_s || '';
+        document.getElementById('cfgPdfTimeout').value = c.pdf_download_timeout_s || '';
+        document.getElementById('cfgPageLoad').value = c.page_load_timeout_s || '';
+        document.getElementById('cfgSelectorTimeout').value = c.selector_timeout_s || '';
+        document.getElementById('cfgValidationTimeout').value = c.pdf_validation_timeout_s || '';
+        document.getElementById('cfgOcrTimeout').value = c.ocr_per_page_timeout_s || '';
+        document.getElementById('cfgRetrievalConc').value = c.retrieval_concurrency || '';
+        document.getElementById('cfgValidationConc').value = c.validation_concurrency || '';
+        document.getElementById('cfgMaxRetries').value = c.max_retries || '';
+        document.getElementById('cfgMaxAttempts').value = c.max_total_attempts || '';
+        document.getElementById('cfgBackpressure').value = c.backpressure_threshold || '';
+        document.getElementById('cfgDiskSpace').value = Math.round((c.min_disk_space_bytes || 0) / 1048576);
+        document.getElementById('cfgCooldownThreshold').value = c.cooldown_failure_threshold || '';
+        document.getElementById('cfgCooldownWindow').value = c.cooldown_window_size || '';
+        document.getElementById('cfgCooldownMinutes').value = c.cooldown_minutes || '';
+        document.getElementById('cfgEzproxy').value = c.sso_proxy_url || '';
+        document.getElementById('cfgOpenAthens').value = c.openathens_url || '';
+        document.getElementById('cfgResolver').value = c.institutional_resolver_url || '';
+        document.getElementById('cfgUnpaywallEmail').value = c.unpaywall_email || '';
+        document.getElementById('cfgCacheTtl').value = c.cache_ttl_days || '';
+
+        const ocrEl = document.getElementById('settingsOcrStatus');
+        ocrEl.textContent = data.ocr_available ? (data.ghostscript_available ? 'Full OCR' : 'Tesseract Only') : 'Disabled';
+        ocrEl.className = 'badge ' + (data.ocr_available ? 'badge-success' : 'badge-warning');
+        document.getElementById('sidebarOcr').textContent = 'OCR: ' + ocrEl.textContent;
+
+        const pwEl = document.getElementById('settingsPlaywright');
+        pwEl.textContent = data.playwright_installed ? 'Installed' : 'Missing';
+        pwEl.className = 'badge ' + (data.playwright_installed ? 'badge-success' : 'badge-danger');
+        document.getElementById('settingsPython').textContent = data.python_version;
+        document.getElementById('settingsPlatform').textContent = data.platform;
+
+        try {
+            const cs = await GET('/api/cache/stats');
+            document.getElementById('cacheActiveCount').textContent = cs.active_entries + ' entries';
+        } catch(e) {}
+    } catch (err) { toast('Failed to load settings: ' + err.message, 'error'); }
+}
+
+document.getElementById('btnSaveSettings').addEventListener('click', async function() {
+    const diskMb = parseInt(document.getElementById('cfgDiskSpace').value) || 1024;
+    const body = {};
+    const fields = [
+        ['api_timeout_s', 'cfgApiTimeout', parseFloat],
+        ['pdf_download_timeout_s', 'cfgPdfTimeout', parseFloat],
+        ['page_load_timeout_s', 'cfgPageLoad', parseFloat],
+        ['selector_timeout_s', 'cfgSelectorTimeout', parseFloat],
+        ['pdf_validation_timeout_s', 'cfgValidationTimeout', parseFloat],
+        ['ocr_per_page_timeout_s', 'cfgOcrTimeout', parseFloat],
+        ['retrieval_concurrency', 'cfgRetrievalConc', parseInt],
+        ['validation_concurrency', 'cfgValidationConc', parseInt],
+        ['max_retries', 'cfgMaxRetries', parseInt],
+        ['max_total_attempts', 'cfgMaxAttempts', parseInt],
+        ['backpressure_threshold', 'cfgBackpressure', parseInt],
+        ['cooldown_failure_threshold', 'cfgCooldownThreshold', parseFloat],
+        ['cooldown_window_size', 'cfgCooldownWindow', parseInt],
+        ['cooldown_minutes', 'cfgCooldownMinutes', parseInt],
+        ['cache_ttl_days', 'cfgCacheTtl', parseInt],
+    ];
+    fields.forEach(function(f) {
+        const v = f[2](document.getElementById(f[1]).value);
+        if (!isNaN(v)) body[f[0]] = v;
+    });
+    body.min_disk_space_bytes = diskMb * 1048576;
+    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail']];
+    strFields.forEach(function(f) { const v = document.getElementById(f[1]).value; if (v) body[f[0]] = v; });
+
+    try {
+        await PUT('/api/settings', body);
+        toast('Settings saved', 'success');
+    } catch (err) { toast('Save failed: ' + err.message, 'error'); }
+});
+
+document.getElementById('btnClearCache').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/cache/clear');
+        toast('Cache cleared: ' + data.entries_deleted + ' entries', 'success');
+        document.getElementById('cacheActiveCount').textContent = '0 entries';
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnRerunWizard').addEventListener('click', async function() {
+    try {
+        const data = await POST('/api/wizard');
+        document.getElementById('wizardResults').innerHTML = '<pre style="font-size:12px;white-space:pre-wrap">' + escHtml(JSON.stringify(data, null, 2)) + '</pre>';
+        toast('Wizard complete', data.errors && data.errors.length ? 'warning' : 'success');
+        loadSettings();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Health Dashboard — SSE
+   ------------------------------------------------------------------ */
+function startSSE() {
+    if (state.sseSource) return;
+    state.sseSource = new EventSource('/api/health/stream');
+    state.sseSource.onmessage = function(event) {
+        try {
+            const m = JSON.parse(event.data);
+            if (m.error) return;
+            document.getElementById('hSuccessRate').textContent = (m.retrieval_success_rate * 100).toFixed(1) + '%';
+            document.getElementById('hAvgAttempts').textContent = m.avg_attempts_per_paper.toFixed(1);
+            document.getElementById('hAvgTime').textContent = (m.avg_retrieval_time_ms / 1000).toFixed(1) + 's';
+            document.getElementById('hCacheRate').textContent = (m.cache_hit_rate * 100).toFixed(1) + '%';
+            document.getElementById('hTotal').textContent = m.total_papers;
+            document.getElementById('hCompleted').textContent = m.completed_papers;
+            document.getElementById('hFailed').textContent = m.failed_papers;
+            document.getElementById('hManual').textContent = m.manual_required_papers;
+            document.getElementById('hRetrievalQueue').textContent = m.retrieval_queue_depth;
+            document.getElementById('hValidationQueue').textContent = m.validation_queue_depth;
+            document.getElementById('hBackpressure').textContent = m.backpressure_weighted_depth + ' / ' + m.backpressure_threshold;
+            document.getElementById('hDiskSpace').textContent = formatBytes(m.disk_space_remaining_bytes);
+            document.getElementById('sidebarWorkers').textContent = 'Workers: ' + m.retrieval_workers_active + 'R / ' + m.validation_workers_active + 'V';
+
+            // Run panel progress
+            if (state.runState === 'running') {
+                const total = m.total_papers || 1;
+                const done = m.completed_papers + m.failed_papers + m.manual_required_papers;
+                const pct = Math.round((done / total) * 100);
+                document.getElementById('runProgressBar').style.width = pct + '%';
+                document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
+                document.getElementById('runProgressPercent').textContent = pct + '%';
+                document.getElementById('runCompleted').textContent = m.completed_papers;
+                document.getElementById('runFailed').textContent = m.failed_papers;
+                document.getElementById('runManual').textContent = m.manual_required_papers;
+                document.getElementById('runRetrieving').textContent = m.retrieval_workers_active;
+            }
+
+            // Cooldowns
+            const cdDiv = document.getElementById('healthCooldowns');
+            if (m.active_cooldowns && m.active_cooldowns.length) {
+                cdDiv.innerHTML = m.active_cooldowns.map(function(cd) {
+                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(cd.publisher) +
+                           '</span><span class="rate">' + (cd.failure_rate * 100).toFixed(0) + '% fail</span>' +
+                           '<span>' + Math.ceil(cd.time_remaining_s / 60) + 'm left</span>' +
+                           '<button class="btn btn-outline btn-sm" onclick="forceCooldownReset(\'' + escAttr(cd.publisher) + '\')">Reset</button></div>';
+                }).join('');
+            } else { cdDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No active cooldowns</div>'; }
+
+            // Paywalls
+            const pwDiv = document.getElementById('healthPaywalls');
+            const pws = m.paywall_counts_by_publisher;
+            if (pws && Object.keys(pws).length) {
+                pwDiv.innerHTML = Object.entries(pws).map(function(e) {
+                    return '<div class="cooldown-item"><span class="publisher">' + escHtml(e[0]) + '</span><span>' + e[1] + ' detections</span></div>';
+                }).join('');
+            } else { pwDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">No paywall events</div>'; }
+        } catch(e) {}
+    };
+    state.sseSource.onerror = function() {
+        if (state.sseSource) { state.sseSource.close(); state.sseSource = null; }
+        setTimeout(function() { if (state.currentPanel === 'health') startSSE(); }, 5000);
+    };
+}
+
+window.forceCooldownReset = async function(pub) {
+    try { await POST('/api/cooldown/reset?publisher=' + encodeURIComponent(pub)); toast('Cooldown reset for ' + pub, 'success'); } catch (err) { toast(err.message, 'error'); }
+};
+
+/* ------------------------------------------------------------------
+   Run Control
+   ------------------------------------------------------------------ */
+async function loadRuns() {
+    try {
+        const data = await GET('/api/runs');
+        const sel = document.getElementById('runSelector');
+        sel.innerHTML = '<option value="">Select Run...</option>';
+        (data.runs || []).forEach(function(r) {
+            const opt = document.createElement('option'); opt.value = r.run_id;
+            opt.textContent = r.run_id + ' (' + r.status + ')'; sel.appendChild(opt);
+        });
+        if (state.runId) sel.value = state.runId;
+        const rsel = document.getElementById('resultsRunFilter');
+        rsel.innerHTML = '<option value="">All Runs</option>';
+        (data.runs || []).forEach(function(r) {
+            const opt = document.createElement('option'); opt.value = r.run_id; opt.textContent = r.run_id; rsel.appendChild(opt);
+        });
+    } catch(e) {}
+}
+
+document.getElementById('runSelector').addEventListener('change', function() { state.runId = this.value || null; });
+
+function updateRunButtons() {
+    const s = state.runState;
+    document.getElementById('btnStart').disabled = s === 'running';
+    document.getElementById('btnPause').disabled = s !== 'running';
+    document.getElementById('btnResume').disabled = s !== 'paused';
+    document.getElementById('btnCancel').disabled = s === 'idle';
+    const badge = document.getElementById('runStatusBadge');
+    badge.textContent = s.toUpperCase();
+    badge.className = 'badge ' + ({running:'badge-success', paused:'badge-warning'}[s] || 'badge-neutral');
+}
+
+function addLogEntry(text, level) {
+    const area = document.getElementById('runLogArea');
+    const time = new Date().toLocaleTimeString();
+    area.innerHTML += '<div class="log-entry"><span class="log-time">[' + time + ']</span> <span class="log-' + (level||'info') + '">' + escHtml(text) + '</span></div>';
+    area.scrollTop = area.scrollHeight;
+}
+
+document.getElementById('btnStart').addEventListener('click', async function() {
+    try {
+        const rid = state.runId ? '?run_id=' + encodeURIComponent(state.runId) : '';
+        const data = await POST('/api/run/start' + rid);
+        state.runId = data.run_id; state.runState = 'running'; updateRunButtons();
+        addLogEntry('Run started: ' + data.run_id, 'info'); startSSE(); toast('Run started', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnPause').addEventListener('click', async function() {
+    try { await POST('/api/run/pause'); state.runState = 'paused'; updateRunButtons(); addLogEntry('Run paused', 'warn'); toast('Paused', 'warning'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnResume').addEventListener('click', async function() {
+    try { await POST('/api/run/resume'); state.runState = 'running'; updateRunButtons(); addLogEntry('Run resumed', 'info'); toast('Resumed', 'success'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnCancel').addEventListener('click', async function() {
+    try { const data = await POST('/api/run/cancel'); state.runState = 'idle'; updateRunButtons(); addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err'); toast('Cancelled', 'warning'); } catch (err) { toast(err.message, 'error'); }
+});
+['btnRetryFailed','btnRetryMismatch','btnRetryManual','btnRetryAll'].forEach(function(id) {
+    const typeMap = { btnRetryFailed:'failed', btnRetryMismatch:'mismatch', btnRetryManual:'manual', btnRetryAll:'all_eligible' };
+    document.getElementById(id).addEventListener('click', async function() {
+        try { const data = await POST('/api/retry', { retry_type: typeMap[id] }); toast(data.papers_reset + ' papers queued', 'success'); addLogEntry('Retry ' + typeMap[id] + ': ' + data.papers_reset, 'info'); } catch (err) { toast(err.message, 'error'); }
+    });
+});
+
+/* ------------------------------------------------------------------
+   SSO
+   ------------------------------------------------------------------ */
+async function loadSsoStatus() {
+    try {
+        const data = await GET('/api/sso/status');
+        const badge = document.getElementById('ssoStatusBadge');
+        if (data.session_valid) { badge.textContent = 'Active'; badge.className = 'badge badge-success'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = false; }
+        else if (data.has_context) { badge.textContent = 'Pending'; badge.className = 'badge badge-warning'; document.getElementById('btnSsoContinue').disabled = false; document.getElementById('btnSsoReauth').disabled = false; }
+        else { badge.textContent = 'Not Connected'; badge.className = 'badge badge-neutral'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = true; }
+    } catch(e) {}
+}
+document.getElementById('btnSsoStart').addEventListener('click', async function() {
+    try { const data = await POST('/api/sso/start'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('SSO page opened', 'info'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnSsoContinue').addEventListener('click', async function() {
+    try { const data = await POST('/api/sso/continue'); document.getElementById('ssoMessage').textContent = data.message; loadSsoStatus(); toast(data.status === 'sso_active' ? 'SSO confirmed' : 'Session uncertain', data.status === 'sso_active' ? 'success' : 'warning'); } catch (err) { toast(err.message, 'error'); }
+});
+document.getElementById('btnSsoReauth').addEventListener('click', async function() {
+    try { const data = await POST('/api/sso/reauth'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('Re-auth started', 'info'); } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   CAPTCHA
+   ------------------------------------------------------------------ */
+document.getElementById('btnCaptchaResolved').addEventListener('click', async function() {
+    try { await POST('/api/captcha/resolved'); document.getElementById('captchaOverlay').classList.remove('active'); toast('CAPTCHA resolved', 'success'); } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Results
+   ------------------------------------------------------------------ */
+async function loadResults() {
+    try {
+        const runFilter = document.getElementById('resultsRunFilter').value;
+        const params = new URLSearchParams({ limit: state.resultsLimit, offset: state.resultsPage * state.resultsLimit, sort_by: state.resultsSortBy, sort_order: state.resultsSortOrder });
+        if (runFilter) params.set('run_id', runFilter);
+        if (state.resultsFilter) params.set('state_filter', state.resultsFilter);
+
+        const data = await GET('/api/papers?' + params.toString());
+        state.resultsTotalCount = data.total_count;
+        const tbody = document.getElementById('resultsBody');
+        if (!data.papers.length) {
+            tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--text-secondary);padding:32px">No papers found</td></tr>';
+        } else {
+            tbody.innerHTML = data.papers.map(renderPaperRow).join('');
+        }
+        const start = state.resultsPage * state.resultsLimit + 1;
+        const end = Math.min(start + data.papers.length - 1, data.total_count);
+        document.getElementById('resultsPagInfo').textContent = 'Showing ' + (data.papers.length ? start : 0) + '-' + end + ' of ' + data.total_count;
+        document.getElementById('btnPrevPage').disabled = state.resultsPage === 0;
+        document.getElementById('btnNextPage').disabled = end >= data.total_count;
+        document.getElementById('tabCountAll').textContent = data.total_count;
+    } catch (err) { toast('Failed to load results: ' + err.message, 'error'); }
+}
+
+function renderPaperRow(p) {
+    const sc = p.confidence_level === 'HIGH' ? 'score-high' : p.confidence_level === 'MEDIUM' ? 'score-medium' : 'score-low';
+    const flagged = p.identity_status === 'VERSION_MISMATCH' || p.identity_status === 'CONTENT_UNVERIFIED';
+    const actions = flagged && !p.user_override ?
+        '<button class="btn btn-sm btn-success" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'confirm_correct\')">OK</button> ' +
+        '<button class="btn btn-sm btn-warning" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'re_retrieve\')">Redo</button>' : '';
+    const stBadge = '<span class="badge ' + ({COMPLETE:'badge-success',FAILED:'badge-danger',MANUAL_REQUIRED:'badge-warning',RETRIEVING:'badge-info',VALIDATING:'badge-info',RETRIEVED:'badge-info'}[p.state]||'badge-neutral') + '">' + escHtml(p.state||'') + '</span>';
+    const vsBadge = p.validation_status ? '<span class="badge ' + (p.validation_status.startsWith('VALID')?'badge-success':p.validation_status==='INVALID'?'badge-danger':'badge-warning') + '">' + escHtml(p.validation_status) + '</span>' : '';
+    const idBadge = p.identity_status ? '<span class="badge ' + (flagged?'badge-warning':'badge-success') + '">' + escHtml(p.identity_status) + '</span>' : '';
+    return '<tr><td title="' + escAttr(p.title||'') + '">' + escHtml((p.title||'').substring(0,50)) + (p.title && p.title.length>50?'...':'') + '</td>' +
+        '<td>' + escHtml(p.authors ? p.authors.split(';')[0].trim().substring(0,25) : '') + '</td>' +
+        '<td>' + (p.year||'') + '</td><td title="' + escAttr(p.doi||'') + '">' + escHtml((p.doi||'').substring(0,20)) + '</td>' +
+        '<td>' + stBadge + '</td><td>' + vsBadge + '</td><td>' + idBadge + '</td>' +
+        '<td>' + escHtml(p.version_type||'') + '</td><td class="' + sc + '">' + (p.integrity_score!=null?p.integrity_score:'') + '</td>' +
+        '<td>' + escHtml(p.retrieval_tier||'') + '</td><td>' + (p.supplement_count||0) + '</td><td>' + p.attempt_count + '</td>' +
+        '<td>' + escHtml(p.last_failure_code||'') + '</td><td>' + escHtml(p.user_override||'') + '</td><td>' + actions + '</td></tr>';
+}
+
+document.querySelectorAll('#resultsTabBar .tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+        document.querySelectorAll('#resultsTabBar .tab').forEach(function(t) { t.classList.remove('active'); });
+        tab.classList.add('active'); state.resultsFilter = tab.dataset.filter; state.resultsPage = 0; loadResults();
+    });
+});
+document.querySelectorAll('th[data-sort]').forEach(function(th) {
+    th.addEventListener('click', function() {
+        if (state.resultsSortBy === th.dataset.sort) { state.resultsSortOrder = state.resultsSortOrder === 'ASC' ? 'DESC' : 'ASC'; }
+        else { state.resultsSortBy = th.dataset.sort; state.resultsSortOrder = 'ASC'; }
+        state.resultsPage = 0; loadResults();
+    });
+});
+document.getElementById('btnPrevPage').addEventListener('click', function() { if (state.resultsPage > 0) { state.resultsPage--; loadResults(); } });
+document.getElementById('btnNextPage').addEventListener('click', function() { state.resultsPage++; loadResults(); });
+document.getElementById('resultsRunFilter').addEventListener('change', function() { state.resultsPage = 0; loadResults(); });
+
+/* Override modal */
+window.showOverride = function(cid, action) {
+    document.getElementById('overrideCanonicalId').value = cid;
+    document.getElementById('overrideAction').value = action;
+    document.getElementById('overrideModalTitle').textContent = action === 'confirm_correct' ? 'Confirm Paper is Correct' : 'Re-retrieve Paper';
+    document.getElementById('overrideReasonGroup').style.display = action === 'confirm_correct' ? 'block' : 'none';
+    document.getElementById('overrideReason').value = '';
+    document.getElementById('overrideModal').classList.add('active');
+};
+document.getElementById('btnOverrideCancel').addEventListener('click', function() { document.getElementById('overrideModal').classList.remove('active'); });
+document.getElementById('btnOverrideSubmit').addEventListener('click', async function() {
+    try {
+        await POST('/api/override', { canonical_id: document.getElementById('overrideCanonicalId').value, action: document.getElementById('overrideAction').value, reason: document.getElementById('overrideReason').value });
+        document.getElementById('overrideModal').classList.remove('active'); toast('Override applied', 'success'); loadResults();
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+/* ------------------------------------------------------------------
+   Exports
+   ------------------------------------------------------------------ */
+document.getElementById('btnExportExcel').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/excel' + (r ? '?run_id=' + encodeURIComponent(r) : '');
+});
+document.getElementById('btnExportPrisma').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; if (!r) { toast('Select a run for PRISMA export', 'warning'); return; }
+    window.location.href = '/api/export/prisma?run_id=' + encodeURIComponent(r);
+});
+document.getElementById('btnExportAudit').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/audit' + (r ? '?run_id=' + encodeURIComponent(r) : '');
+});
+document.getElementById('btnExportIntegration').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/integration' + (r ? '?run_id=' + encodeURIComponent(r) : '');
+});
+
+/* ------------------------------------------------------------------
+   Utility
+   ------------------------------------------------------------------ */
+function escHtml(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function escAttr(s) { return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;'); }
+function formatBytes(b) {
+    if (!b || b <= 0) return '0 B';
+    const u = ['B','KB','MB','GB','TB'], i = Math.floor(Math.log(b) / Math.log(1024));
+    return (b / Math.pow(1024, i)).toFixed(1) + ' ' + u[i];
+}
+
+/* ------------------------------------------------------------------
+   Init
+   ------------------------------------------------------------------ */
+(async function init() {
+    try {
+        const s = await GET('/api/status');
+        if (s.wizard_errors && s.wizard_errors.length) s.wizard_errors.forEach(function(e) { toast(e, 'warning'); });
+        document.getElementById('sidebarOcr').textContent = 'OCR: ' + s.ocr_mode;
+        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); startSSE(); }
+    } catch(e) { toast('Could not connect to server', 'error'); }
+    updateRunButtons();
+})();
+
+})();
+</script>
+</body>
+</html>
