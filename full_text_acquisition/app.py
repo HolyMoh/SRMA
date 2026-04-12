@@ -1229,3 +1229,162 @@ async def get_run_detail(run_id: str) -> JSONResponse:
         "outcome_counts": outcomes,
         "paper_count": len(paper_runs),
     })
+
+
+# ===========================================================================
+# SSO ENDPOINTS
+# ===========================================================================
+
+
+@app.post("/api/sso/start")
+async def sso_start() -> JSONResponse:
+    """Initiate SSO login by opening the institutional login page.
+
+    Opens a headed browser and navigates to the configured SSO URL.
+    The user completes authentication manually.
+    ABSOLUTE RULE: Never access anything the user types.
+    """
+    config = _get_config()
+    bm: BrowserManager = app_state.get("browser_manager")
+    if bm is None:
+        raise HTTPException(status_code=503, detail="Browser manager not initialized")
+
+    # Determine SSO URL
+    sso_url = (
+        config.get("sso_proxy_url")
+        or config.get("openathens_url")
+        or config.get("institutional_resolver_url")
+    )
+
+    if not sso_url:
+        raise HTTPException(
+            status_code=400,
+            detail="No SSO URL configured. Set sso_proxy_url, openathens_url, "
+                   "or institutional_resolver_url in Settings.",
+        )
+
+    try:
+        page = await bm.initiate_sso_login(sso_url)
+        await _get_db().log_audit(AuditLogEntry(
+            outcome="SSO_LOGIN_INITIATED",
+            details=json.dumps({"sso_url": sso_url}),
+        ))
+        return JSONResponse({
+            "status": "sso_login_page_opened",
+            "sso_url": sso_url,
+            "message": "Complete authentication in the browser window, then click Continue.",
+        })
+    except Exception as exc:
+        logger.error("SSO start failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to open SSO page: {exc}")
+
+
+@app.post("/api/sso/continue")
+async def sso_continue() -> JSONResponse:
+    """User signals that SSO login is complete.
+
+    Verifies the session appears active before allowing Tier 3 retrieval.
+    """
+    bm: BrowserManager = app_state.get("browser_manager")
+    if bm is None:
+        raise HTTPException(status_code=503, detail="Browser manager not initialized")
+
+    session_ok = await bm.check_sso_session_valid()
+
+    if session_ok:
+        await _get_db().log_audit(AuditLogEntry(
+            outcome="SSO_LOGIN_CONFIRMED",
+        ))
+        return JSONResponse({
+            "status": "sso_active",
+            "message": "SSO session confirmed. Tier 3 and 3.5 retrieval enabled.",
+        })
+    else:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "sso_uncertain",
+                "message": "Session could not be verified. You may need to re-authenticate. "
+                           "Tier 3 retrieval will attempt but may fail.",
+            },
+        )
+
+
+@app.post("/api/sso/reauth")
+async def sso_reauth() -> JSONResponse:
+    """Re-authenticate SSO session.
+
+    Destroys the current persistent context and opens a fresh login page.
+    """
+    config = _get_config()
+    bm: BrowserManager = app_state.get("browser_manager")
+    if bm is None:
+        raise HTTPException(status_code=503, detail="Browser manager not initialized")
+
+    sso_url = (
+        config.get("sso_proxy_url")
+        or config.get("openathens_url")
+        or config.get("institutional_resolver_url")
+    )
+
+    if not sso_url:
+        raise HTTPException(
+            status_code=400,
+            detail="No SSO URL configured.",
+        )
+
+    try:
+        await bm.handle_session_expired(sso_url)
+        await _get_db().log_audit(AuditLogEntry(
+            outcome="SSO_REAUTH_INITIATED",
+            failure_code=FailureCode.SESSION_EXPIRED.value,
+        ))
+        return JSONResponse({
+            "status": "reauth_started",
+            "sso_url": sso_url,
+            "message": "Session destroyed. Complete re-authentication in the browser.",
+        })
+    except Exception as exc:
+        logger.error("SSO re-auth failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Re-authentication failed: {exc}")
+
+
+@app.get("/api/sso/status")
+async def sso_status() -> JSONResponse:
+    """Check current SSO session status."""
+    bm: BrowserManager = app_state.get("browser_manager")
+    if bm is None:
+        return JSONResponse({
+            "has_context": False,
+            "session_valid": False,
+        })
+
+    has_ctx = bm.has_persistent_context
+    session_valid = await bm.check_sso_session_valid() if has_ctx else False
+
+    return JSONResponse({
+        "has_context": has_ctx,
+        "session_valid": session_valid,
+    })
+
+
+# ===========================================================================
+# CAPTCHA ENDPOINTS
+# ===========================================================================
+
+
+@app.post("/api/captcha/resolved")
+async def captcha_resolved() -> JSONResponse:
+    """User signals that a CAPTCHA has been solved.
+
+    Logs the resolution and allows Scholar-Assisted Retrieval to resume.
+    """
+    await _get_db().log_audit(AuditLogEntry(
+        outcome="CAPTCHA_RESOLVED",
+        details=json.dumps({"resolved_by": "user"}),
+    ))
+
+    return JSONResponse({
+        "status": "captcha_resolved",
+        "message": "CAPTCHA marked as resolved. Retrieval will resume.",
+    })
