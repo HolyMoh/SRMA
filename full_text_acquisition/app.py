@@ -2559,6 +2559,305 @@ async def export_integration(
     )
 
 
+@app.get("/api/export/bundle")
+async def export_bundle(
+    run_id: str = Query(..., description="Run ID to export (required)"),
+) -> FileResponse:
+    """Reproducible submission bundle for journal submission.
+
+    Produces a single ZIP file containing everything a reviewer needs
+    to verify the acquisition run:
+
+        /config_snapshot.json      Exact config used at run start
+        /audit_log.jsonl           Full audit trail (JSONL)
+        /prisma_report.csv         PRISMA 2020 compliance report
+        /integration_export.json   Structured per-paper export
+        /sha256_manifest.txt       SHA-256 of every PDF (sha256sum format)
+        /pdfs/                     All successfully retrieved PDFs
+        /supplements/              All supplement files
+        /README.txt                Explanation of each artifact
+
+    SHA-256 manifest follows the `sha256sum` format:
+        {64-hex-hash}  {filename}
+    Each line can be verified with:  sha256sum -c sha256_manifest.txt
+    """
+    import hashlib
+    import zipfile
+
+    db = _get_db()
+
+    # Verify run exists
+    run_record = await db.get_run(run_id)
+    if run_record is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    bundle_filename = f"submission_bundle_{run_id}_{timestamp}.zip"
+    bundle_path = os.path.join(export_dir, bundle_filename)
+
+    # Gather data
+    papers = await db.get_papers_by_run(run_id, limit=10000)
+    prisma = await db.generate_prisma_report(run_id)
+    audit_entries = await db.export_audit_log_jsonl(run_id=run_id)
+    integration = await db.build_integration_export_bulk(
+        run_id=run_id, limit=10000
+    )
+
+    config_snapshot_json = run_record.config_snapshot or "{}"
+
+    # Build PRISMA CSV in memory
+    prisma_rows = [
+        ("Category", "Count"),
+        ("Run ID", prisma.run_id),
+        ("Total Sought", prisma.total_sought),
+        ("Verified (Retrieved + Validated)", prisma.verified),
+        ("Flagged (Needs Review)", prisma.flagged),
+        ("Not Retrieved - No OA Source", prisma.not_retrieved_no_oa),
+        ("Not Retrieved - Paywall", prisma.not_retrieved_paywall),
+        ("Not Retrieved - Access Denied", prisma.not_retrieved_access_denied),
+        ("Not Retrieved - Not Found", prisma.not_retrieved_not_found),
+        ("Not Retrieved - Timeout", prisma.not_retrieved_timeout),
+        ("Not Retrieved - Other", prisma.not_retrieved_other),
+        ("Manual Required", prisma.manual_required),
+        ("Already Retrieved (Prior Run)", prisma.already_retrieved),
+        ("User Overrides - Confirmed", prisma.user_overrides_confirmed),
+        ("User Overrides - Re-retrieved", prisma.user_overrides_reretried),
+    ]
+    prisma_buf = io.StringIO()
+    csv.writer(prisma_buf).writerows(prisma_rows)
+    prisma_csv = prisma_buf.getvalue()
+
+    # Audit log JSONL (one JSON object per line)
+    audit_jsonl = "\n".join(
+        json.dumps(e, default=str) for e in audit_entries
+    )
+    if audit_jsonl:
+        audit_jsonl += "\n"
+
+    # Integration JSON
+    integration_json = json.dumps(
+        [e.model_dump() for e in integration],
+        indent=2, default=str,
+    )
+
+    # ---- Build the zip ----
+    manifest_entries: List[str] = []  # lines for sha256_manifest.txt
+    included_pdfs = 0
+    included_supplements = 0
+    skipped_missing = 0
+
+    def sha256_of_file(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    with zipfile.ZipFile(
+        bundle_path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as zf:
+        # Primary artifacts
+        zf.writestr("config_snapshot.json", config_snapshot_json)
+        zf.writestr("audit_log.jsonl", audit_jsonl)
+        zf.writestr("prisma_report.csv", prisma_csv)
+        zf.writestr("integration_export.json", integration_json)
+
+        # PDFs
+        for paper in papers:
+            if not paper.pdf_path or not os.path.isfile(paper.pdf_path):
+                if paper.pdf_path:
+                    skipped_missing += 1
+                continue
+            # Use the stored filename, or derive from path
+            arc_name = paper.pdf_filename or os.path.basename(paper.pdf_path)
+            arc_path = f"pdfs/{arc_name}"
+            zf.write(paper.pdf_path, arc_path)
+            sha = paper.sha256_checksum or sha256_of_file(paper.pdf_path)
+            manifest_entries.append(f"{sha}  {arc_path}")
+            included_pdfs += 1
+
+            # Supplements
+            supplements = await db.get_supplements_for_paper(paper.canonical_id)
+            for sup in supplements:
+                if not sup.file_path or not os.path.isfile(sup.file_path):
+                    continue
+                # Namespace supplements by canonical_id so names don't collide
+                safe_cid = paper.canonical_id.replace(":", "_").replace("/", "_")
+                sup_arc = f"supplements/{safe_cid}/{sup.filename}"
+                zf.write(sup.file_path, sup_arc)
+                sup_sha = sup.sha256_checksum or sha256_of_file(sup.file_path)
+                manifest_entries.append(f"{sup_sha}  {sup_arc}")
+                included_supplements += 1
+
+        # Manifest — also cover the JSON/CSV artifacts so a reviewer can
+        # verify the whole bundle end-to-end.
+        def sha_str(s: str) -> str:
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()
+        manifest_entries.insert(0, f"{sha_str(config_snapshot_json)}  config_snapshot.json")
+        manifest_entries.insert(1, f"{sha_str(audit_jsonl)}  audit_log.jsonl")
+        manifest_entries.insert(2, f"{sha_str(prisma_csv)}  prisma_report.csv")
+        manifest_entries.insert(3, f"{sha_str(integration_json)}  integration_export.json")
+        manifest_text = "\n".join(manifest_entries) + "\n"
+        zf.writestr("sha256_manifest.txt", manifest_text)
+
+        # README for reviewers
+        readme = _build_bundle_readme(
+            run_record=run_record,
+            prisma=prisma,
+            included_pdfs=included_pdfs,
+            included_supplements=included_supplements,
+            skipped_missing=skipped_missing,
+            total_audit_entries=len(audit_entries),
+            total_papers=len(papers),
+        )
+        zf.writestr("README.txt", readme)
+
+    # Audit log entry for the export itself
+    await db.log_audit(AuditLogEntry(
+        run_id=run_id,
+        outcome="BUNDLE_EXPORTED",
+        details=json.dumps({
+            "bundle": bundle_filename,
+            "pdfs_included": included_pdfs,
+            "supplements_included": included_supplements,
+            "pdfs_missing_on_disk": skipped_missing,
+        }),
+    ))
+
+    return FileResponse(
+        bundle_path,
+        media_type="application/zip",
+        filename=bundle_filename,
+    )
+
+
+def _build_bundle_readme(
+    run_record: RunRecord,
+    prisma: PrismaReport,
+    included_pdfs: int,
+    included_supplements: int,
+    skipped_missing: int,
+    total_audit_entries: int,
+    total_papers: int,
+) -> str:
+    """Human-readable README explaining the bundle contents."""
+    now = datetime.now(timezone.utc).isoformat()
+    lines = [
+        "FULL-TEXT ACQUISITION — SUBMISSION BUNDLE",
+        "=" * 52,
+        "",
+        f"Run ID:              {run_record.run_id}",
+        f"Run started:         {run_record.started_at}",
+        f"Run completed:       {run_record.completed_at or '(still open)'}",
+        f"Run status:          {run_record.status}",
+        f"Bundle generated:    {now}",
+        "",
+        f"Papers submitted:    {run_record.total_submitted}",
+        f"Papers in bundle:    {total_papers}",
+        f"PDFs included:       {included_pdfs}",
+        f"Supplements included:{included_supplements}",
+        f"PDFs missing on disk (state/disk drift): {skipped_missing}",
+        f"Audit log entries:   {total_audit_entries}",
+        "",
+        "-" * 52,
+        "PRISMA 2020 SUMMARY",
+        "-" * 52,
+        f"Total sought:        {prisma.total_sought}",
+        f"Verified:            {prisma.verified}",
+        f"Flagged:             {prisma.flagged}",
+        f"Manual required:     {prisma.manual_required}",
+        f"Already retrieved:   {prisma.already_retrieved}",
+        f"Overrides (confirmed):   {prisma.user_overrides_confirmed}",
+        f"Overrides (re-retried):  {prisma.user_overrides_reretried}",
+        "",
+        "Not retrieved, by category:",
+        f"  No OA source:      {prisma.not_retrieved_no_oa}",
+        f"  Paywall:           {prisma.not_retrieved_paywall}",
+        f"  Access denied:     {prisma.not_retrieved_access_denied}",
+        f"  Not found:         {prisma.not_retrieved_not_found}",
+        f"  Timeout:           {prisma.not_retrieved_timeout}",
+        f"  Other:             {prisma.not_retrieved_other}",
+        "",
+        "-" * 52,
+        "FILES IN THIS BUNDLE",
+        "-" * 52,
+        "",
+        "config_snapshot.json",
+        "  The exact configuration used at the start of this run. Contains",
+        "  all timeouts, concurrency settings, rate limits, cooldown",
+        "  parameters, and institutional URLs. Does NOT contain credentials",
+        "  (the system never stores them).",
+        "",
+        "audit_log.jsonl",
+        "  Complete event trail for this run. One JSON object per line.",
+        "  Each entry records: timestamp, paper canonical_id, tier,",
+        "  method, URL attempted, HTTP status, content type, outcome,",
+        "  failure_code, execution time, and retry count. This is the",
+        "  authoritative record of what the system did.",
+        "",
+        "prisma_report.csv",
+        "  PRISMA 2020 compliance report. Drop this into your systematic",
+        "  review flow diagram. All 'not retrieved' reasons are",
+        "  subcategorized by cause (no OA / paywall / access denied /",
+        "  not found / timeout / other).",
+        "",
+        "integration_export.json",
+        "  Structured per-paper export ready for downstream tools",
+        "  (ASReview, extraction pipelines, risk-of-bias assessment).",
+        "  Each paper carries canonical_id, DOIs, PMID, OpenAlex ID,",
+        "  PDF path inside this bundle, SHA-256, page count, version",
+        "  type (published / accepted / preprint), integrity score,",
+        "  identity status, user override (if any), and the full",
+        "  retrieval log for that paper.",
+        "",
+        "sha256_manifest.txt",
+        "  SHA-256 hash of every file in this bundle, in the standard",
+        "  `sha256sum` format:",
+        "      {64-hex-hash}  {path}",
+        "  Verify end-to-end integrity with:",
+        "      sha256sum -c sha256_manifest.txt",
+        "  (Run this from the directory where you extracted the bundle.)",
+        "",
+        "pdfs/",
+        "  All successfully retrieved and validated PDFs for this run.",
+        "  Filename convention: FirstAuthorLastName_Year_First4Words.pdf",
+        "  Content-drifted versions use a _v{N} suffix.",
+        "",
+        "supplements/",
+        "  Supplementary materials, organized by paper canonical_id.",
+        "  PDFs in this tree were validated the same way as primary",
+        "  PDFs. Non-PDF supplements (DOCX, XLSX, CSV, ZIP) were",
+        "  accepted based on size check only; their validation_status",
+        "  is SUPPLEMENT_NON_PDF in the integration export.",
+        "",
+        "-" * 52,
+        "REPRODUCIBILITY",
+        "-" * 52,
+        "",
+        "The exact config and seeded randomness (seed = hash(run_id))",
+        "used for this run are preserved in config_snapshot.json.",
+        "Re-running with the same inputs and the same config should",
+        "produce the same retrieval attempts — though third-party API",
+        "responses may naturally have evolved since then (new open-access",
+        "releases, changed publisher URLs, expired cache entries).",
+        "",
+        "VERSION_MISMATCH and CONTENT_UNVERIFIED papers were never",
+        "auto-completed — any paper in those states required a",
+        "recorded user override, visible in the audit log and the",
+        "integration export.",
+        "",
+        "The system never accessed paywalls without a user-mediated",
+        "institutional session, never captured or injected credentials,",
+        "and followed publisher rate limits and robots.txt.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 # ===========================================================================
 # SETTINGS ENDPOINTS
 # ===========================================================================

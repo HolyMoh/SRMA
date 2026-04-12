@@ -1145,6 +1145,8 @@
                     <button class="btn btn-outline btn-sm" id="btnExportPrisma">Export PRISMA</button>
                     <button class="btn btn-outline btn-sm" id="btnExportAudit">Export Audit JSON</button>
                     <button class="btn btn-outline btn-sm" id="btnExportIntegration">Export Integration</button>
+                    <button class="btn btn-primary btn-sm" id="btnExportBundle"
+                            title="Submission bundle: config, audit log, PRISMA, PDFs, supplements, SHA-256 manifest">Download Submission Bundle</button>
                 </div>
             </div>
 
@@ -2243,6 +2245,15 @@ document.getElementById('btnExportAudit').addEventListener('click', function() {
 });
 document.getElementById('btnExportIntegration').addEventListener('click', function() {
     const r = document.getElementById('resultsRunFilter').value; window.location.href = '/api/export/integration' + (r ? '?run_id=' + encodeURIComponent(r) : '');
+});
+document.getElementById('btnExportBundle').addEventListener('click', function() {
+    const r = document.getElementById('resultsRunFilter').value;
+    if (!r) {
+        toast('Select a specific run to build the submission bundle', 'warning');
+        return;
+    }
+    toast('Preparing submission bundle — this may take a moment for large runs...', 'info');
+    window.location.href = '/api/export/bundle?run_id=' + encodeURIComponent(r);
 });
 
 /* ------------------------------------------------------------------
