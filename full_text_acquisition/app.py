@@ -437,6 +437,17 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     app_state["engine"] = engine
     app_state["worker_pool"] = worker_pool
     app_state["shutdown_event"] = asyncio.Event()
+    app_state["enrichment_status"] = {
+        "in_progress": False,
+        "run_id": None,
+        "total": 0,
+        "completed": 0,
+        "enriched_count": 0,
+        "failed_count": 0,
+        "started_at": None,
+        "completed_at": None,
+    }
+    app_state["enrichment_task"] = None
 
     logger.info(
         "Startup complete: %d interrupted resets, %d missing files reconciled",
@@ -712,20 +723,11 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     # Bulk insert new papers
     inserted = await db.insert_papers_bulk(papers)
 
-    # Transition INGESTED → NORMALIZED for all new papers
+    # Transition INGESTED → NORMALIZED for all new papers (synchronous, fast)
     for paper in papers:
         await db.transition_state(paper.canonical_id, PaperState.NORMALIZED.value)
 
-    # Metadata enrichment
-    enrichment = await _enrich_papers(papers, db, config)
-
-    # Transition NORMALIZED → ENRICHED → IDENTITY_ASSIGNED → READY_FOR_RETRIEVAL
-    for paper in papers:
-        await db.transition_state(paper.canonical_id, PaperState.ENRICHED.value)
-        await db.transition_state(paper.canonical_id, PaperState.IDENTITY_ASSIGNED.value)
-        await db.transition_state(paper.canonical_id, PaperState.READY_FOR_RETRIEVAL.value)
-
-    # Create paper_runs for new papers
+    # Create paper_runs for new papers (synchronous, fast)
     paper_runs = [
         PaperRun(canonical_id=p.canonical_id, run_id=run_id, submitted_in_this_run=True)
         for p in papers
@@ -735,6 +737,32 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     # Update run count
     total_ready = inserted
     await db.update_run_submitted_count(run_id, len(rows))
+
+    # Launch enrichment + downstream state transitions in the background.
+    # The response below returns immediately; the UI polls /api/enrichment/status
+    # (or consumes /api/enrichment/stream) to observe progress. Each paper
+    # transitions NORMALIZED → ENRICHED → IDENTITY_ASSIGNED → READY_FOR_RETRIEVAL
+    # as its enrichment finishes.
+    if papers:
+        app_state["enrichment_status"] = {
+            "in_progress": True,
+            "run_id": run_id,
+            "total": len(papers),
+            "completed": 0,
+            "enriched_count": 0,
+            "failed_count": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+        }
+        canonical_ids = [p.canonical_id for p in papers]
+        task = asyncio.create_task(
+            _enrich_papers_background(canonical_ids, run_id),
+            name=f"enrichment-{run_id}",
+        )
+        app_state["enrichment_task"] = task
+    # No papers to enrich → status stays with in_progress=False
+
+    enrichment: Optional[EnrichmentResult] = None  # Populated async; kept None in response
 
     # Build preview (first 10 rows)
     preview = []
@@ -819,6 +847,140 @@ def _get_field(
         return None
     value = row.get(column_name, "")
     return value.strip() if value else None
+
+
+async def _enrich_papers_background(
+    canonical_ids: List[str],
+    run_id: str,
+) -> None:
+    """Background task: enrich papers + advance state to READY_FOR_RETRIEVAL.
+
+    For each paper:
+        1. OpenAlex API (primary)
+        2. CrossRef API (fallback)
+        3. Transition NORMALIZED → ENRICHED → IDENTITY_ASSIGNED → READY_FOR_RETRIEVAL
+        4. Update live progress in app_state["enrichment_status"]
+
+    Papers without a DOI skip API calls but still transition through the pipeline.
+    All failures are non-fatal — a paper that can't be enriched still advances.
+    """
+    db = app_state.get("db")
+    engine = app_state.get("engine")
+    config = app_state.get("config", DEFAULT_CONFIG)
+    status = app_state.get("enrichment_status")
+
+    if db is None or engine is None or status is None:
+        logger.error("Enrichment background: app_state not initialized")
+        return
+
+    logger.info(
+        "Enrichment background: starting for run=%s, %d papers",
+        run_id, len(canonical_ids),
+    )
+
+    try:
+        for cid in canonical_ids:
+            # Refresh paper from DB in case worker tasks touched it
+            paper = await db.get_paper(cid)
+            if paper is None:
+                status["completed"] += 1
+                continue
+
+            enriched = False
+
+            # Skip API calls for papers without a DOI
+            if paper.doi:
+                # Try OpenAlex first
+                try:
+                    oa_url = f"https://api.openalex.org/works/doi:{paper.doi}"
+                    oa_data, _ = await engine._api_request(
+                        url=oa_url,
+                        doi=paper.doi,
+                        api_name="openalex",
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        tier="ENRICHMENT",
+                    )
+                    if oa_data:
+                        filled = await _apply_enrichment_openalex(paper, oa_data, db)
+                        if filled:
+                            enriched = True
+                except Exception as exc:
+                    logger.debug(
+                        "OpenAlex enrichment failed for %s: %s", paper.doi, exc
+                    )
+
+                # Fallback to CrossRef
+                if not enriched:
+                    try:
+                        cr_url = f"https://api.crossref.org/works/{paper.doi}"
+                        cr_data, _ = await engine._api_request(
+                            url=cr_url,
+                            doi=paper.doi,
+                            api_name="crossref",
+                            canonical_id=paper.canonical_id,
+                            run_id=run_id,
+                            tier="ENRICHMENT",
+                        )
+                        if cr_data:
+                            msg = cr_data.get("message", cr_data)
+                            filled = await _apply_enrichment_crossref(paper, msg, db)
+                            if filled:
+                                enriched = True
+                    except Exception as exc:
+                        logger.debug(
+                            "CrossRef enrichment failed for %s: %s", paper.doi, exc
+                        )
+
+            # Always advance through the state machine even if enrichment failed
+            try:
+                await db.transition_state(cid, PaperState.ENRICHED.value)
+                await db.transition_state(cid, PaperState.IDENTITY_ASSIGNED.value)
+                await db.transition_state(cid, PaperState.READY_FOR_RETRIEVAL.value)
+            except Exception as exc:
+                logger.error(
+                    "State transition failed for %s during enrichment: %s",
+                    cid, exc,
+                )
+
+            # Update progress counters
+            if enriched:
+                status["enriched_count"] += 1
+            else:
+                status["failed_count"] += 1
+            status["completed"] += 1
+
+    except asyncio.CancelledError:
+        logger.info("Enrichment background: cancelled")
+        raise
+    except Exception as exc:
+        logger.error(
+            "Enrichment background: unhandled exception: %s\n%s",
+            exc, traceback.format_exc(),
+        )
+    finally:
+        status["in_progress"] = False
+        status["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await db.log_audit(AuditLogEntry(
+                run_id=run_id,
+                outcome="ENRICHMENT_COMPLETE",
+                details=json.dumps({
+                    "total": status["total"],
+                    "completed": status["completed"],
+                    "enriched": status["enriched_count"],
+                    "failed": status["failed_count"],
+                }),
+            ))
+        except Exception:
+            pass
+
+        logger.info(
+            "Enrichment background: complete for run=%s (%d/%d enriched, %d without metadata)",
+            run_id, status["enriched_count"], status["total"],
+            status["failed_count"],
+        )
 
 
 async def _enrich_papers(
@@ -1946,6 +2108,74 @@ async def reset_cooldown(
 # ===========================================================================
 # HEALTH DASHBOARD — SSE + SNAPSHOT
 # ===========================================================================
+
+
+@app.get("/api/enrichment/status")
+async def enrichment_status() -> JSONResponse:
+    """Return current enrichment background-task status (single snapshot)."""
+    status = app_state.get("enrichment_status") or {
+        "in_progress": False,
+        "run_id": None,
+        "total": 0,
+        "completed": 0,
+        "enriched_count": 0,
+        "failed_count": 0,
+        "started_at": None,
+        "completed_at": None,
+    }
+    return JSONResponse(status)
+
+
+@app.get("/api/enrichment/stream")
+async def enrichment_stream(request: Request) -> StreamingResponse:
+    """SSE stream of enrichment progress.
+
+    Emits a status JSON every ~1s while enrichment is in progress.
+    Sends one final event when in_progress becomes False, then closes.
+    Closes immediately if the client disconnects or shutdown is signaled.
+    """
+
+    async def event_generator() -> AsyncIterator[str]:
+        shutdown_event: asyncio.Event = app_state.get(
+            "shutdown_event", asyncio.Event()
+        )
+
+        # Always emit the current status first so late subscribers see it
+        sent_final = False
+        while not shutdown_event.is_set():
+            if await request.is_disconnected():
+                break
+
+            status = app_state.get("enrichment_status") or {
+                "in_progress": False,
+                "total": 0,
+                "completed": 0,
+                "enriched_count": 0,
+                "failed_count": 0,
+            }
+            yield f"data: {json.dumps(status, default=str)}\n\n"
+
+            # Stop streaming once enrichment is complete (after one final event)
+            if not status.get("in_progress"):
+                if sent_final:
+                    break
+                sent_final = True  # loop once more to give clients the final state
+
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+                break  # shutdown signaled
+            except asyncio.TimeoutError:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/health/stream")

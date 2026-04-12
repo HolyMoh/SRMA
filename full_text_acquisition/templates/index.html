@@ -667,7 +667,30 @@
                 </div>
 
                 <div style="margin-top:16px">
-                    <button class="btn btn-primary" id="btnStartAfterUpload">Start Retrieval</button>
+                    <button class="btn btn-primary" id="btnStartAfterUpload"
+                            title="Start retrieval for this run">Start Retrieval</button>
+                </div>
+            </div>
+
+            <!-- Enrichment progress (shown while background enrichment runs) -->
+            <div class="card" id="enrichmentProgress" style="display:none">
+                <div class="card-header">
+                    <h3>Metadata Enrichment</h3>
+                    <span class="badge badge-info" id="enrichmentBadge">In Progress</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="enrichProgressBar" style="width:0%"></div>
+                    </div>
+                    <div class="progress-stats">
+                        <span id="enrichProgressText">Enriching 0/0 papers...</span>
+                        <span id="enrichProgressPercent">0%</span>
+                    </div>
+                </div>
+                <div style="margin-top:8px; font-size:12px; color:var(--text-secondary)">
+                    Fetching metadata from OpenAlex and CrossRef. The UI stays responsive —
+                    you can browse other panels while this runs. <strong>Start Retrieval</strong>
+                    is disabled until enrichment completes.
                 </div>
             </div>
 
@@ -1187,6 +1210,8 @@ const state = {
     sseSource: null,
     statusPollInterval: null,
     lastStatusCounts: null,
+    enrichmentSseSource: null,
+    enrichmentInProgress: false,
 };
 
 /* ------------------------------------------------------------------
@@ -1321,10 +1346,106 @@ async function handleUpload(file) {
 
         document.getElementById('uploadResults').style.display = 'block';
         await loadStateBreakdown();
-        toast('Upload complete: ' + data.ready_for_retrieval_count + ' papers ready', 'success');
+        // Background enrichment runs on the server — open the SSE stream to track it
+        try {
+            const enr = await GET('/api/enrichment/status');
+            if (enr && enr.in_progress) {
+                startEnrichmentSSE();
+            } else {
+                setStartButtonEnrichmentLock(false);
+            }
+        } catch (e) {
+            setStartButtonEnrichmentLock(false);
+        }
+        toast('Upload accepted: ' + data.total_after_dedup + ' papers ingested. Enriching metadata in background...', 'success');
     } catch (err) {
         document.getElementById('uploadProgress').style.display = 'none';
         toast('Upload failed: ' + err.message, 'error');
+    }
+}
+
+/* ------------------------------------------------------------------
+   Enrichment progress (SSE-driven, background task on server)
+   ------------------------------------------------------------------ */
+function setStartButtonEnrichmentLock(locked) {
+    const btn = document.getElementById('btnStartAfterUpload');
+    if (!btn) return;
+    if (locked) {
+        btn.disabled = true;
+        btn.title = 'Waiting for enrichment to complete';
+        btn.dataset.enrichLocked = '1';
+    } else {
+        btn.disabled = false;
+        btn.title = 'Start retrieval for this run';
+        delete btn.dataset.enrichLocked;
+    }
+}
+
+function renderEnrichmentStatus(s) {
+    const total = s.total || 0;
+    const done = s.completed || 0;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    document.getElementById('enrichProgressBar').style.width = pct + '%';
+    document.getElementById('enrichProgressPercent').textContent = pct + '%';
+    if (s.in_progress) {
+        document.getElementById('enrichProgressText').textContent =
+            'Enriching ' + done + '/' + total + ' papers... (' +
+            (s.enriched_count || 0) + ' enriched, ' +
+            (s.failed_count || 0) + ' no metadata)';
+        const badge = document.getElementById('enrichmentBadge');
+        badge.textContent = 'In Progress';
+        badge.className = 'badge badge-info';
+    } else {
+        document.getElementById('enrichProgressText').textContent =
+            'Done: ' + (s.enriched_count || 0) + ' enriched, ' +
+            (s.failed_count || 0) + ' without metadata (' + total + ' total)';
+        const badge = document.getElementById('enrichmentBadge');
+        badge.textContent = 'Complete';
+        badge.className = 'badge badge-success';
+    }
+}
+
+function startEnrichmentSSE() {
+    if (state.enrichmentSseSource) return;
+    document.getElementById('enrichmentProgress').style.display = 'block';
+    setStartButtonEnrichmentLock(true);
+    state.enrichmentInProgress = true;
+
+    state.enrichmentSseSource = new EventSource('/api/enrichment/stream');
+    state.enrichmentSseSource.onmessage = function(event) {
+        try {
+            const s = JSON.parse(event.data);
+            renderEnrichmentStatus(s);
+
+            if (!s.in_progress) {
+                // Final event received — unlock and close
+                state.enrichmentInProgress = false;
+                setStartButtonEnrichmentLock(false);
+                stopEnrichmentSSE();
+                toast('Enrichment complete: ' + (s.enriched_count || 0) + '/' +
+                      (s.total || 0) + ' enriched', 'success');
+                // Refresh state breakdown to show new READY_FOR_RETRIEVAL counts
+                if (typeof loadStateBreakdown === 'function') {
+                    loadStateBreakdown();
+                }
+            }
+        } catch (e) {
+            // Ignore parse errors
+        }
+    };
+    state.enrichmentSseSource.onerror = function() {
+        stopEnrichmentSSE();
+        // Reconnect if enrichment is still in progress
+        setTimeout(function() {
+            if (state.enrichmentInProgress) startEnrichmentSSE();
+        }, 3000);
+    };
+}
+
+function stopEnrichmentSSE() {
+    if (state.enrichmentSseSource) {
+        state.enrichmentSseSource.close();
+        state.enrichmentSseSource = null;
     }
 }
 
@@ -1415,6 +1536,10 @@ document.getElementById('btnResetRetryAll').addEventListener('click', async func
 });
 
 document.getElementById('btnStartAfterUpload').addEventListener('click', async function() {
+    if (state.enrichmentInProgress) {
+        toast('Waiting for enrichment to complete', 'warning');
+        return;
+    }
     try {
         const data = await POST('/api/run/start?run_id=' + encodeURIComponent(state.runId));
         toast('Run started: ' + data.run_id, 'success');
@@ -1913,6 +2038,15 @@ function formatBytes(b) {
         if (s.wizard_errors && s.wizard_errors.length) s.wizard_errors.forEach(function(e) { toast(e, 'warning'); });
         document.getElementById('sidebarOcr').textContent = 'OCR: ' + s.ocr_mode;
         if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); startSSE(); startStatusPoll(); }
+
+        // Reconnect enrichment SSE if a background task is still running
+        try {
+            const enr = await GET('/api/enrichment/status');
+            if (enr && enr.in_progress) {
+                document.getElementById('uploadResults').style.display = 'block';
+                startEnrichmentSSE();
+            }
+        } catch (e) {}
     } catch(e) { toast('Could not connect to server', 'error'); }
     updateRunButtons();
 })();
