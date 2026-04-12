@@ -1109,3 +1109,421 @@ class IntegrationExport(BaseModel):
             supplement_paths=[s.file_path for s in supplements],
             retrieval_log=[e.to_dict() for e in audit_entries],
         )
+
+
+# ===========================================================================
+# HELPER FUNCTIONS & VALIDATORS
+# ===========================================================================
+
+
+def normalize_doi(raw_doi: Optional[str]) -> Optional[str]:
+    """Normalize a DOI string: strip common prefixes, trim whitespace, lowercase.
+
+    Returns None if input is None, empty, or not a recognizable DOI.
+
+    Examples:
+        "https://doi.org/10.1000/xyz" → "10.1000/xyz"
+        " 10.1000/XYZ " → "10.1000/xyz"
+        "doi: 10.1000/xyz" → "10.1000/xyz"
+    """
+    if not raw_doi:
+        return None
+
+    doi = raw_doi.strip()
+
+    # Strip common URL prefixes
+    prefixes_to_strip = [
+        "https://doi.org/",
+        "http://doi.org/",
+        "https://dx.doi.org/",
+        "http://dx.doi.org/",
+        "doi.org/",
+        "dx.doi.org/",
+        "doi:",
+        "DOI:",
+        "doi: ",
+        "DOI: ",
+    ]
+    for prefix in prefixes_to_strip:
+        if doi.lower().startswith(prefix.lower()):
+            doi = doi[len(prefix):]
+            break
+
+    doi = doi.strip().lower()
+
+    # Validate basic DOI pattern: starts with "10."
+    if not doi.startswith("10."):
+        return None
+
+    # Must have a slash after the registrant code
+    if "/" not in doi:
+        return None
+
+    return doi
+
+
+def normalize_title(raw_title: Optional[str]) -> str:
+    """Normalize a title for comparison and hashing.
+
+    Strips HTML tags, normalizes Unicode, collapses whitespace, lowercases.
+    """
+    if not raw_title:
+        return ""
+
+    title = raw_title.strip()
+
+    # Strip HTML tags
+    title = re.sub(r"<[^>]+>", "", title)
+
+    # Normalize Unicode to NFC form
+    title = unicodedata.normalize("NFC", title)
+
+    # Collapse whitespace
+    title = re.sub(r"\s+", " ", title).strip()
+
+    return title.lower()
+
+
+def extract_first_author_lastname(authors_str: Optional[str]) -> str:
+    """Extract the last name of the first author from an author string.
+
+    Handles common formats:
+        "Smith, John; Doe, Jane" → "Smith"
+        "John Smith, Jane Doe"   → "Smith"
+        "Smith J, Doe J"         → "Smith"
+        "Smith"                  → "Smith"
+    """
+    if not authors_str or not authors_str.strip():
+        return "Unknown"
+
+    authors = authors_str.strip()
+
+    # Split on common author separators
+    first_author = authors.split(";")[0].strip()
+    if not first_author:
+        return "Unknown"
+
+    # If "LastName, FirstName" format (comma-separated)
+    if "," in first_author:
+        lastname = first_author.split(",")[0].strip()
+        if lastname:
+            return _sanitize_name(lastname)
+
+    # If "FirstName LastName" format (space-separated)
+    parts = first_author.split()
+    if len(parts) >= 2:
+        # Last token is likely the last name
+        return _sanitize_name(parts[-1])
+
+    # Single name
+    return _sanitize_name(parts[0]) if parts else "Unknown"
+
+
+def _sanitize_name(name: str) -> str:
+    """Sanitize a name component for use in filenames.
+
+    Removes non-alphanumeric characters, handles Unicode → ASCII.
+    """
+    # Normalize Unicode
+    name = unicodedata.normalize("NFKD", name)
+    # Strip diacritics (combining characters)
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    # Keep only alphanumeric
+    name = re.sub(r"[^a-zA-Z0-9]", "", name)
+    return name if name else "Unknown"
+
+
+def generate_canonical_id(
+    doi: Optional[str] = None,
+    pmid: Optional[str] = None,
+    openalex_id: Optional[str] = None,
+    title: Optional[str] = None,
+    first_author_lastname: Optional[str] = None,
+    year: Optional[int] = None,
+) -> str:
+    """Generate a deterministic canonical ID using priority-based identity.
+
+    Priority:
+        1. Normalized DOI
+        2. PMID
+        3. OpenAlex ID
+        4. SHA256(normalized_title + first_author_lastname + year)
+
+    Always returns a non-empty string.
+    """
+    normalized = normalize_doi(doi)
+    if normalized:
+        return f"doi:{normalized}"
+
+    if pmid and str(pmid).strip():
+        return f"pmid:{str(pmid).strip()}"
+
+    if openalex_id and str(openalex_id).strip():
+        return f"openalex:{str(openalex_id).strip()}"
+
+    # Fallback: title-author-year hash
+    norm_title = normalize_title(title)
+    author = (first_author_lastname or "unknown").lower().strip()
+    yr = str(year) if year else "0000"
+
+    composite = f"{norm_title}|{author}|{yr}"
+    title_hash = hashlib.sha256(composite.encode("utf-8")).hexdigest()[:16]
+    return f"hash:{title_hash}"
+
+
+def generate_filename(
+    first_author_lastname: str,
+    year: Optional[int],
+    title: str,
+    extension: str = ".pdf",
+) -> str:
+    """Generate a standardized filename: FirstAuthor_Year_First4MeaningfulWords.ext
+
+    Rules:
+        - ASCII-safe characters only
+        - Stopwords removed from title words
+        - Max 60 characters total (including extension)
+        - Special characters sanitized to underscores
+    """
+    author_part = _sanitize_name(first_author_lastname) or "Unknown"
+    year_part = str(year) if year else "NoYear"
+
+    # Extract meaningful words from title
+    norm_title = normalize_title(title)
+    words = norm_title.split()
+    meaningful = [w for w in words if w.lower() not in STOPWORDS and len(w) > 1]
+
+    # Take first 4 meaningful words
+    title_words = meaningful[:4]
+    # Capitalize first letter of each word, sanitize
+    title_parts = []
+    for word in title_words:
+        sanitized = re.sub(r"[^a-zA-Z0-9]", "", word)
+        if sanitized:
+            title_parts.append(sanitized.capitalize())
+
+    title_part = "_".join(title_parts) if title_parts else "Untitled"
+
+    # Combine parts
+    base = f"{author_part}_{year_part}_{title_part}"
+
+    # Ensure extension starts with dot
+    if not extension.startswith("."):
+        extension = f".{extension}"
+
+    # Enforce max length (including extension)
+    max_base_len = MAX_FILENAME_LENGTH - len(extension)
+    if len(base) > max_base_len:
+        base = base[:max_base_len]
+        # Avoid trailing underscore from truncation
+        base = base.rstrip("_")
+
+    return f"{base}{extension}"
+
+
+def generate_supplement_filename(
+    first_author_lastname: str,
+    year: Optional[int],
+    supplement_index: int,
+    extension: str,
+) -> str:
+    """Generate a supplement filename: FirstAuthor_Year_Supplement_N.ext"""
+    author_part = _sanitize_name(first_author_lastname) or "Unknown"
+    year_part = str(year) if year else "NoYear"
+
+    if not extension.startswith("."):
+        extension = f".{extension}"
+
+    base = f"{author_part}_{year_part}_Supplement_{supplement_index}"
+
+    max_base_len = MAX_FILENAME_LENGTH - len(extension)
+    if len(base) > max_base_len:
+        base = base[:max_base_len].rstrip("_")
+
+    return f"{base}{extension}"
+
+
+def validate_state_transition(current_state: str, new_state: str) -> bool:
+    """Check whether a state transition is valid per the state machine.
+
+    Returns True if the transition is allowed, False otherwise.
+    """
+    allowed = VALID_TRANSITIONS.get(current_state, set())
+    return new_state in allowed
+
+
+def get_valid_transitions(current_state: str) -> Set[str]:
+    """Return the set of valid target states from the given state."""
+    return VALID_TRANSITIONS.get(current_state, set())
+
+
+def calculate_integrity_score(
+    source_tier: Optional[str],
+    version_type: Optional[str],
+    identity_status: Optional[str],
+    has_supplements: bool = False,
+) -> Tuple[int, str]:
+    """Calculate the integrity score (0–100) and confidence level.
+
+    Scoring:
+        Source:     OA API 40 | Publisher 35 | SSO 30 | OCR 25
+        Version:    Published +25 | Accepted +15 | Preprint +5
+        Identity:   DOI_VERIFIED +25 | TITLE_VERIFIED +15 | CONTENT_UNVERIFIED +0
+        Supplement: +10
+
+    Cap at 100, floor at 0.
+    If identity is CONTENT_UNVERIFIED or VERSION_MISMATCH, cap total at 40.
+
+    Returns:
+        Tuple of (score, confidence_level).
+    """
+    source_score = SOURCE_SCORES.get(source_tier or "", 0)
+    version_score = VERSION_SCORES.get(version_type or "UNKNOWN", 0)
+    identity_score_val = IDENTITY_SCORES.get(identity_status or "CONTENT_UNVERIFIED", 0)
+    supplement_score = SUPPLEMENT_BONUS if has_supplements else 0
+
+    total = source_score + version_score + identity_score_val + supplement_score
+
+    # Apply identity-unverified cap
+    if identity_status in (
+        IdentityStatus.CONTENT_UNVERIFIED.value,
+        IdentityStatus.VERSION_MISMATCH.value,
+    ):
+        total = min(total, IDENTITY_UNVERIFIED_CAP)
+
+    # Clamp to [0, 100]
+    total = max(INTEGRITY_SCORE_MIN, min(INTEGRITY_SCORE_MAX, total))
+
+    confidence = score_to_confidence(total)
+    return total, confidence
+
+
+def score_to_confidence(score: int) -> str:
+    """Map an integrity score to a confidence level string."""
+    if score >= CONFIDENCE_HIGH_THRESHOLD:
+        return ConfidenceLevel.HIGH.value
+    elif score >= CONFIDENCE_MEDIUM_THRESHOLD:
+        return ConfidenceLevel.MEDIUM.value
+    else:
+        return ConfidenceLevel.LOW.value
+
+
+def detect_column(header: str) -> Optional[str]:
+    """Detect which field a CSV/Excel column header maps to.
+
+    Returns the canonical field name ('doi', 'title', 'authors', 'year',
+    'journal') or None if unrecognized.
+    """
+    header_lower = header.strip().lower()
+    for field_name, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            if header_lower == alias.lower():
+                return field_name
+    return None
+
+
+def auto_detect_columns(headers: List[str]) -> ColumnMapping:
+    """Auto-detect column mapping from a list of CSV/Excel headers.
+
+    Returns a ColumnMapping with detected columns filled in.
+    """
+    mapping = ColumnMapping()
+    for header in headers:
+        detected = detect_column(header)
+        if detected == "doi" and mapping.doi_column is None:
+            mapping.doi_column = header
+        elif detected == "title" and mapping.title_column is None:
+            mapping.title_column = header
+        elif detected == "authors" and mapping.authors_column is None:
+            mapping.authors_column = header
+        elif detected == "year" and mapping.year_column is None:
+            mapping.year_column = header
+        elif detected == "journal" and mapping.journal_column is None:
+            mapping.journal_column = header
+    return mapping
+
+
+def resolve_publisher_from_doi(doi: Optional[str]) -> str:
+    """Resolve publisher from DOI prefix (Signal 1).
+
+    Returns a PublisherEnum value string.
+    """
+    if not doi:
+        return PublisherEnum.OTHER.value
+
+    normalized = normalize_doi(doi)
+    if not normalized:
+        return PublisherEnum.OTHER.value
+
+    # Check longest prefixes first (e.g., "10.1016/S0140-6736" before "10.1016")
+    sorted_prefixes = sorted(DOI_PREFIX_PUBLISHER_MAP.keys(), key=len, reverse=True)
+    for prefix in sorted_prefixes:
+        if normalized.startswith(prefix.lower()):
+            return DOI_PREFIX_PUBLISHER_MAP[prefix]
+
+    return PublisherEnum.OTHER.value
+
+
+def is_safe_scholar_domain(url: str) -> bool:
+    """Check whether a URL's domain is in the safe domain allowlist.
+
+    Used by Tier 3.5 Scholar-Assisted Retrieval to filter links.
+    Only follows links to publisher domains, PMC, arXiv, medRxiv,
+    and recognized institutional repository domains.
+    """
+    try:
+        # Extract domain from URL
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.hostname
+        if not domain:
+            return False
+        domain = domain.lower()
+
+        # Check exact domain matches
+        for safe in SAFE_SCHOLAR_DOMAINS:
+            if safe.startswith("."):
+                # Suffix match for institutional domains
+                if domain.endswith(safe):
+                    return True
+            else:
+                # Exact match or subdomain match
+                if domain == safe or domain.endswith(f".{safe}"):
+                    return True
+
+        return False
+    except Exception:
+        return False
+
+
+def generate_seeded_delay(
+    run_id: str,
+    canonical_id: str,
+    base_delay: float,
+    jitter_range: float = 2.0,
+) -> float:
+    """Generate a deterministic delay seeded by run_id + canonical_id.
+
+    Ensures reproducibility for audit purposes. The delay is
+    base_delay + (0 to jitter_range) seconds, determined by hash.
+    """
+    seed_str = f"{run_id}:{canonical_id}"
+    seed_hash = hashlib.sha256(seed_str.encode("utf-8")).hexdigest()
+    # Use first 8 hex chars as a fraction [0, 1)
+    fraction = int(seed_hash[:8], 16) / 0xFFFFFFFF
+    return base_delay + (fraction * jitter_range)
+
+
+def pdf_magic_bytes_valid(data: bytes) -> bool:
+    """Check whether byte data starts with the PDF magic bytes (%PDF)."""
+    return data[:4] == PDF_MAGIC_BYTES
+
+
+def looks_like_html(data: bytes) -> bool:
+    """Check whether byte data appears to be HTML disguised as a PDF.
+
+    Checks the first 1024 bytes for HTML indicators.
+    """
+    sample = data[:1024].lower()
+    html_indicators = [b"<!doctype html", b"<html", b"<head", b"<body"]
+    return any(indicator in sample for indicator in html_indicators)
