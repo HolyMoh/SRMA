@@ -1314,3 +1314,516 @@ class RetrievalEngine:
             )
 
         return success, failure_code
+
+    # ===================================================================
+    # TIER 2 — Publisher-Aware Direct Retrieval (Playwright headless)
+    # ===================================================================
+
+    async def tier2_publisher_direct(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 2: Publisher-aware direct retrieval with Playwright headless.
+
+        Checks publisher cooldown first. Routes to publisher-specific method.
+        Uses a disposable browser context per paper.
+
+        Returns:
+            Tuple of (success, failure_code).
+        """
+        publisher = paper.publisher or PublisherEnum.OTHER.value
+
+        # Check adaptive cooldown
+        cooldown = await self._db.get_publisher_cooldown(publisher)
+        if cooldown and cooldown.is_in_cooldown:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_2.value,
+                method=f"publisher_{publisher.lower()}",
+                outcome="COOLDOWN_ACTIVE",
+                failure_code=FailureCode.PUBLISHER_COOLDOWN_ACTIVE.value,
+                details={
+                    "publisher": publisher,
+                    "failure_rate": cooldown.failure_rate,
+                    "cooldown_until": cooldown.cooldown_until,
+                },
+            )
+            return False, FailureCode.PUBLISHER_COOLDOWN_ACTIVE.value
+
+        if not paper.doi:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_2.value,
+                method="publisher_direct",
+                outcome="SKIPPED",
+                failure_code=FailureCode.NO_DOI.value,
+            )
+            return False, FailureCode.NO_DOI.value
+
+        doi_url = f"https://doi.org/{paper.doi}"
+        start_ms = time.monotonic() * 1000
+        success = False
+        failure_code: Optional[str] = None
+
+        try:
+            async with self._browser.disposable_context() as ctx:
+                page = await ctx.new_page()
+
+                # Navigate to DOI (follows redirect to publisher)
+                nav_result = await self._browser.safe_navigate(
+                    page, doi_url,
+                    timeout_s=self._config.get(
+                        "page_load_timeout_s", DEFAULT_PAGE_LOAD_TIMEOUT_S
+                    ),
+                )
+
+                if not nav_result["success"]:
+                    failure_code = self._map_nav_error(nav_result)
+                    elapsed_ms = (time.monotonic() * 1000) - start_ms
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        tier=TierEnum.TIER_2.value,
+                        method="publisher_navigate",
+                        url_attempted=doi_url,
+                        http_status=nav_result.get("status"),
+                        outcome="NAVIGATION_FAILED",
+                        failure_code=failure_code,
+                        execution_time_ms=elapsed_ms,
+                    )
+                    await self._record_tier2_attempt(publisher, False)
+                    return False, failure_code
+
+                # Update publisher from redirect domain (Signal 3)
+                final_url = nav_result["url"]
+                resolved_pub, signal = PublisherResolver.resolve(
+                    doi=paper.doi,
+                    redirect_url=final_url,
+                )
+                if resolved_pub != publisher:
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        publisher=resolved_pub,
+                        publisher_signal_source=signal,
+                    )
+                    publisher = resolved_pub
+
+                # Paywall detection
+                if await self._browser.detect_paywall(page):
+                    elapsed_ms = (time.monotonic() * 1000) - start_ms
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        tier=TierEnum.TIER_2.value,
+                        method=f"publisher_{publisher.lower()}",
+                        url_attempted=final_url,
+                        outcome="PAYWALL_DETECTED",
+                        failure_code=FailureCode.PAYWALL_DETECTED.value,
+                        execution_time_ms=elapsed_ms,
+                        details={"publisher": publisher},
+                    )
+                    await self._record_tier2_attempt(publisher, False)
+                    return False, FailureCode.PAYWALL_DETECTED.value
+
+                # Route to publisher-specific method
+                publisher_methods = {
+                    PublisherEnum.ELSEVIER.value: self._pub_elsevier,
+                    PublisherEnum.SPRINGER.value: self._pub_springer,
+                    PublisherEnum.WILEY.value: self._pub_wiley,
+                    PublisherEnum.NATURE.value: self._pub_nature,
+                    PublisherEnum.BMJ.value: self._pub_bmj,
+                    PublisherEnum.LANCET.value: self._pub_lancet,
+                    PublisherEnum.TAYLOR_FRANCIS.value: self._pub_taylor_francis,
+                    PublisherEnum.SAGE.value: self._pub_sage,
+                }
+
+                method_fn = publisher_methods.get(
+                    publisher, self._pub_generic_fallback
+                )
+                pdf_url = await method_fn(page, paper, final_url)
+
+                if not pdf_url:
+                    # Fallback to generic if specific method failed
+                    if publisher != PublisherEnum.OTHER.value:
+                        pdf_url = await self._pub_generic_fallback(
+                            page, paper, final_url
+                        )
+
+                if not pdf_url:
+                    elapsed_ms = (time.monotonic() * 1000) - start_ms
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        tier=TierEnum.TIER_2.value,
+                        method=f"publisher_{publisher.lower()}",
+                        url_attempted=final_url,
+                        outcome="NO_PDF_LINK",
+                        failure_code=FailureCode.PUBLISHER_SOFT_BLOCK.value,
+                        execution_time_ms=elapsed_ms,
+                    )
+                    await self._record_tier2_attempt(publisher, False)
+                    return False, FailureCode.PUBLISHER_SOFT_BLOCK.value
+
+                # Resolve relative PDF URL
+                if pdf_url.startswith("/"):
+                    pdf_url = urljoin(final_url, pdf_url)
+
+                # Download the PDF
+                filename = generate_filename(
+                    paper.first_author_lastname, paper.year, paper.title,
+                )
+                final_path = os.path.join(self._output_dir, filename)
+
+                success, failure_code, pdf_data = await self._download_pdf(
+                    url=pdf_url,
+                    final_path=final_path,
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    tier=TierEnum.TIER_2.value,
+                    method=f"publisher_{publisher.lower()}",
+                )
+
+                if success:
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        pdf_path=final_path,
+                        pdf_filename=filename,
+                        retrieval_tier=TierEnum.TIER_2.value,
+                        retrieval_method=f"publisher_{publisher.lower()}",
+                        retrieval_url=pdf_url,
+                        pdf_size_bytes=len(pdf_data) if pdf_data else None,
+                    )
+
+                await self._record_tier2_attempt(publisher, success)
+                return success, failure_code
+
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() * 1000) - start_ms
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_2.value,
+                method=f"publisher_{publisher.lower()}",
+                url_attempted=doi_url,
+                outcome="EXCEPTION",
+                failure_code=FailureCode.PUBLISHER_SOFT_BLOCK.value,
+                execution_time_ms=elapsed_ms,
+                exc=exc,
+            )
+            await self._record_tier2_attempt(publisher, False)
+            return False, FailureCode.PUBLISHER_SOFT_BLOCK.value
+
+    async def _record_tier2_attempt(
+        self, publisher: str, success: bool
+    ) -> None:
+        """Record a Tier 2 attempt for publisher cooldown tracking."""
+        try:
+            await self._db.record_publisher_attempt(
+                publisher=publisher,
+                success=success,
+                cooldown_failure_threshold=self._config.get(
+                    "cooldown_failure_threshold", 0.70
+                ),
+                cooldown_window_size=self._config.get(
+                    "cooldown_window_size", 20
+                ),
+                cooldown_minutes=self._config.get(
+                    "cooldown_minutes", 10
+                ),
+            )
+        except Exception as exc:
+            logger.error("Failed to record publisher attempt: %s", exc)
+
+    def _map_nav_error(self, nav_result: Dict[str, Any]) -> str:
+        """Map a safe_navigate error to a FailureCode."""
+        error = nav_result.get("error", "")
+        status = nav_result.get("status")
+
+        if error == "TIMEOUT":
+            return FailureCode.TIMEOUT.value
+        if status == 403:
+            return FailureCode.ACCESS_DENIED.value
+        if status == 404:
+            return FailureCode.NOT_FOUND.value
+        if status == 429:
+            return FailureCode.RATE_LIMITED.value
+        if status and status >= 500:
+            return FailureCode.PUBLISHER_SOFT_BLOCK.value
+        return FailureCode.PUBLISHER_SOFT_BLOCK.value
+
+    # -----------------------------------------------------------------------
+    # Publisher-specific methods (Tier 2)
+    # -----------------------------------------------------------------------
+
+    async def _pub_elsevier(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """Elsevier / ScienceDirect — shadow DOM + iframe handling."""
+        # Strategy 1: Look for PDF link in shadow DOM
+        shadow_el = await self._browser.traverse_shadow_dom(
+            page,
+            "#pdfLink",
+            "a[href*='pdf']",
+        )
+        if shadow_el:
+            try:
+                href = await shadow_el.get_attribute("href")
+                if href:
+                    return href
+            except Exception:
+                pass
+
+        # Strategy 2: Direct PDF download link selectors
+        selectors = [
+            "a.pdf-download[href*='pdf']",
+            "a[id='pdfLink']",
+            "#pdfLink",
+            "a[class*='pdf-download']",
+            "a[href*='/pdfft?']",
+            "a[href*='pii'][href*='pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Strategy 3: Check iframe for embedded PDF viewer
+        iframe_url = await self._browser.extract_from_iframe(
+            page,
+            "iframe[src*='pdf']",
+            "embed[src*='pdf'], object[data*='pdf']",
+            "src",
+        )
+        if iframe_url:
+            return iframe_url
+
+        # Strategy 4: Meta tag fallback
+        return await self._browser.extract_pdf_url_from_page(page)
+
+    async def _pub_springer(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """Springer / SpringerLink — PDF link extraction."""
+        selectors = [
+            "a[data-article-pdf]",
+            "a[href*='/content/pdf/']",
+            "a.c-pdf-download__link",
+            "a[title='Download PDF']",
+            "a[data-test='pdf-link']",
+            "a[href*='.pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Construct PDF URL from article URL
+        if "/article/" in current_url:
+            article_path = current_url.split("/article/")[-1]
+            constructed = f"https://link.springer.com/content/pdf/{article_path}.pdf"
+            return constructed
+
+        return await self._browser.extract_pdf_url_from_page(page)
+
+    async def _pub_wiley(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """Wiley Online Library — PDF link extraction."""
+        selectors = [
+            "a.pdf-download",
+            "a[href*='/pdfdirect/']",
+            "a[href*='/epdf/']",
+            "a[title*='PDF']",
+            "a[class*='epub-section__item__link']",
+            "a[href*='.pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            # Convert epdf to pdfdirect for direct download
+            if "/epdf/" in pdf_url:
+                pdf_url = pdf_url.replace("/epdf/", "/pdfdirect/")
+            return pdf_url
+
+        # Construct from DOI
+        if paper.doi:
+            constructed = f"https://onlinelibrary.wiley.com/doi/pdfdirect/{paper.doi}"
+            return constructed
+
+        return await self._browser.extract_pdf_url_from_page(page)
+
+    async def _pub_nature(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """Nature Publishing Group — PDF link extraction."""
+        selectors = [
+            "a[data-article-pdf]",
+            "a[href*='.pdf']",
+            "a.c-pdf-download__link",
+            "a[data-track-action='download pdf']",
+            "a[class*='download-pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Construct from article URL
+        if "/articles/" in current_url:
+            return current_url.rstrip("/") + ".pdf"
+
+        return await self._browser.extract_pdf_url_from_page(page)
+
+    async def _pub_bmj(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """BMJ — PDF link extraction."""
+        selectors = [
+            "a.article-pdf-download",
+            "a[href*='.full.pdf']",
+            "a[href*='/pdf/']",
+            "a[data-trigger='full-pdf']",
+            "a[class*='pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Construct from content URL
+        if "/content/" in current_url:
+            return current_url.rstrip("/") + ".full.pdf"
+
+        return await self._browser.extract_pdf_url_from_page(page)
+
+    async def _pub_lancet(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """The Lancet — PDF link extraction (Elsevier-owned)."""
+        selectors = [
+            "a.pdf-download",
+            "a[href*='pdfft']",
+            "a[href*='pdf'][class*='download']",
+            "a[id*='pdf']",
+            "a[href*='.pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Lancet uses similar structure to ScienceDirect
+        return await self._pub_elsevier(page, paper, current_url)
+
+    async def _pub_taylor_francis(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """Taylor & Francis Online — PDF link extraction."""
+        selectors = [
+            "a.show-pdf",
+            "a[href*='/pdf/']",
+            "a[class*='pdf-download']",
+            "a[data-id='pdf-link']",
+            "a[href*='.pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Construct PDF URL from DOI page
+        if paper.doi and "/doi/" in current_url:
+            base = current_url.split("/doi/")[0]
+            return f"{base}/doi/pdf/{paper.doi}?needAccess=true"
+
+        return await self._browser.extract_pdf_url_from_page(page)
+
+    async def _pub_sage(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """SAGE Publications — PDF link extraction."""
+        selectors = [
+            "a.pdf-download",
+            "a[href*='/doi/pdf/']",
+            "a[data-item-name='download-PDF']",
+            "a[class*='pdf']",
+            "a[href*='.pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Construct from DOI
+        if paper.doi:
+            return f"https://journals.sagepub.com/doi/pdf/{paper.doi}"
+
+        return await self._browser.extract_pdf_url_from_page(page)
+
+    async def _pub_generic_fallback(
+        self, page: Any, paper: Paper, current_url: str
+    ) -> Optional[str]:
+        """Generic fallback — meta tags + common anchor patterns.
+
+        Used when the publisher is OTHER or when publisher-specific
+        methods fail.
+        """
+        # Strategy 1: Meta tags (most reliable across publishers)
+        pdf_url = await self._browser.extract_pdf_url_from_page(page)
+        if pdf_url:
+            return pdf_url
+
+        # Strategy 2: Common PDF link selectors
+        generic_selectors = [
+            "a[href*='.pdf']",
+            "a[href*='/pdf/']",
+            "a[href*='pdf?']",
+            "a[class*='pdf']",
+            "a[title*='PDF']",
+            "a[title*='pdf']",
+            "a[data-format='pdf']",
+            "button[data-format='pdf']",
+        ]
+        pdf_url = await self._browser.wait_for_pdf_link(
+            page, generic_selectors,
+            timeout_s=self._config.get("selector_timeout_s", DEFAULT_SELECTOR_TIMEOUT_S),
+        )
+        if pdf_url:
+            return pdf_url
+
+        # Strategy 3: Look for download buttons that might trigger JS
+        download_selectors = [
+            "a[download]",
+            "a[href*='download']",
+            "button[class*='download']",
+        ]
+        for selector in download_selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element:
+                    href = await element.get_attribute("href")
+                    if href:
+                        return href
+            except Exception:
+                continue
+
+        return None
