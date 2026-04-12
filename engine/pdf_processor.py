@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import config
 from models.extraction_schema import PDFQuality, ExtractionLocation
@@ -384,7 +384,3 @@ class PDFProcessor:
         if len(combined) > max_chars:
             combined = combined[:max_chars] + "\n[TRUNCATED]"
         return combined
-
-
-# ── Type alias for Any in method signatures ───────────────────────────────────
-from typing import Any  # noqa: E402 — needed for _parse_page_once signature
