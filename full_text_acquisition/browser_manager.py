@@ -569,3 +569,435 @@ class BrowserManager:
         logger.warning("SSO session expired, initiating re-authentication")
         await self.destroy_persistent_context(reason="SESSION_EXPIRED")
         return await self.initiate_sso_login(sso_url)
+
+    # -----------------------------------------------------------------------
+    # Page helpers — CAPTCHA detection
+    # -----------------------------------------------------------------------
+
+    async def detect_captcha(self, page: Any) -> bool:
+        """Check whether the current page contains a CAPTCHA challenge.
+
+        Detection signals:
+            1. Known CAPTCHA iframe selectors (reCAPTCHA, hCaptcha)
+            2. Text patterns indicating bot detection
+
+        Returns True if CAPTCHA is detected.
+        """
+        # Check for CAPTCHA selectors
+        for selector in CAPTCHA_SELECTORS:
+            try:
+                element = await page.query_selector(selector)
+                if element is not None:
+                    logger.info("CAPTCHA detected via selector: %s", selector)
+                    return True
+            except Exception:
+                continue
+
+        # Check page text for CAPTCHA indicators
+        try:
+            body_text = await page.inner_text("body")
+            body_lower = body_text.lower()
+            for pattern in CAPTCHA_TEXT_PATTERNS:
+                if pattern in body_lower:
+                    logger.info(
+                        "CAPTCHA detected via text pattern: '%s'", pattern
+                    )
+                    return True
+        except Exception as exc:
+            logger.debug("Could not read body text for CAPTCHA check: %s", exc)
+
+        return False
+
+    # -----------------------------------------------------------------------
+    # Page helpers — paywall detection
+    # -----------------------------------------------------------------------
+
+    async def detect_paywall(self, page: Any) -> bool:
+        """Check whether the current page shows paywall indicators.
+
+        Scans for:
+            - Text patterns from PAYWALL_INDICATORS
+            - Payment-related DOM elements (purchase buttons, price tags)
+
+        Returns True if paywall is detected.
+        """
+        # Check text indicators
+        try:
+            body_text = await page.inner_text("body")
+            body_lower = body_text.lower()
+            for indicator in PAYWALL_INDICATORS:
+                if indicator.lower() in body_lower:
+                    logger.debug(
+                        "Paywall detected via text: '%s'", indicator
+                    )
+                    return True
+        except Exception as exc:
+            logger.debug("Could not read body text for paywall check: %s", exc)
+
+        # Check for payment DOM elements
+        payment_selectors = [
+            "button[class*='purchase']",
+            "button[class*='buy']",
+            "a[class*='purchase']",
+            "a[class*='buy-article']",
+            "[class*='paywall']",
+            "[class*='pay-wall']",
+            "[id*='paywall']",
+            "[data-testid*='purchase']",
+            ".price-tag",
+            ".article-purchase",
+            ".subscription-required",
+        ]
+        for selector in payment_selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element is not None:
+                    logger.debug(
+                        "Paywall detected via DOM element: %s", selector
+                    )
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    # -----------------------------------------------------------------------
+    # Page helpers — navigation utilities
+    # -----------------------------------------------------------------------
+
+    async def safe_navigate(
+        self,
+        page: Any,
+        url: str,
+        timeout_s: float = DEFAULT_PAGE_LOAD_TIMEOUT_S,
+        wait_until: str = "domcontentloaded",
+    ) -> Dict[str, Any]:
+        """Navigate to a URL with timeout and comprehensive error handling.
+
+        Returns a dict with:
+            success: bool
+            status: int or None (HTTP status code)
+            url: str (final URL after redirects)
+            error: str or None
+            content_type: str or None
+        """
+        result: Dict[str, Any] = {
+            "success": False,
+            "status": None,
+            "url": url,
+            "error": None,
+            "content_type": None,
+        }
+
+        try:
+            response = await page.goto(
+                url,
+                timeout=timeout_s * 1000,
+                wait_until=wait_until,
+            )
+
+            if response is not None:
+                result["status"] = response.status
+                result["url"] = page.url
+                headers = response.headers
+                result["content_type"] = headers.get("content-type", "")
+
+                if 200 <= response.status < 400:
+                    result["success"] = True
+                else:
+                    result["error"] = f"HTTP {response.status}"
+            else:
+                result["url"] = page.url
+                result["success"] = True
+
+        except Exception as exc:
+            exc_name = type(exc).__name__
+            if "Timeout" in exc_name or "timeout" in str(exc).lower():
+                result["error"] = "TIMEOUT"
+            elif "net::ERR_" in str(exc):
+                result["error"] = f"NETWORK_ERROR: {exc}"
+            else:
+                result["error"] = f"{exc_name}: {exc}"
+            logger.debug(
+                "Navigation to %s failed: %s", url, result["error"]
+            )
+
+        return result
+
+    async def wait_for_pdf_link(
+        self,
+        page: Any,
+        selectors: List[str],
+        timeout_s: float = DEFAULT_SELECTOR_TIMEOUT_S,
+    ) -> Optional[str]:
+        """Wait for any of the given selectors to appear and extract a PDF link.
+
+        Tries each selector in order. Returns the href/src of the first
+        matching element, or None if none found within timeout.
+        """
+        for selector in selectors:
+            try:
+                element = await page.wait_for_selector(
+                    selector,
+                    timeout=timeout_s * 1000,
+                    state="attached",
+                )
+                if element is None:
+                    continue
+
+                # Try href first, then src, then data-url
+                for attr in ("href", "src", "data-url", "data-pdf-url"):
+                    value = await element.get_attribute(attr)
+                    if value and (".pdf" in value.lower() or "pdf" in value.lower()):
+                        logger.debug(
+                            "PDF link found via selector '%s': %s",
+                            selector, value,
+                        )
+                        return value
+
+                # If no PDF-specific attribute, still return href
+                href = await element.get_attribute("href")
+                if href:
+                    return href
+
+            except Exception:
+                continue
+
+        return None
+
+    async def extract_pdf_url_from_page(self, page: Any) -> Optional[str]:
+        """Attempt to find a PDF download URL on the current page.
+
+        Searches through multiple strategies:
+            1. Meta tags (citation_pdf_url, etc.)
+            2. Link elements with PDF types
+            3. Anchor tags with PDF patterns
+            4. Embedded object/embed elements
+
+        Returns the first PDF URL found, or None.
+        """
+        strategies = [
+            # Meta tags — most reliable
+            (
+                "meta[name='citation_pdf_url']",
+                "content",
+            ),
+            (
+                "meta[name='citation_pdf']",
+                "content",
+            ),
+            (
+                "meta[property='citation_pdf_url']",
+                "content",
+            ),
+            (
+                "meta[name='dc.identifier'][scheme='doi']",
+                None,
+            ),
+            # Link elements
+            (
+                "link[type='application/pdf']",
+                "href",
+            ),
+            # Anchor patterns
+            (
+                "a[href*='.pdf']",
+                "href",
+            ),
+            (
+                "a[href*='/pdf/']",
+                "href",
+            ),
+            (
+                "a[href*='pdf?']",
+                "href",
+            ),
+            (
+                "a[data-article-pdf]",
+                "href",
+            ),
+            (
+                "a.pdf-download",
+                "href",
+            ),
+            (
+                "a[class*='pdf']",
+                "href",
+            ),
+            # Embedded objects
+            (
+                "embed[type='application/pdf']",
+                "src",
+            ),
+            (
+                "object[type='application/pdf']",
+                "data",
+            ),
+            (
+                "iframe[src*='.pdf']",
+                "src",
+            ),
+        ]
+
+        for selector, attr in strategies:
+            try:
+                element = await page.query_selector(selector)
+                if element is None:
+                    continue
+
+                if attr is None:
+                    continue
+
+                value = await element.get_attribute(attr)
+                if value:
+                    # Resolve relative URLs
+                    if value.startswith("/"):
+                        base_url = page.url
+                        from urllib.parse import urljoin
+                        value = urljoin(base_url, value)
+                    logger.debug(
+                        "PDF URL extracted via '%s': %s", selector, value
+                    )
+                    return value
+            except Exception:
+                continue
+
+        return None
+
+    async def traverse_shadow_dom(
+        self,
+        page: Any,
+        host_selector: str,
+        inner_selector: str,
+    ) -> Optional[Any]:
+        """Traverse into a shadow DOM to find an inner element.
+
+        Used primarily for Elsevier/ScienceDirect which uses
+        shadow DOM for PDF viewer components.
+
+        Args:
+            page: The Playwright page.
+            host_selector: CSS selector for the shadow host element.
+            inner_selector: CSS selector within the shadow root.
+
+        Returns the inner element handle, or None.
+        """
+        try:
+            host = await page.query_selector(host_selector)
+            if host is None:
+                return None
+
+            # Evaluate in page context to pierce shadow DOM
+            inner = await page.evaluate_handle(
+                """([hostEl, innerSel]) => {
+                    const shadow = hostEl.shadowRoot;
+                    if (!shadow) return null;
+                    return shadow.querySelector(innerSel);
+                }""",
+                [host, inner_selector],
+            )
+
+            # Check if result is null
+            is_null = await page.evaluate("(el) => el === null", inner)
+            if is_null:
+                return None
+
+            return inner
+        except Exception as exc:
+            logger.debug(
+                "Shadow DOM traversal failed (%s > %s): %s",
+                host_selector, inner_selector, exc,
+            )
+            return None
+
+    async def extract_from_iframe(
+        self,
+        page: Any,
+        iframe_selector: str,
+        inner_selector: str,
+        attribute: str = "href",
+    ) -> Optional[str]:
+        """Extract a value from an element inside an iframe.
+
+        Args:
+            page: The Playwright page.
+            iframe_selector: CSS selector for the iframe element.
+            inner_selector: CSS selector for the target inside the iframe.
+            attribute: Attribute to extract from the inner element.
+
+        Returns the attribute value, or None.
+        """
+        try:
+            iframe_element = await page.query_selector(iframe_selector)
+            if iframe_element is None:
+                return None
+
+            frame = await iframe_element.content_frame()
+            if frame is None:
+                return None
+
+            element = await frame.query_selector(inner_selector)
+            if element is None:
+                return None
+
+            value = await element.get_attribute(attribute)
+            return value
+        except Exception as exc:
+            logger.debug(
+                "Iframe extraction failed (%s > %s): %s",
+                iframe_selector, inner_selector, exc,
+            )
+            return None
+
+    async def intercept_pdf_download(
+        self,
+        page: Any,
+        trigger_action: Any,
+        timeout_s: float = 30.0,
+    ) -> Optional[bytes]:
+        """Intercept a PDF download triggered by a page action.
+
+        Some publishers don't expose direct PDF URLs but instead trigger
+        a download via JavaScript. This method intercepts the download
+        event to capture the PDF bytes.
+
+        Args:
+            page: The Playwright page.
+            trigger_action: An async callable that triggers the download
+                (e.g., clicking a button).
+            timeout_s: How long to wait for the download to start.
+
+        Returns the downloaded bytes, or None on failure.
+        """
+        try:
+            async with page.expect_download(
+                timeout=timeout_s * 1000
+            ) as download_info:
+                await trigger_action()
+
+            download = download_info.value
+            tmp_path = await download.path()
+            if tmp_path is None:
+                logger.debug("Download intercepted but no file path returned")
+                return None
+
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+
+            # Clean up temp file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            logger.debug(
+                "PDF download intercepted: %d bytes", len(data)
+            )
+            return data
+
+        except Exception as exc:
+            logger.debug(
+                "PDF download interception failed: %s: %s",
+                type(exc).__name__, exc,
+            )
+            return None
