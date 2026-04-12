@@ -268,3 +268,151 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "scholar_min_delay_s": SCHOLAR_MIN_DELAY_S,
     "scholar_max_queries_per_paper": SCHOLAR_MAX_QUERIES_PER_PAPER,
 }
+
+
+# ===========================================================================
+# ENUMS
+# ===========================================================================
+
+
+class PaperState(str, enum.Enum):
+    """Global state machine states for each paper."""
+
+    INGESTED = "INGESTED"
+    NORMALIZED = "NORMALIZED"
+    ENRICHED = "ENRICHED"
+    IDENTITY_ASSIGNED = "IDENTITY_ASSIGNED"
+    READY_FOR_RETRIEVAL = "READY_FOR_RETRIEVAL"
+    RETRIEVING = "RETRIEVING"
+    RETRIEVED = "RETRIEVED"
+    VALIDATING = "VALIDATING"
+    VALIDATED = "VALIDATED"
+    COMPLETE = "COMPLETE"
+    FAILED = "FAILED"
+    MANUAL_REQUIRED = "MANUAL_REQUIRED"
+    DUPLICATE = "DUPLICATE"
+    ALREADY_RETRIEVED = "ALREADY_RETRIEVED"
+
+
+class PublisherEnum(str, enum.Enum):
+    """Known publisher identifiers for Tier 2 routing."""
+
+    ELSEVIER = "ELSEVIER"
+    SPRINGER = "SPRINGER"
+    WILEY = "WILEY"
+    NATURE = "NATURE"
+    BMJ = "BMJ"
+    LANCET = "LANCET"
+    TAYLOR_FRANCIS = "TAYLOR_FRANCIS"
+    SAGE = "SAGE"
+    OTHER = "OTHER"
+
+
+class TierEnum(str, enum.Enum):
+    """Retrieval tier identifiers."""
+
+    TIER_0 = "TIER_0"      # Unpaywall (pure HTTP)
+    TIER_1 = "TIER_1"      # Open Access APIs (pure HTTP)
+    TIER_2 = "TIER_2"      # Publisher-aware direct (Playwright headless)
+    TIER_3 = "TIER_3"      # Institutional SSO (Playwright headed)
+    TIER_3_5 = "TIER_3_5"  # Scholar-assisted retrieval (SSO session)
+    TIER_4 = "TIER_4"      # Manual flag
+
+
+class FailureCode(str, enum.Enum):
+    """Complete failure taxonomy — every possible failure reason."""
+
+    NO_DOI = "NO_DOI"
+    NO_OA_SOURCE = "NO_OA_SOURCE"
+    PUBLISHER_SOFT_BLOCK = "PUBLISHER_SOFT_BLOCK"
+    PAYWALL_DETECTED = "PAYWALL_DETECTED"
+    ACCESS_DENIED = "ACCESS_DENIED"
+    NOT_FOUND = "NOT_FOUND"
+    RATE_LIMITED = "RATE_LIMITED"
+    SSO_FAILED = "SSO_FAILED"
+    SESSION_EXPIRED = "SESSION_EXPIRED"
+    SCHOLAR_BLOCKED = "SCHOLAR_BLOCKED"
+    CAPTCHA_ENCOUNTERED = "CAPTCHA_ENCOUNTERED"
+    PDF_INVALID = "PDF_INVALID"
+    SIZE_TOO_SMALL = "SIZE_TOO_SMALL"
+    IMAGE_ONLY_SCAN = "IMAGE_ONLY_SCAN"
+    IMAGE_UNREADABLE = "IMAGE_UNREADABLE"
+    CORRUPTED = "CORRUPTED"
+    HTML_DISGUISED_AS_PDF = "HTML_DISGUISED_AS_PDF"
+    VERSION_MISMATCH = "VERSION_MISMATCH"
+    CONTENT_UNVERIFIED = "CONTENT_UNVERIFIED"
+    CONTENT_UPDATED = "CONTENT_UPDATED"
+    CONTENT_UNCHANGED = "CONTENT_UNCHANGED"
+    INCOMPLETE_DOWNLOAD = "INCOMPLETE_DOWNLOAD"
+    FILE_MISSING = "FILE_MISSING"
+    METADATA_MISSING = "METADATA_MISSING"
+    TIMEOUT = "TIMEOUT"
+    MANUAL_REQUIRED = "MANUAL_REQUIRED"
+    INTERRUPTED_RESET = "INTERRUPTED_RESET"
+    STATE_MACHINE_ERROR = "STATE_MACHINE_ERROR"
+    SUPPLEMENT_NON_PDF = "SUPPLEMENT_NON_PDF"
+    ALREADY_RETRIEVED = "ALREADY_RETRIEVED"
+    REUSED = "REUSED"
+    PUBLISHER_COOLDOWN_ACTIVE = "PUBLISHER_COOLDOWN_ACTIVE"
+    COOLDOWN_EXTENDED = "COOLDOWN_EXTENDED"
+
+
+class ValidationStatus(str, enum.Enum):
+    """Final validation status after Step 3 checks."""
+
+    VALID = "VALID"                          # DOI verified
+    VALID_TITLE = "VALID_TITLE"              # Title verified (≥85% fuzzy)
+    VALID_OCR = "VALID_OCR"                  # OCR applied, then verified
+    PARTIAL_SIZE = "PARTIAL_SIZE"            # File size < 50KB
+    PARTIAL_IMAGE = "PARTIAL_IMAGE"          # Image-only, OCR unavailable
+    PARTIAL_OCR = "PARTIAL_OCR"              # OCR applied, confirmed
+    PARTIAL_IDENTITY = "PARTIAL_IDENTITY"    # Title match only
+    VERSION_MISMATCH = "VERSION_MISMATCH"    # Different DOI found in PDF
+    CONTENT_UNVERIFIED = "CONTENT_UNVERIFIED"  # No DOI or title match
+    CONTENT_UPDATED = "CONTENT_UPDATED"      # Hash differs from baseline
+    INVALID = "INVALID"                      # Terminal failure (corrupt/HTML/wrong)
+
+
+class IdentityStatus(str, enum.Enum):
+    """Result of metadata-DOI cross-check (Check 6)."""
+
+    DOI_VERIFIED = "DOI_VERIFIED"
+    TITLE_VERIFIED = "TITLE_VERIFIED"
+    VERSION_MISMATCH = "VERSION_MISMATCH"
+    CONTENT_UNVERIFIED = "CONTENT_UNVERIFIED"
+
+
+class VersionType(str, enum.Enum):
+    """Detected version classification (Step 3.5)."""
+
+    PREPRINT = "PREPRINT"
+    ACCEPTED_MANUSCRIPT = "ACCEPTED_MANUSCRIPT"
+    PUBLISHED_VERSION = "PUBLISHED_VERSION"
+    SUPPLEMENTARY = "SUPPLEMENTARY"
+    UNKNOWN = "UNKNOWN"
+
+
+class ContentDriftStatus(str, enum.Enum):
+    """SHA-256 content drift detection result (Check 7)."""
+
+    CONTENT_UNCHANGED = "CONTENT_UNCHANGED"
+    CONTENT_UPDATED = "CONTENT_UPDATED"
+    REUSED = "REUSED"
+    FIRST_RETRIEVAL = "FIRST_RETRIEVAL"
+
+
+class ConfidenceLevel(str, enum.Enum):
+    """Integrity score confidence band."""
+
+    HIGH = "HIGH"      # 80–100 (green)
+    MEDIUM = "MEDIUM"  # 50–79  (amber)
+    LOW = "LOW"        # 0–49   (red)
+
+
+class RunStatus(str, enum.Enum):
+    """Status of a retrieval run."""
+
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
