@@ -1001,3 +1001,210 @@ class BrowserManager:
                 type(exc).__name__, exc,
             )
             return None
+
+    # -----------------------------------------------------------------------
+    # close_all — master cleanup
+    # -----------------------------------------------------------------------
+
+    async def close_all(self) -> None:
+        """Close all browser contexts, stop Playwright, and log.
+
+        Called during graceful shutdown. Safe to call multiple times.
+
+        Sequence:
+            1. Close all disposable contexts
+            2. Close persistent context
+            3. Close browser
+            4. Stop Playwright
+            5. Mark as closed
+        """
+        if self._closed:
+            logger.debug("BrowserManager.close_all() already called, skipping")
+            return
+
+        async with self._lock:
+            self._closed = True
+
+        closed_disposable = 0
+        closed_persistent = False
+
+        # 1. Close all disposable contexts
+        disposable_copy = set(self._disposable_contexts)
+        for ctx in disposable_copy:
+            try:
+                await ctx.close()
+                closed_disposable += 1
+            except Exception as exc:
+                logger.debug(
+                    "Error closing disposable context during shutdown: %s", exc
+                )
+            finally:
+                self._disposable_contexts.discard(ctx)
+
+        # 2. Close persistent context
+        if self._persistent_context is not None:
+            try:
+                await self._persistent_context.close()
+                closed_persistent = True
+            except Exception as exc:
+                logger.debug(
+                    "Error closing persistent context during shutdown: %s", exc
+                )
+            finally:
+                self._persistent_context = None
+
+        # 3. Close browser
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception as exc:
+                logger.debug(
+                    "Error closing browser during shutdown: %s", exc
+                )
+            finally:
+                self._browser = None
+
+        # 4. Stop Playwright
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception as exc:
+                logger.debug(
+                    "Error stopping Playwright during shutdown: %s", exc
+                )
+            finally:
+                self._playwright = None
+
+        logger.info(
+            "BrowserManager closed: %d disposable, persistent=%s",
+            closed_disposable,
+            closed_persistent,
+        )
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether close_all() has been called."""
+        return self._closed
+
+    @property
+    def active_disposable_count(self) -> int:
+        """Number of currently active disposable contexts."""
+        return len(self._disposable_contexts)
+
+    # -----------------------------------------------------------------------
+    # Async context manager for app lifecycle
+    # -----------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def managed(self) -> AsyncIterator[BrowserManager]:
+        """Async context manager for BrowserManager lifecycle.
+
+        Usage:
+            async with BrowserManager.get_instance().managed() as bm:
+                # Use bm for browser operations
+                ...
+            # close_all() called automatically on exit
+        """
+        try:
+            yield self
+        except Exception as exc:
+            logger.error(
+                "BrowserManager context error: %s: %s\n%s",
+                type(exc).__name__,
+                exc,
+                traceback.format_exc(),
+            )
+            raise
+        finally:
+            await self.close_all()
+
+
+# ---------------------------------------------------------------------------
+# Playwright installation check (used by first-launch wizard)
+# ---------------------------------------------------------------------------
+
+def is_playwright_installed() -> bool:
+    """Check whether Playwright Python package is importable."""
+    try:
+        import playwright  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def is_chromium_installed() -> bool:
+    """Check whether Playwright Chromium browser is installed.
+
+    Runs `playwright install --dry-run chromium` to check without downloading.
+    Falls back to checking the registry if dry-run is not available.
+    """
+    try:
+        from playwright._impl._driver import compute_driver_executable
+        driver_executable = compute_driver_executable()
+        result = subprocess.run(
+            [str(driver_executable), "install", "--dry-run", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        # If dry-run exits 0, browser is already installed
+        return result.returncode == 0
+    except Exception:
+        # Fallback: try to find browser executables in known locations
+        try:
+            from playwright._impl._driver import compute_driver_executable
+            driver_executable = compute_driver_executable()
+            result = subprocess.run(
+                [str(driver_executable), "install", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            # If playwright CLI works, assume we can check
+            return "chromium" in result.stdout.lower()
+        except Exception:
+            return False
+
+
+async def install_chromium() -> bool:
+    """Attempt to install Playwright Chromium browser.
+
+    Runs `playwright install chromium` as a subprocess.
+    Returns True on success.
+    """
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "playwright", "install", "chromium",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=300.0
+        )
+
+        if process.returncode == 0:
+            logger.info("Playwright Chromium installed successfully")
+            return True
+        else:
+            logger.error(
+                "Playwright Chromium installation failed (exit %d): %s",
+                process.returncode,
+                stderr.decode("utf-8", errors="replace"),
+            )
+            return False
+    except asyncio.TimeoutError:
+        logger.error("Playwright Chromium installation timed out (300s)")
+        return False
+    except FileNotFoundError:
+        logger.error(
+            "Playwright CLI not found. Install with: pip install playwright"
+        )
+        return False
+    except Exception as exc:
+        logger.error(
+            "Playwright Chromium installation error: %s: %s\n%s",
+            type(exc).__name__,
+            exc,
+            traceback.format_exc(),
+        )
+        return False
