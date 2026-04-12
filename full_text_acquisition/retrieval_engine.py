@@ -2620,3 +2620,662 @@ class RetrievalEngine:
             return "txt"
         # Default to pdf for unknown
         return "pdf"
+
+    # ===================================================================
+    # STEP 3 — PDF Validation & Integrity
+    # ===================================================================
+
+    async def validate_pdf(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[str, str]:
+        """Run the full 7-check validation pipeline on a retrieved PDF.
+
+        State: RETRIEVED → VALIDATING → VALIDATED (or FAILED).
+
+        Returns:
+            Tuple of (validation_status, identity_status).
+        """
+        pdf_path = paper.pdf_path
+        if not pdf_path or not os.path.isfile(pdf_path):
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                method="validate",
+                outcome="FILE_MISSING",
+                failure_code=FailureCode.FILE_MISSING.value,
+            )
+            return ValidationStatus.INVALID.value, IdentityStatus.CONTENT_UNVERIFIED.value
+
+        start_ms = time.monotonic() * 1000
+
+        try:
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
+        except Exception as exc:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                method="validate_read",
+                outcome="READ_FAILED",
+                failure_code=FailureCode.CORRUPTED.value,
+                exc=exc,
+            )
+            return ValidationStatus.INVALID.value, IdentityStatus.CONTENT_UNVERIFIED.value
+
+        # CHECK 1: File size > 50KB
+        check1_ok, check1_detail = self._check1_file_size(pdf_bytes)
+        await self._log_validation_check(
+            paper.canonical_id, run_id, "CHECK_1_SIZE",
+            check1_ok, check1_detail, start_ms,
+        )
+        if not check1_ok:
+            return ValidationStatus.PARTIAL_SIZE.value, IdentityStatus.CONTENT_UNVERIFIED.value
+
+        # CHECK 2: Magic bytes (%PDF)
+        check2_ok, check2_detail = self._check2_magic_bytes(pdf_bytes)
+        await self._log_validation_check(
+            paper.canonical_id, run_id, "CHECK_2_MAGIC",
+            check2_ok, check2_detail, start_ms,
+        )
+        if not check2_ok:
+            return ValidationStatus.INVALID.value, IdentityStatus.CONTENT_UNVERIFIED.value
+
+        # CHECK 3: HTML disguise
+        check3_ok, check3_detail = self._check3_html_disguise(pdf_bytes)
+        await self._log_validation_check(
+            paper.canonical_id, run_id, "CHECK_3_HTML",
+            check3_ok, check3_detail, start_ms,
+        )
+        if not check3_ok:
+            return ValidationStatus.INVALID.value, IdentityStatus.CONTENT_UNVERIFIED.value
+
+        # CHECK 4: PDF parsability
+        check4_ok, page_count, check4_detail = await self._check4_parsability(
+            pdf_path, paper.canonical_id, run_id, start_ms
+        )
+        if not check4_ok:
+            return ValidationStatus.INVALID.value, IdentityStatus.CONTENT_UNVERIFIED.value
+
+        # Update page count
+        await self._db.update_paper_fields(
+            paper.canonical_id, pdf_page_count=page_count
+        )
+
+        # CHECK 5: Text extraction
+        extracted_text, check5_ok = await self._check5_text_extraction(
+            pdf_path, paper.canonical_id, run_id, start_ms
+        )
+
+        ocr_applied = False
+        if not check5_ok:
+            # CHECK 5b: OCR fallback
+            if self.tesseract_available and self.ghostscript_available:
+                extracted_text, ocr_ok = await self._check5b_ocr(
+                    pdf_path, paper.canonical_id, run_id, start_ms
+                )
+                if ocr_ok and extracted_text:
+                    ocr_applied = True
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        ocr_applied=True,
+                        ocr_text_extracted=True,
+                    )
+                else:
+                    # IMAGE_UNREADABLE
+                    await self._log_validation_check(
+                        paper.canonical_id, run_id, "CHECK_5B_OCR",
+                        False, "OCR produced no text", start_ms,
+                    )
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        ocr_applied=True,
+                        ocr_text_extracted=False,
+                    )
+                    return (
+                        ValidationStatus.PARTIAL_IMAGE.value,
+                        IdentityStatus.CONTENT_UNVERIFIED.value,
+                    )
+            elif self.tesseract_available:
+                # ghostscript missing — try pytesseract directly
+                extracted_text, ocr_ok = await self._check5b_ocr_tesseract_only(
+                    pdf_path, paper.canonical_id, run_id, start_ms
+                )
+                if ocr_ok and extracted_text:
+                    ocr_applied = True
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        ocr_applied=True,
+                        ocr_text_extracted=True,
+                    )
+                else:
+                    return (
+                        ValidationStatus.PARTIAL_IMAGE.value,
+                        IdentityStatus.CONTENT_UNVERIFIED.value,
+                    )
+            else:
+                # OCR unavailable
+                await self._log_validation_check(
+                    paper.canonical_id, run_id, "CHECK_5_TEXT",
+                    False, "No text extracted, OCR unavailable", start_ms,
+                )
+                return (
+                    ValidationStatus.PARTIAL_IMAGE.value,
+                    IdentityStatus.CONTENT_UNVERIFIED.value,
+                )
+
+        # CHECK 6: Metadata-DOI cross-check
+        identity_status = await self._check6_identity(
+            extracted_text, paper, run_id, start_ms
+        )
+
+        # CHECK 7: SHA-256 + content drift detection
+        content_drift = await self._check7_content_drift(
+            pdf_bytes, paper, run_id, start_ms
+        )
+
+        # Determine final validation status
+        validation_status = self._determine_validation_status(
+            identity_status, ocr_applied, content_drift
+        )
+
+        elapsed_ms = (time.monotonic() * 1000) - start_ms
+        await self._log(
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            method="validate_complete",
+            outcome=validation_status,
+            execution_time_ms=elapsed_ms,
+            details={
+                "identity": identity_status,
+                "ocr_applied": ocr_applied,
+                "content_drift": content_drift,
+                "page_count": page_count,
+            },
+        )
+
+        return validation_status, identity_status
+
+    # -----------------------------------------------------------------------
+    # Individual validation checks
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _check1_file_size(data: bytes) -> Tuple[bool, str]:
+        """CHECK 1: File size > 50KB."""
+        size = len(data)
+        if size < MIN_PDF_SIZE_BYTES:
+            return False, f"File size {size} bytes < minimum {MIN_PDF_SIZE_BYTES}"
+        return True, f"File size {size} bytes OK"
+
+    @staticmethod
+    def _check2_magic_bytes(data: bytes) -> Tuple[bool, str]:
+        """CHECK 2: PDF magic bytes (%PDF)."""
+        if pdf_magic_bytes_valid(data):
+            return True, "Magic bytes %PDF present"
+        header = data[:4].hex() if len(data) >= 4 else "empty"
+        return False, f"Invalid magic bytes: {header}"
+
+    @staticmethod
+    def _check3_html_disguise(data: bytes) -> Tuple[bool, str]:
+        """CHECK 3: HTML disguised as PDF."""
+        if looks_like_html(data):
+            return False, "File contains HTML content disguised as PDF"
+        return True, "No HTML disguise detected"
+
+    async def _check4_parsability(
+        self,
+        pdf_path: str,
+        canonical_id: str,
+        run_id: str,
+        start_ms: float,
+    ) -> Tuple[bool, int, str]:
+        """CHECK 4: PDF parsability — can we open and count pages?
+
+        Returns (ok, page_count, detail).
+        """
+        try:
+            import fitz  # PyMuPDF
+
+            doc = fitz.open(pdf_path)
+            page_count = len(doc)
+            doc.close()
+
+            if page_count == 0:
+                await self._log_validation_check(
+                    canonical_id, run_id, "CHECK_4_PARSE",
+                    False, "PDF has 0 pages", start_ms,
+                )
+                return False, 0, "PDF has 0 pages"
+
+            await self._log_validation_check(
+                canonical_id, run_id, "CHECK_4_PARSE",
+                True, f"PDF parsable, {page_count} pages", start_ms,
+            )
+            return True, page_count, f"{page_count} pages"
+
+        except ImportError:
+            # PyMuPDF not available, try pypdf
+            try:
+                from pypdf import PdfReader
+
+                reader = PdfReader(pdf_path)
+                page_count = len(reader.pages)
+
+                if page_count == 0:
+                    await self._log_validation_check(
+                        canonical_id, run_id, "CHECK_4_PARSE",
+                        False, "PDF has 0 pages", start_ms,
+                    )
+                    return False, 0, "PDF has 0 pages"
+
+                await self._log_validation_check(
+                    canonical_id, run_id, "CHECK_4_PARSE",
+                    True, f"PDF parsable, {page_count} pages", start_ms,
+                )
+                return True, page_count, f"{page_count} pages"
+
+            except Exception as exc:
+                await self._log_validation_check(
+                    canonical_id, run_id, "CHECK_4_PARSE",
+                    False, f"Parse failed: {type(exc).__name__}: {exc}", start_ms,
+                )
+                return False, 0, f"CORRUPTED: {exc}"
+
+        except Exception as exc:
+            await self._log_validation_check(
+                canonical_id, run_id, "CHECK_4_PARSE",
+                False, f"Parse failed: {type(exc).__name__}: {exc}", start_ms,
+            )
+            return False, 0, f"CORRUPTED: {exc}"
+
+    async def _check5_text_extraction(
+        self,
+        pdf_path: str,
+        canonical_id: str,
+        run_id: str,
+        start_ms: float,
+    ) -> Tuple[str, bool]:
+        """CHECK 5: Extract text from first 3 pages.
+
+        Returns (extracted_text, has_text).
+        """
+        text = ""
+        try:
+            try:
+                import fitz
+
+                doc = fitz.open(pdf_path)
+                pages_to_read = min(3, len(doc))
+                for i in range(pages_to_read):
+                    page_text = doc[i].get_text()
+                    text += page_text + "\n"
+                doc.close()
+
+            except ImportError:
+                from pypdf import PdfReader
+
+                reader = PdfReader(pdf_path)
+                pages_to_read = min(3, len(reader.pages))
+                for i in range(pages_to_read):
+                    page_text = reader.pages[i].extract_text() or ""
+                    text += page_text + "\n"
+
+        except Exception as exc:
+            await self._log_validation_check(
+                canonical_id, run_id, "CHECK_5_TEXT",
+                False, f"Text extraction error: {exc}", start_ms,
+            )
+            return "", False
+
+        text = text.strip()
+        has_text = len(text) > 50  # More than trivial content
+
+        await self._log_validation_check(
+            canonical_id, run_id, "CHECK_5_TEXT",
+            has_text,
+            f"Extracted {len(text)} chars" if has_text else "No meaningful text",
+            start_ms,
+        )
+
+        return text, has_text
+
+    async def _check5b_ocr(
+        self,
+        pdf_path: str,
+        canonical_id: str,
+        run_id: str,
+        start_ms: float,
+    ) -> Tuple[str, bool]:
+        """CHECK 5b: OCR via ocrmypdf (requires tesseract + ghostscript).
+
+        Runs ocrmypdf on page 1, saves searchable PDF as stored copy.
+        Returns (extracted_text, success).
+        """
+        try:
+            import subprocess
+
+            output_path = pdf_path  # Overwrite with searchable version
+            ocr_timeout = self._config.get(
+                "ocr_per_page_timeout_s", DEFAULT_OCR_PER_PAGE_TIMEOUT_S
+            )
+
+            process = await asyncio.create_subprocess_exec(
+                "ocrmypdf",
+                "--pages", "1",
+                "--skip-text",
+                "--force-ocr",
+                "--output-type", "pdf",
+                pdf_path, output_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=ocr_timeout
+            )
+
+            if process.returncode != 0:
+                await self._log_validation_check(
+                    canonical_id, run_id, "CHECK_5B_OCR",
+                    False,
+                    f"ocrmypdf failed (exit {process.returncode}): "
+                    f"{stderr.decode('utf-8', errors='replace')[:200]}",
+                    start_ms,
+                )
+                return "", False
+
+            # Extract text from the now-searchable PDF
+            text, has_text = await self._check5_text_extraction(
+                output_path, canonical_id, run_id, start_ms
+            )
+
+            await self._log_validation_check(
+                canonical_id, run_id, "CHECK_5B_OCR",
+                has_text,
+                f"OCR extracted {len(text)} chars" if has_text else "OCR: no text",
+                start_ms,
+            )
+
+            return text, has_text
+
+        except asyncio.TimeoutError:
+            await self._log_validation_check(
+                canonical_id, run_id, "CHECK_5B_OCR",
+                False, "OCR timed out", start_ms,
+            )
+            return "", False
+        except Exception as exc:
+            await self._log_validation_check(
+                canonical_id, run_id, "CHECK_5B_OCR",
+                False, f"OCR error: {type(exc).__name__}: {exc}", start_ms,
+            )
+            return "", False
+
+    async def _check5b_ocr_tesseract_only(
+        self,
+        pdf_path: str,
+        canonical_id: str,
+        run_id: str,
+        start_ms: float,
+    ) -> Tuple[str, bool]:
+        """CHECK 5b fallback: OCR with pytesseract only (no ghostscript).
+
+        Converts first page to image, then runs tesseract.
+        Returns (extracted_text, success).
+        """
+        try:
+            try:
+                import fitz
+
+                doc = fitz.open(pdf_path)
+                if len(doc) == 0:
+                    doc.close()
+                    return "", False
+
+                page = doc[0]
+                pix = page.get_pixmap(dpi=300)
+                img_bytes = pix.tobytes("png")
+                doc.close()
+
+            except ImportError:
+                # Cannot render without PyMuPDF
+                await self._log_validation_check(
+                    canonical_id, run_id, "CHECK_5B_TESSERACT",
+                    False, "PyMuPDF not available for image rendering", start_ms,
+                )
+                return "", False
+
+            # Run tesseract on the image
+            try:
+                from PIL import Image
+                import pytesseract
+
+                img = Image.open(io.BytesIO(img_bytes))
+                text = pytesseract.image_to_string(img)
+                text = text.strip()
+                has_text = len(text) > 50
+
+                await self._log_validation_check(
+                    canonical_id, run_id, "CHECK_5B_TESSERACT",
+                    has_text,
+                    f"Tesseract extracted {len(text)} chars"
+                    if has_text else "Tesseract: no text",
+                    start_ms,
+                )
+                return text, has_text
+
+            except ImportError:
+                await self._log_validation_check(
+                    canonical_id, run_id, "CHECK_5B_TESSERACT",
+                    False, "pytesseract not installed", start_ms,
+                )
+                return "", False
+
+        except Exception as exc:
+            await self._log_validation_check(
+                canonical_id, run_id, "CHECK_5B_TESSERACT",
+                False, f"Tesseract error: {exc}", start_ms,
+            )
+            return "", False
+
+    async def _check6_identity(
+        self,
+        extracted_text: str,
+        paper: Paper,
+        run_id: str,
+        start_ms: float,
+    ) -> str:
+        """CHECK 6: Metadata-DOI cross-check.
+
+        Searches first 3 pages text + PDF metadata for target DOI.
+
+        Returns IdentityStatus value.
+        """
+        text_lower = extracted_text.lower()
+
+        # Search for target DOI in text
+        if paper.doi:
+            doi_lower = paper.doi.lower()
+            if doi_lower in text_lower:
+                await self._log_validation_check(
+                    paper.canonical_id, run_id, "CHECK_6_IDENTITY",
+                    True, "DOI found in PDF text", start_ms,
+                )
+                return IdentityStatus.DOI_VERIFIED.value
+
+            # Check for DOI URL form
+            doi_url_form = f"doi.org/{doi_lower}"
+            if doi_url_form in text_lower:
+                await self._log_validation_check(
+                    paper.canonical_id, run_id, "CHECK_6_IDENTITY",
+                    True, "DOI URL found in PDF text", start_ms,
+                )
+                return IdentityStatus.DOI_VERIFIED.value
+
+        # Check if a DIFFERENT DOI is found (VERSION_MISMATCH)
+        doi_pattern = re.compile(r'10\.\d{4,9}/[^\s]+')
+        found_dois = doi_pattern.findall(text_lower)
+        if paper.doi and found_dois:
+            # Filter out the target DOI
+            other_dois = [d for d in found_dois if d != paper.doi.lower()]
+            if other_dois:
+                await self._log_validation_check(
+                    paper.canonical_id, run_id, "CHECK_6_IDENTITY",
+                    False,
+                    f"Different DOI found: {other_dois[0][:50]}",
+                    start_ms,
+                )
+                return IdentityStatus.VERSION_MISMATCH.value
+
+        # Fuzzy title match (≥85%)
+        if paper.title:
+            title_norm = normalize_title(paper.title)
+            if title_norm and len(title_norm) > 10:
+                similarity = self._fuzzy_title_match(title_norm, text_lower)
+                if similarity >= TITLE_FUZZY_THRESHOLD:
+                    await self._log_validation_check(
+                        paper.canonical_id, run_id, "CHECK_6_IDENTITY",
+                        True,
+                        f"Title fuzzy match: {similarity:.2f}",
+                        start_ms,
+                    )
+                    return IdentityStatus.TITLE_VERIFIED.value
+
+        # No match at all
+        await self._log_validation_check(
+            paper.canonical_id, run_id, "CHECK_6_IDENTITY",
+            False, "No DOI or title match found", start_ms,
+        )
+        return IdentityStatus.CONTENT_UNVERIFIED.value
+
+    @staticmethod
+    def _fuzzy_title_match(title_norm: str, text_lower: str) -> float:
+        """Compute a simple token-overlap similarity between title and text.
+
+        Returns a float between 0.0 and 1.0.
+        """
+        title_tokens = set(title_norm.split())
+        title_tokens -= STOPWORDS
+        if not title_tokens:
+            return 0.0
+
+        # Check what fraction of title tokens appear in the text
+        found = sum(1 for t in title_tokens if t in text_lower)
+        return found / len(title_tokens)
+
+    async def _check7_content_drift(
+        self,
+        pdf_bytes: bytes,
+        paper: Paper,
+        run_id: str,
+        start_ms: float,
+    ) -> str:
+        """CHECK 7: SHA-256 + content drift detection.
+
+        First retrieval: store hash as baseline.
+        Subsequent: compare hash, version if changed.
+
+        Returns ContentDriftStatus value.
+        """
+        current_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+        if not paper.sha256_checksum:
+            # First retrieval — store as baseline
+            await self._db.update_paper_fields(
+                paper.canonical_id,
+                sha256_checksum=current_hash,
+                pdf_size_bytes=len(pdf_bytes),
+            )
+            await self._log_validation_check(
+                paper.canonical_id, run_id, "CHECK_7_DRIFT",
+                True, f"First retrieval, baseline hash: {current_hash[:16]}...",
+                start_ms,
+            )
+            return ContentDriftStatus.FIRST_RETRIEVAL.value
+
+        if current_hash == paper.sha256_checksum:
+            await self._log_validation_check(
+                paper.canonical_id, run_id, "CHECK_7_DRIFT",
+                True, "Hash matches stored baseline", start_ms,
+            )
+            return ContentDriftStatus.CONTENT_UNCHANGED.value
+
+        # Hash differs — content updated
+        # Save as versioned file
+        new_version = paper.content_drift_version + 1
+        base_name = os.path.splitext(paper.pdf_path or "unknown.pdf")[0]
+        versioned_path = f"{base_name}_v{new_version}.pdf"
+
+        write_ok, write_err = await self._atomic_write_pdf(
+            pdf_bytes, versioned_path
+        )
+
+        await self._db.update_paper_fields(
+            paper.canonical_id,
+            content_drift_status=ContentDriftStatus.CONTENT_UPDATED.value,
+            content_drift_version=new_version,
+        )
+
+        await self._log_validation_check(
+            paper.canonical_id, run_id, "CHECK_7_DRIFT",
+            False,
+            f"Content changed: old={paper.sha256_checksum[:16]}... "
+            f"new={current_hash[:16]}... saved as v{new_version}",
+            start_ms,
+        )
+
+        return ContentDriftStatus.CONTENT_UPDATED.value
+
+    # -----------------------------------------------------------------------
+    # Validation logging helper
+    # -----------------------------------------------------------------------
+
+    async def _log_validation_check(
+        self,
+        canonical_id: str,
+        run_id: str,
+        check_name: str,
+        passed: bool,
+        detail: str,
+        start_ms: float,
+    ) -> None:
+        """Log a single validation check result."""
+        elapsed_ms = (time.monotonic() * 1000) - start_ms
+        await self._log(
+            canonical_id=canonical_id,
+            run_id=run_id,
+            method=check_name,
+            outcome="PASS" if passed else "FAIL",
+            failure_code=None if passed else check_name,
+            execution_time_ms=elapsed_ms,
+            details={"detail": detail},
+        )
+
+    @staticmethod
+    def _determine_validation_status(
+        identity_status: str,
+        ocr_applied: bool,
+        content_drift: str,
+    ) -> str:
+        """Determine the final validation status from check results."""
+        # Content drift takes precedence for flagging
+        if content_drift == ContentDriftStatus.CONTENT_UPDATED.value:
+            return ValidationStatus.CONTENT_UPDATED.value
+
+        # Identity-based status
+        if identity_status == IdentityStatus.DOI_VERIFIED.value:
+            if ocr_applied:
+                return ValidationStatus.VALID_OCR.value
+            return ValidationStatus.VALID.value
+
+        if identity_status == IdentityStatus.TITLE_VERIFIED.value:
+            if ocr_applied:
+                return ValidationStatus.PARTIAL_OCR.value
+            return ValidationStatus.VALID_TITLE.value
+
+        if identity_status == IdentityStatus.VERSION_MISMATCH.value:
+            return ValidationStatus.VERSION_MISMATCH.value
+
+        # CONTENT_UNVERIFIED
+        return ValidationStatus.CONTENT_UNVERIFIED.value
