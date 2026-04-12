@@ -1165,6 +1165,8 @@ const state = {
     resultsLimit: 100,
     resultsTotalCount: 0,
     sseSource: null,
+    statusPollInterval: null,
+    lastStatusCounts: null,
 };
 
 /* ------------------------------------------------------------------
@@ -1527,9 +1529,99 @@ document.getElementById('btnStart').addEventListener('click', async function() {
         const rid = state.runId ? '?run_id=' + encodeURIComponent(state.runId) : '';
         const data = await POST('/api/run/start' + rid);
         state.runId = data.run_id; state.runState = 'running'; updateRunButtons();
-        addLogEntry('Run started: ' + data.run_id, 'info'); startSSE(); toast('Run started', 'success');
+        // Clear placeholder and add start message
+        document.getElementById('runLogArea').innerHTML = '';
+        addLogEntry('Run started: ' + data.run_id, 'info');
+        addLogEntry('Ready for retrieval: ' + data.ready_for_retrieval + ' papers', 'info');
+        addLogEntry('Awaiting validation: ' + data.awaiting_validation + ' papers', 'info');
+        addLogEntry('Workers spinning up...', 'info');
+        startSSE();
+        startStatusPoll();
+        toast('Run started', 'success');
     } catch (err) { toast(err.message, 'error'); }
 });
+
+/* ------------------------------------------------------------------
+   Run status polling (independent of SSE)
+   ------------------------------------------------------------------ */
+function startStatusPoll() {
+    stopStatusPoll();
+    state.statusPollInterval = setInterval(pollRunStatus, 2500);
+    pollRunStatus();  // immediate first fetch
+}
+
+function stopStatusPoll() {
+    if (state.statusPollInterval) {
+        clearInterval(state.statusPollInterval);
+        state.statusPollInterval = null;
+    }
+}
+
+async function pollRunStatus() {
+    try {
+        const s = await GET('/api/run/status');
+        const wp = s.worker_pool || {};
+
+        // Update sidebar worker status
+        const retActive = wp.retrieval_workers_active || 0;
+        const valActive = wp.validation_workers_active || 0;
+        document.getElementById('sidebarWorkers').textContent =
+            'Workers: ' + retActive + 'R / ' + valActive + 'V' +
+            (wp.paused ? ' (paused)' : '');
+
+        // Update progress metric cards
+        document.getElementById('runCompleted').textContent = s.complete || 0;
+        document.getElementById('runFailed').textContent = s.failed || 0;
+        document.getElementById('runManual').textContent = s.manual_required || 0;
+        document.getElementById('runRetrieving').textContent = s.retrieving || 0;
+
+        // Progress bar
+        const done = (s.complete || 0) + (s.failed || 0) + (s.manual_required || 0);
+        const total = s.total_papers || 1;
+        const pct = Math.round((done / total) * 100);
+        document.getElementById('runProgressBar').style.width = pct + '%';
+        document.getElementById('runProgressText').textContent = done + ' / ' + total + ' papers';
+        document.getElementById('runProgressPercent').textContent = pct + '%';
+
+        // Emit log entry when counts change
+        const counters = wp.counters || {};
+        const snap = JSON.stringify({
+            r: counters.retrieved || 0,
+            f: counters.failed || 0,
+            m: counters.manual || 0,
+            v: counters.validated || 0,
+            vf: counters.val_failed || 0,
+            retQ: s.ready_for_retrieval,
+            retG: s.retrieving,
+            valQ: s.retrieved,
+            valG: s.validating,
+        });
+        if (state.lastStatusCounts !== snap) {
+            const prev = state.lastStatusCounts ? JSON.parse(state.lastStatusCounts) : null;
+            state.lastStatusCounts = snap;
+            const now = JSON.parse(snap);
+            if (prev) {
+                if (now.r > prev.r) addLogEntry('Retrieved +' + (now.r - prev.r) + ' (queue: ' + now.retQ + ')', 'ok');
+                if (now.f > prev.f) addLogEntry('Failed +' + (now.f - prev.f), 'err');
+                if (now.m > prev.m) addLogEntry('Manual required +' + (now.m - prev.m), 'warn');
+                if (now.v > prev.v) addLogEntry('Validated +' + (now.v - prev.v), 'ok');
+                if (now.vf > prev.vf) addLogEntry('Validation failed +' + (now.vf - prev.vf), 'err');
+            } else {
+                addLogEntry('Queue: retrieval=' + now.retQ + ' (active ' + now.retG + ') | validation=' + now.valQ + ' (active ' + now.valG + ')', 'info');
+            }
+        }
+
+        // Detect run completion
+        if (state.runState === 'running' && !wp.running) {
+            state.runState = 'idle';
+            updateRunButtons();
+            addLogEntry('Run finished', 'info');
+            stopStatusPoll();
+        }
+    } catch (err) {
+        // Ignore transient errors
+    }
+}
 document.getElementById('btnPause').addEventListener('click', async function() {
     try { await POST('/api/run/pause'); state.runState = 'paused'; updateRunButtons(); addLogEntry('Run paused', 'warn'); toast('Paused', 'warning'); } catch (err) { toast(err.message, 'error'); }
 });
@@ -1537,7 +1629,7 @@ document.getElementById('btnResume').addEventListener('click', async function() 
     try { await POST('/api/run/resume'); state.runState = 'running'; updateRunButtons(); addLogEntry('Run resumed', 'info'); toast('Resumed', 'success'); } catch (err) { toast(err.message, 'error'); }
 });
 document.getElementById('btnCancel').addEventListener('click', async function() {
-    try { const data = await POST('/api/run/cancel'); state.runState = 'idle'; updateRunButtons(); addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err'); toast('Cancelled', 'warning'); } catch (err) { toast(err.message, 'error'); }
+    try { const data = await POST('/api/run/cancel'); state.runState = 'idle'; updateRunButtons(); addLogEntry('Cancelled (' + data.papers_interrupted + ' interrupted)', 'err'); toast('Cancelled', 'warning'); stopStatusPoll(); } catch (err) { toast(err.message, 'error'); }
 });
 ['btnRetryFailed','btnRetryMismatch','btnRetryManual','btnRetryAll'].forEach(function(id) {
     const typeMap = { btnRetryFailed:'failed', btnRetryMismatch:'mismatch', btnRetryManual:'manual', btnRetryAll:'all_eligible' };
@@ -1557,6 +1649,29 @@ async function loadSsoStatus() {
         else if (data.has_context) { badge.textContent = 'Pending'; badge.className = 'badge badge-warning'; document.getElementById('btnSsoContinue').disabled = false; document.getElementById('btnSsoReauth').disabled = false; }
         else { badge.textContent = 'Not Connected'; badge.className = 'badge badge-neutral'; document.getElementById('btnSsoContinue').disabled = true; document.getElementById('btnSsoReauth').disabled = true; }
     } catch(e) {}
+
+    // Load SSO queue count
+    try {
+        const q = await GET('/api/sso/queue-count');
+        const configLines = [];
+        if (q.sso_configured) {
+            configLines.push('<div style="color:var(--success)">&#10003; SSO URL configured</div>');
+        } else {
+            configLines.push('<div style="color:var(--warning)">&#9888; No SSO URL configured — set EZproxy/OpenAthens/resolver URL in Settings first.</div>');
+        }
+        configLines.push('<div style="margin-top:12px;padding:12px;background:var(--bg-primary);border-radius:var(--radius-sm)">');
+        configLines.push('<div style="font-weight:600;font-size:14px;margin-bottom:4px">SSO Queue</div>');
+        configLines.push('<div style="font-size:22px;font-weight:700;color:var(--accent)">' + q.pending_retrieval + ' papers</div>');
+        configLines.push('<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">will be attempted after you log in once</div>');
+        if (q.previously_failed_paywall > 0) {
+            configLines.push('<div style="font-size:12px;color:var(--warning);margin-top:8px">&#9888; ' + q.previously_failed_paywall + ' previously hit paywalls in Tier 2 — these will retry via your SSO session.</div>');
+        }
+        configLines.push('</div>');
+        configLines.push('<div style="margin-top:12px;font-size:12px;color:var(--text-secondary);line-height:1.6"><strong>Session reuse:</strong> ' + q.session_reuse_note + '</div>');
+        document.getElementById('ssoConfigSummary').innerHTML = configLines.join('');
+    } catch(e) {
+        document.getElementById('ssoConfigSummary').innerHTML = '<div style="color:var(--text-secondary);font-size:13px">Could not load SSO queue count.</div>';
+    }
 }
 document.getElementById('btnSsoStart').addEventListener('click', async function() {
     try { const data = await POST('/api/sso/start'); document.getElementById('ssoMessage').textContent = data.message; document.getElementById('btnSsoContinue').disabled = false; toast('SSO page opened', 'info'); } catch (err) { toast(err.message, 'error'); }
@@ -1690,7 +1805,7 @@ function formatBytes(b) {
         const s = await GET('/api/status');
         if (s.wizard_errors && s.wizard_errors.length) s.wizard_errors.forEach(function(e) { toast(e, 'warning'); });
         document.getElementById('sidebarOcr').textContent = 'OCR: ' + s.ocr_mode;
-        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); startSSE(); }
+        if (s.workers_running) { state.runState = s.workers_paused ? 'paused' : 'running'; updateRunButtons(); startSSE(); startStatusPoll(); }
     } catch(e) { toast('Could not connect to server', 'error'); }
     updateRunButtons();
 })();
