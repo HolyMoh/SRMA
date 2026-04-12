@@ -1827,3 +1827,431 @@ class RetrievalEngine:
                 continue
 
         return None
+
+    # ===================================================================
+    # TIER 3 — Institutional SSO (Playwright headed, persistent context)
+    # ===================================================================
+
+    async def tier3_institutional_sso(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 3: Retrieve via institutional SSO with headed browser.
+
+        Uses a persistent browser context with user-mediated login.
+        Tries in order: EZproxy → OpenAthens → institutional resolver → doi.org
+
+        ABSOLUTE RULE: Never access anything the user types.
+
+        Returns:
+            Tuple of (success, failure_code).
+        """
+        if not paper.doi:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_3.value,
+                method="sso",
+                outcome="SKIPPED",
+                failure_code=FailureCode.NO_DOI.value,
+            )
+            return False, FailureCode.NO_DOI.value
+
+        # Check if SSO session is valid
+        session_valid = await self._browser.check_sso_session_valid()
+        if not session_valid:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_3.value,
+                method="sso",
+                outcome="SSO_NOT_AUTHENTICATED",
+                failure_code=FailureCode.SSO_FAILED.value,
+                details={"reason": "No active SSO session. User must authenticate."},
+            )
+            return False, FailureCode.SSO_FAILED.value
+
+        # Build access URLs in priority order
+        access_urls = self._build_sso_access_urls(paper.doi)
+        if not access_urls:
+            return False, FailureCode.SSO_FAILED.value
+
+        start_ms = time.monotonic() * 1000
+
+        try:
+            page = await self._browser.get_sso_page()
+
+            for url_method, url in access_urls:
+                nav_result = await self._browser.safe_navigate(
+                    page, url,
+                    timeout_s=self._config.get(
+                        "page_load_timeout_s", DEFAULT_PAGE_LOAD_TIMEOUT_S
+                    ),
+                )
+
+                if not nav_result["success"]:
+                    # Check for SESSION_EXPIRED (403 in SSO context)
+                    if nav_result.get("status") == 403:
+                        await self._log(
+                            canonical_id=paper.canonical_id,
+                            run_id=run_id,
+                            tier=TierEnum.TIER_3.value,
+                            method=url_method,
+                            url_attempted=url,
+                            http_status=403,
+                            outcome="SESSION_EXPIRED",
+                            failure_code=FailureCode.SESSION_EXPIRED.value,
+                        )
+                        # Attempt re-authentication
+                        sso_url = self._get_primary_sso_url()
+                        if sso_url:
+                            await self._browser.handle_session_expired(sso_url)
+                        return False, FailureCode.SESSION_EXPIRED.value
+                    continue
+
+                # Paywall detection on the resolved page
+                if await self._browser.detect_paywall(page):
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        tier=TierEnum.TIER_3.value,
+                        method=url_method,
+                        url_attempted=url,
+                        outcome="PAYWALL_DETECTED",
+                        failure_code=FailureCode.PAYWALL_DETECTED.value,
+                    )
+                    continue
+
+                # Try to find PDF URL on this page
+                pdf_url = await self._browser.extract_pdf_url_from_page(page)
+                if not pdf_url:
+                    pdf_url = await self._pub_generic_fallback(
+                        page, paper, nav_result["url"]
+                    )
+
+                if not pdf_url:
+                    continue
+
+                # Resolve relative URL
+                if pdf_url.startswith("/"):
+                    pdf_url = urljoin(nav_result["url"], pdf_url)
+
+                # Download the PDF
+                filename = generate_filename(
+                    paper.first_author_lastname, paper.year, paper.title,
+                )
+                final_path = os.path.join(self._output_dir, filename)
+
+                success, failure_code, pdf_data = await self._download_pdf(
+                    url=pdf_url,
+                    final_path=final_path,
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    tier=TierEnum.TIER_3.value,
+                    method=url_method,
+                )
+
+                if success:
+                    elapsed_ms = (time.monotonic() * 1000) - start_ms
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        pdf_path=final_path,
+                        pdf_filename=filename,
+                        retrieval_tier=TierEnum.TIER_3.value,
+                        retrieval_method=url_method,
+                        retrieval_url=pdf_url,
+                        pdf_size_bytes=len(pdf_data) if pdf_data else None,
+                    )
+                    return True, None
+
+            # All SSO methods exhausted
+            elapsed_ms = (time.monotonic() * 1000) - start_ms
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_3.value,
+                method="sso_all",
+                outcome="ALL_SSO_FAILED",
+                failure_code=FailureCode.SSO_FAILED.value,
+                execution_time_ms=elapsed_ms,
+            )
+            return False, FailureCode.SSO_FAILED.value
+
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() * 1000) - start_ms
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_3.value,
+                method="sso",
+                outcome="EXCEPTION",
+                failure_code=FailureCode.SSO_FAILED.value,
+                execution_time_ms=elapsed_ms,
+                exc=exc,
+            )
+            return False, FailureCode.SSO_FAILED.value
+
+    def _build_sso_access_urls(self, doi: str) -> List[Tuple[str, str]]:
+        """Build ordered list of SSO access URLs from config.
+
+        Returns list of (method_name, url) tuples.
+        """
+        urls: List[Tuple[str, str]] = []
+        doi_url = f"https://doi.org/{doi}"
+
+        # EZproxy
+        ezproxy = self._config.get("sso_proxy_url", "")
+        if ezproxy:
+            ezproxy_clean = ezproxy.rstrip("/")
+            urls.append((
+                "ezproxy",
+                f"{ezproxy_clean}/login?url={doi_url}",
+            ))
+
+        # OpenAthens
+        openathens = self._config.get("openathens_url", "")
+        if openathens:
+            openathens_clean = openathens.rstrip("/")
+            urls.append((
+                "openathens",
+                f"{openathens_clean}?url={doi_url}",
+            ))
+
+        # Institutional resolver
+        resolver = self._config.get("institutional_resolver_url", "")
+        if resolver:
+            resolver_clean = resolver.rstrip("/")
+            urls.append((
+                "resolver",
+                f"{resolver_clean}?doi={doi}",
+            ))
+
+        # Direct DOI fallback (may work if institutional IP is recognized)
+        urls.append(("doi_direct", doi_url))
+
+        return urls
+
+    def _get_primary_sso_url(self) -> Optional[str]:
+        """Get the primary SSO login URL for re-authentication."""
+        for key in ("sso_proxy_url", "openathens_url", "institutional_resolver_url"):
+            url = self._config.get(key, "")
+            if url:
+                return url
+        return None
+
+    # ===================================================================
+    # TIER 3.5 — Scholar-Assisted Retrieval (SSO session only)
+    # ===================================================================
+
+    async def tier3_5_scholar_assisted(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 3.5: Search Google Scholar for PDF links using SSO session.
+
+        SAFETY FILTER: Only follows links to known-safe domains.
+        Rate limited: 10s minimum (seeded delay). Max 3 queries per paper.
+
+        Returns:
+            Tuple of (success, failure_code).
+        """
+        # Must have active SSO session
+        session_valid = await self._browser.check_sso_session_valid()
+        if not session_valid:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=TierEnum.TIER_3_5.value,
+                method="scholar",
+                outcome="SSO_NOT_AUTHENTICATED",
+                failure_code=FailureCode.SSO_FAILED.value,
+            )
+            return False, FailureCode.SSO_FAILED.value
+
+        if not paper.title:
+            return False, FailureCode.METADATA_MISSING.value
+
+        max_queries = self._config.get(
+            "scholar_max_queries_per_paper", SCHOLAR_MAX_QUERIES_PER_PAPER
+        )
+        min_delay = self._config.get(
+            "scholar_min_delay_s", SCHOLAR_MIN_DELAY_S
+        )
+
+        page = await self._browser.get_sso_page()
+
+        for query_attempt in range(max_queries):
+            start_ms = time.monotonic() * 1000
+
+            # Seeded delay for audit reproducibility
+            delay = generate_seeded_delay(
+                run_id,
+                f"{paper.canonical_id}_{query_attempt}",
+                min_delay,
+                jitter_range=3.0,
+            )
+            await asyncio.sleep(delay)
+
+            # Build search query — title-based
+            search_title = paper.title[:200]  # Truncate very long titles
+            if paper.authors and query_attempt > 0:
+                # Add author on retry for more specific results
+                search_query = f'"{search_title}" {paper.first_author_lastname}'
+            else:
+                search_query = f'"{search_title}"'
+
+            scholar_url = (
+                f"https://scholar.google.com/scholar?"
+                f"q={search_query.replace(' ', '+')}"
+            )
+
+            # Navigate to Scholar
+            nav_result = await self._browser.safe_navigate(
+                page, scholar_url,
+                timeout_s=self._config.get(
+                    "page_load_timeout_s", DEFAULT_PAGE_LOAD_TIMEOUT_S
+                ),
+            )
+
+            elapsed_ms = (time.monotonic() * 1000) - start_ms
+
+            if not nav_result["success"]:
+                await self._log(
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    tier=TierEnum.TIER_3_5.value,
+                    method="scholar",
+                    url_attempted=scholar_url,
+                    http_status=nav_result.get("status"),
+                    outcome="SCHOLAR_NAV_FAILED",
+                    failure_code=FailureCode.SCHOLAR_BLOCKED.value,
+                    execution_time_ms=elapsed_ms,
+                    retry_count=query_attempt,
+                )
+                continue
+
+            # CAPTCHA detection
+            if await self._browser.detect_captcha(page):
+                await self._log(
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    tier=TierEnum.TIER_3_5.value,
+                    method="scholar",
+                    url_attempted=scholar_url,
+                    outcome="CAPTCHA_ENCOUNTERED",
+                    failure_code=FailureCode.CAPTCHA_ENCOUNTERED.value,
+                    execution_time_ms=elapsed_ms,
+                    retry_count=query_attempt,
+                )
+                return False, FailureCode.CAPTCHA_ENCOUNTERED.value
+
+            # Extract PDF links from Scholar results
+            pdf_links = await self._extract_scholar_pdf_links(page)
+
+            for link_url in pdf_links:
+                # SAFETY FILTER: known-safe domains only
+                if not is_safe_scholar_domain(link_url):
+                    logger.debug(
+                        "Scholar link rejected (unsafe domain): %s", link_url
+                    )
+                    continue
+
+                # Try downloading
+                filename = generate_filename(
+                    paper.first_author_lastname, paper.year, paper.title,
+                )
+                final_path = os.path.join(self._output_dir, filename)
+
+                success, failure_code, pdf_data = await self._download_pdf(
+                    url=link_url,
+                    final_path=final_path,
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    tier=TierEnum.TIER_3_5.value,
+                    method="scholar",
+                    retry_count=query_attempt,
+                )
+
+                if success:
+                    await self._db.update_paper_fields(
+                        paper.canonical_id,
+                        pdf_path=final_path,
+                        pdf_filename=filename,
+                        retrieval_tier=TierEnum.TIER_3_5.value,
+                        retrieval_method="scholar",
+                        retrieval_url=link_url,
+                        pdf_size_bytes=len(pdf_data) if pdf_data else None,
+                    )
+                    await self._log(
+                        canonical_id=paper.canonical_id,
+                        run_id=run_id,
+                        tier=TierEnum.TIER_3_5.value,
+                        method="scholar",
+                        url_attempted=link_url,
+                        outcome="SCHOLAR_FALLBACK",
+                        execution_time_ms=elapsed_ms,
+                        retry_count=query_attempt,
+                    )
+                    return True, None
+
+        # All queries exhausted
+        await self._log(
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_3_5.value,
+            method="scholar",
+            outcome="ALL_SCHOLAR_FAILED",
+            failure_code=FailureCode.SCHOLAR_BLOCKED.value,
+            details={"queries_attempted": max_queries},
+        )
+        return False, FailureCode.SCHOLAR_BLOCKED.value
+
+    async def _extract_scholar_pdf_links(self, page: Any) -> List[str]:
+        """Extract PDF links from a Google Scholar results page.
+
+        Looks for:
+            - [PDF] links on the right side of results
+            - Direct PDF href attributes
+        """
+        pdf_links: List[str] = []
+
+        try:
+            # Scholar shows [PDF] links with class "gs_or_ggsm"
+            # or as direct links with "[PDF]" text
+            pdf_selectors = [
+                "a[href*='.pdf']",
+                ".gs_or_ggsm a",
+                ".gs_ggsd a",
+                "a[data-clk-atid]",
+            ]
+
+            seen_urls: Set[str] = set()
+            for selector in pdf_selectors:
+                elements = await page.query_selector_all(selector)
+                for element in elements:
+                    href = await element.get_attribute("href")
+                    if href and href not in seen_urls:
+                        # Prioritize actual PDF URLs
+                        if ".pdf" in href.lower() or "pdf" in href.lower():
+                            pdf_links.append(href)
+                            seen_urls.add(href)
+
+            # Also check for links with "[PDF]" text content
+            all_links = await page.query_selector_all("a")
+            for link in all_links:
+                try:
+                    text = await link.inner_text()
+                    if "[PDF]" in text.upper():
+                        href = await link.get_attribute("href")
+                        if href and href not in seen_urls:
+                            pdf_links.append(href)
+                            seen_urls.add(href)
+                except Exception:
+                    continue
+
+        except Exception as exc:
+            logger.debug("Error extracting Scholar PDF links: %s", exc)
+
+        return pdf_links
