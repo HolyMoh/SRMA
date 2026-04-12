@@ -1044,6 +1044,70 @@
         </div>
 
         <!-- ============================================================
+             PANEL 6: RESULTS
+             ============================================================ -->
+        <div id="panelResults" class="panel">
+            <div class="panel-header">
+                <h2>Results</h2>
+                <div class="btn-group">
+                    <select class="form-control" id="resultsRunFilter" style="width:180px;display:inline-block">
+                        <option value="">All Runs</option>
+                    </select>
+                    <button class="btn btn-outline btn-sm" id="btnExportExcel">Export Excel</button>
+                    <button class="btn btn-outline btn-sm" id="btnExportPrisma">Export PRISMA</button>
+                    <button class="btn btn-outline btn-sm" id="btnExportAudit">Export Audit JSON</button>
+                    <button class="btn btn-outline btn-sm" id="btnExportIntegration">Export Integration</button>
+                </div>
+            </div>
+
+            <!-- Filter tabs -->
+            <div class="tab-bar" id="resultsTabBar">
+                <div class="tab active" data-filter="">All <span class="tab-count" id="tabCountAll">0</span></div>
+                <div class="tab" data-filter="downloaded">Downloaded <span class="tab-count" id="tabCountDownloaded">0</span></div>
+                <div class="tab" data-filter="partial">Partial <span class="tab-count" id="tabCountPartial">0</span></div>
+                <div class="tab" data-filter="mismatch">Mismatch <span class="tab-count" id="tabCountMismatch">0</span></div>
+                <div class="tab" data-filter="failed">Failed <span class="tab-count" id="tabCountFailed">0</span></div>
+                <div class="tab" data-filter="manual">Manual <span class="tab-count" id="tabCountManual">0</span></div>
+            </div>
+
+            <div class="card" style="padding:0">
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th data-sort="title">Title</th>
+                                <th data-sort="first_author_lastname">Author</th>
+                                <th data-sort="year">Year</th>
+                                <th>DOI</th>
+                                <th data-sort="state">State</th>
+                                <th>Status</th>
+                                <th>Identity</th>
+                                <th>Version</th>
+                                <th data-sort="integrity_score">Score</th>
+                                <th>Source</th>
+                                <th>Suppl.</th>
+                                <th data-sort="attempt_count">Att.</th>
+                                <th>Failure</th>
+                                <th>Override</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Pagination -->
+            <div class="pagination">
+                <span id="resultsPagInfo">Showing 0-0 of 0</span>
+                <div class="page-btns">
+                    <button class="btn btn-outline btn-sm" id="btnPrevPage" disabled>&laquo; Prev</button>
+                    <button class="btn btn-outline btn-sm" id="btnNextPage" disabled>Next &raquo;</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
              CAPTCHA OVERLAY (global, over everything)
              ============================================================ -->
     </main>
