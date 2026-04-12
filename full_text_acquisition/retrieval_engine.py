@@ -2255,3 +2255,368 @@ class RetrievalEngine:
             logger.debug("Error extracting Scholar PDF links: %s", exc)
 
         return pdf_links
+
+    # ===================================================================
+    # TIER 4 — Manual Flag
+    # ===================================================================
+
+    async def tier4_manual_flag(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Tier 4: Flag paper for manual retrieval.
+
+        State: RETRIEVING → MANUAL_REQUIRED.
+        Logs all previous endpoints and failure codes.
+        Suggests action: ILL | corresponding author | ResearchGate.
+        """
+        # Gather retrieval history for this paper
+        audit_entries = await self._db.get_audit_log_for_paper(
+            paper.canonical_id, limit=50
+        )
+
+        failed_endpoints: List[Dict[str, Any]] = []
+        failure_codes: List[str] = []
+        for entry in audit_entries:
+            if entry.failure_code:
+                failure_codes.append(entry.failure_code)
+            if entry.url_attempted:
+                failed_endpoints.append({
+                    "tier": entry.tier,
+                    "method": entry.method,
+                    "url": entry.url_attempted,
+                    "status": entry.http_status,
+                    "failure_code": entry.failure_code,
+                })
+
+        # Build suggested actions
+        suggestions: List[str] = []
+        if paper.doi:
+            suggestions.append(
+                f"Request via Inter-Library Loan (ILL) using DOI: {paper.doi}"
+            )
+            suggestions.append(
+                "Contact corresponding author directly"
+            )
+            suggestions.append(
+                f"Search ResearchGate: https://www.researchgate.net/search?q={paper.doi}"
+            )
+        else:
+            suggestions.append(
+                f"Search by title: \"{paper.title[:100]}\""
+            )
+            suggestions.append(
+                "Request via Inter-Library Loan (ILL)"
+            )
+
+        await self._log(
+            canonical_id=paper.canonical_id,
+            run_id=run_id,
+            tier=TierEnum.TIER_4.value,
+            method="manual_flag",
+            outcome="MANUAL_REQUIRED",
+            failure_code=FailureCode.MANUAL_REQUIRED.value,
+            details={
+                "failed_endpoints": failed_endpoints,
+                "failure_codes": list(set(failure_codes)),
+                "suggested_actions": suggestions,
+                "total_attempts": paper.attempt_count,
+            },
+        )
+
+        return False, FailureCode.MANUAL_REQUIRED.value
+
+    # ===================================================================
+    # Adaptive Retry Engine
+    # ===================================================================
+
+    async def orchestrate_retrieval(
+        self,
+        paper: Paper,
+        run_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Master retrieval orchestrator — runs through tiers adaptively.
+
+        Tier progression: 0 → 1 → 2 → 3 → 3.5 → 4.
+        Skips tiers intelligently based on previous failures.
+        Tracks retry history. Hard cap on total attempts.
+
+        Returns:
+            Tuple of (success, final_failure_code).
+        """
+        max_attempts = self._config.get(
+            "max_total_attempts", DEFAULT_MAX_TOTAL_ATTEMPTS
+        )
+
+        # Check attempt cap
+        if paper.attempt_count >= max_attempts:
+            await self._log(
+                canonical_id=paper.canonical_id,
+                run_id=run_id,
+                tier=None,
+                method="orchestrator",
+                outcome="ATTEMPT_CAP_REACHED",
+                failure_code=FailureCode.MANUAL_REQUIRED.value,
+                details={"attempt_count": paper.attempt_count, "cap": max_attempts},
+            )
+            return await self.tier4_manual_flag(paper, run_id)
+
+        # Increment attempt count
+        new_count = paper.attempt_count + 1
+        await self._db.update_paper_fields(
+            paper.canonical_id, attempt_count=new_count
+        )
+
+        # Get previous failure history to make adaptive decisions
+        prev_failures = await self._get_failure_history(paper.canonical_id)
+
+        # Tier 0 — Unpaywall (pure HTTP)
+        if not self._should_skip_tier(TierEnum.TIER_0.value, prev_failures):
+            success, fc = await self.tier0_unpaywall(paper, run_id)
+            if success:
+                return True, None
+
+        # Tier 1 — Open Access APIs (pure HTTP)
+        if not self._should_skip_tier(TierEnum.TIER_1.value, prev_failures):
+            success, fc = await self.tier1_open_access(paper, run_id)
+            if success:
+                return True, None
+
+        # Tier 2 — Publisher Direct (Playwright headless)
+        # Skip if NO_DOI or if publisher in cooldown
+        if (
+            paper.doi
+            and not self._should_skip_tier(TierEnum.TIER_2.value, prev_failures)
+        ):
+            success, fc = await self.tier2_publisher_direct(paper, run_id)
+            if success:
+                return True, None
+            # If PAYWALL_DETECTED, go straight to Tier 3
+            if fc == FailureCode.PAYWALL_DETECTED.value:
+                pass  # Fall through to Tier 3
+
+        # Tier 3 — Institutional SSO (requires active session)
+        if (
+            self._browser.has_persistent_context
+            and not self._should_skip_tier(TierEnum.TIER_3.value, prev_failures)
+        ):
+            success, fc = await self.tier3_institutional_sso(paper, run_id)
+            if success:
+                return True, None
+
+            # Tier 3.5 — Scholar-Assisted (only with active SSO)
+            if fc != FailureCode.SSO_FAILED.value:
+                success, fc = await self.tier3_5_scholar_assisted(paper, run_id)
+                if success:
+                    return True, None
+
+        # Tier 4 — Manual Flag
+        return await self.tier4_manual_flag(paper, run_id)
+
+    async def _get_failure_history(
+        self, canonical_id: str
+    ) -> Dict[str, List[str]]:
+        """Get failure history grouped by tier for adaptive decisions."""
+        entries = await self._db.get_audit_log_for_paper(canonical_id, limit=100)
+        history: Dict[str, List[str]] = {}
+        for entry in entries:
+            if entry.tier and entry.failure_code:
+                if entry.tier not in history:
+                    history[entry.tier] = []
+                history[entry.tier].append(entry.failure_code)
+        return history
+
+    def _should_skip_tier(
+        self,
+        tier: str,
+        failure_history: Dict[str, List[str]],
+    ) -> bool:
+        """Decide whether to skip a tier based on previous failures.
+
+        Skip rules:
+            - Tier had 3+ failures with the same endpoint → skip
+            - Tier 0/1 returned NO_OA_SOURCE on all attempts → skip on retry
+            - Tier 2 returned PAYWALL_DETECTED → skip (go to Tier 3)
+            - Tier 3 returned SSO_FAILED → skip 3 and 3.5
+        """
+        tier_failures = failure_history.get(tier, [])
+        if not tier_failures:
+            return False
+
+        max_retries = self._config.get("max_retries", DEFAULT_MAX_RETRIES)
+
+        # If all attempts for this tier returned the same terminal failure
+        if len(tier_failures) >= max_retries:
+            unique_failures = set(tier_failures[-max_retries:])
+            terminal_failures = {
+                FailureCode.NO_OA_SOURCE.value,
+                FailureCode.NO_DOI.value,
+                FailureCode.PAYWALL_DETECTED.value,
+                FailureCode.SSO_FAILED.value,
+            }
+            if unique_failures.issubset(terminal_failures):
+                return True
+
+        return False
+
+    # ===================================================================
+    # Supplement Sniffer
+    # ===================================================================
+
+    async def sniff_supplements(
+        self,
+        paper: Paper,
+        page: Any,
+        run_id: str,
+    ) -> int:
+        """Scan for supplementary materials after successful Tier 2 download.
+
+        Searches:
+            1. HTML page for supplement links
+            2. First 5 pages of the PDF for supplement keywords
+
+        Downloads each to /Supplements/{canonical_id}/.
+        PDFs get full Step 3 validation. Others get size-only check.
+
+        Returns count of supplements found and downloaded.
+        """
+        supplement_count = 0
+        supplement_urls: List[Tuple[str, str]] = []  # (url, extension)
+
+        # Scan HTML page for supplement links
+        try:
+            supplement_selectors = [
+                "a[href*='supplement']",
+                "a[href*='supporting']",
+                "a[href*='appendix']",
+                "a[href*='additional']",
+                "a[class*='supplement']",
+                "a[data-type='supplementary']",
+            ]
+
+            seen: Set[str] = set()
+            for selector in supplement_selectors:
+                elements = await page.query_selector_all(selector)
+                for element in elements:
+                    href = await element.get_attribute("href")
+                    if href and href not in seen:
+                        seen.add(href)
+                        # Determine extension
+                        ext = self._guess_extension(href)
+                        supplement_urls.append((href, ext))
+        except Exception as exc:
+            logger.debug("Error scanning HTML for supplements: %s", exc)
+
+        # Download each supplement
+        for idx, (supp_url, ext) in enumerate(supplement_urls, start=1):
+            # Resolve relative URL
+            if supp_url.startswith("/"):
+                supp_url = urljoin(page.url, supp_url)
+
+            try:
+                supp_filename = generate_supplement_filename(
+                    paper.first_author_lastname,
+                    paper.year,
+                    idx,
+                    ext,
+                )
+                supp_dir = os.path.join(
+                    self._supplement_dir, paper.canonical_id.replace(":", "_")
+                )
+                os.makedirs(supp_dir, exist_ok=True)
+                supp_path = os.path.join(supp_dir, supp_filename)
+
+                # Download
+                data, http_status, content_type, error = await self._stream_download(
+                    supp_url
+                )
+                if data is None or error:
+                    continue
+
+                # Validate based on type
+                if ext == "pdf":
+                    # Full validation: magic bytes + size
+                    if not pdf_magic_bytes_valid(data) or len(data) < MIN_PDF_SIZE_BYTES:
+                        continue
+                    write_ok, _ = await self._atomic_write_pdf(data, supp_path)
+                    validation_status = "VALID" if write_ok else None
+                else:
+                    # Non-PDF: size > 0 check only
+                    if len(data) == 0:
+                        continue
+                    with open(supp_path, "wb") as f:
+                        f.write(data)
+                    validation_status = "SUPPLEMENT_NON_PDF"
+
+                if not os.path.isfile(supp_path):
+                    continue
+
+                # Record supplement
+                supp_hash = hashlib.sha256(data).hexdigest()
+                supp_record = SupplementFile(
+                    canonical_id=paper.canonical_id,
+                    supplement_index=idx,
+                    filename=supp_filename,
+                    file_path=supp_path,
+                    file_extension=ext,
+                    file_size_bytes=len(data),
+                    sha256_checksum=supp_hash,
+                    validation_status=validation_status,
+                    source_url=supp_url,
+                )
+                await self._db.insert_supplement(supp_record)
+                supplement_count += 1
+
+                await self._log(
+                    canonical_id=paper.canonical_id,
+                    run_id=run_id,
+                    tier=paper.retrieval_tier,
+                    method="supplement_sniffer",
+                    url_attempted=supp_url,
+                    outcome="SUPPLEMENT_DOWNLOADED",
+                    details={
+                        "index": idx,
+                        "extension": ext,
+                        "size_bytes": len(data),
+                        "validation": validation_status,
+                    },
+                )
+
+            except Exception as exc:
+                logger.debug(
+                    "Error downloading supplement %d for %s: %s",
+                    idx, paper.canonical_id, exc,
+                )
+                continue
+
+        # Update paper supplement count
+        if supplement_count > 0:
+            await self._db.update_paper_fields(
+                paper.canonical_id,
+                supplement_count=supplement_count,
+            )
+
+        return supplement_count
+
+    @staticmethod
+    def _guess_extension(url: str) -> str:
+        """Guess file extension from a URL."""
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        if path.endswith(".pdf"):
+            return "pdf"
+        if path.endswith(".docx") or path.endswith(".doc"):
+            return "docx"
+        if path.endswith(".xlsx") or path.endswith(".xls"):
+            return "xlsx"
+        if path.endswith(".csv"):
+            return "csv"
+        if path.endswith(".zip"):
+            return "zip"
+        if path.endswith(".pptx") or path.endswith(".ppt"):
+            return "pptx"
+        if path.endswith(".txt"):
+            return "txt"
+        # Default to pdf for unknown
+        return "pdf"
