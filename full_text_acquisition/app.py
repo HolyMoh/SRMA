@@ -1035,3 +1035,197 @@ async def _apply_enrichment_crossref(
         await db.update_paper_fields(paper.canonical_id, **updates)
 
     return filled
+
+
+# ===========================================================================
+# RETRIEVAL CONTROL ENDPOINTS
+# ===========================================================================
+
+
+@app.post("/api/run/start")
+async def start_run(
+    run_id: Optional[str] = Query(default=None, description="Run ID to start. If None, starts the most recent run."),
+) -> JSONResponse:
+    """Start retrieval workers for a run.
+
+    If run_id is not specified, starts the most recent run.
+    """
+    db = _get_db()
+    wp = _get_worker_pool()
+
+    if wp.is_running:
+        raise HTTPException(
+            status_code=409, detail="A run is already in progress. Pause or cancel first."
+        )
+
+    # Determine run_id
+    if not run_id:
+        runs = await db.list_runs(limit=1)
+        if not runs:
+            raise HTTPException(
+                status_code=404, detail="No runs found. Upload a file first."
+            )
+        run_id = runs[0].run_id
+
+    # Verify run exists
+    run_record = await db.get_run(run_id)
+    if run_record is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    # Check there are papers to retrieve
+    state_counts = await db.count_papers_by_state()
+    ready_count = state_counts.get(PaperState.READY_FOR_RETRIEVAL.value, 0)
+    retrieved_count = state_counts.get(PaperState.RETRIEVED.value, 0)
+
+    if ready_count == 0 and retrieved_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No papers are ready for retrieval or validation.",
+        )
+
+    # Start workers
+    await wp.start(run_id)
+
+    logger.info("Run %s started (%d ready, %d awaiting validation)", run_id, ready_count, retrieved_count)
+
+    return JSONResponse({
+        "status": "started",
+        "run_id": run_id,
+        "ready_for_retrieval": ready_count,
+        "awaiting_validation": retrieved_count,
+    })
+
+
+@app.post("/api/run/pause")
+async def pause_run() -> JSONResponse:
+    """Pause retrieval workers. Validation continues."""
+    wp = _get_worker_pool()
+
+    if not wp.is_running:
+        raise HTTPException(status_code=409, detail="No run is in progress")
+
+    if wp.is_paused:
+        raise HTTPException(status_code=409, detail="Run is already paused")
+
+    wp.pause()
+
+    return JSONResponse({"status": "paused"})
+
+
+@app.post("/api/run/resume")
+async def resume_run() -> JSONResponse:
+    """Resume paused retrieval workers."""
+    wp = _get_worker_pool()
+
+    if not wp.is_running:
+        raise HTTPException(status_code=409, detail="No run is in progress")
+
+    if not wp.is_paused:
+        raise HTTPException(status_code=409, detail="Run is not paused")
+
+    wp.resume()
+
+    return JSONResponse({"status": "resumed"})
+
+
+@app.post("/api/run/cancel")
+async def cancel_run() -> JSONResponse:
+    """Cancel the current run and stop all workers."""
+    db = _get_db()
+    wp = _get_worker_pool()
+
+    if not wp.is_running:
+        raise HTTPException(status_code=409, detail="No run is in progress")
+
+    interrupted = await wp.stop(timeout_s=30.0)
+
+    # Mark run as cancelled
+    status = wp.get_status()
+    current_run_id = status.get("run_id")
+    if current_run_id:
+        await db.complete_run(current_run_id, status=RunStatus.CANCELLED.value)
+
+    return JSONResponse({
+        "status": "cancelled",
+        "papers_interrupted": interrupted,
+    })
+
+
+@app.post("/api/retry")
+async def retry_papers(request: RetryRequest) -> JSONResponse:
+    """Retry failed or mismatched papers.
+
+    retry_type: 'failed' | 'mismatch' | 'manual' | 'all_eligible'
+    canonical_ids: Optional specific papers to retry.
+    """
+    db = _get_db()
+
+    count = await db.reset_papers_for_retry_bulk(
+        canonical_ids=request.canonical_ids,
+        retry_type=request.retry_type,
+    )
+
+    await db.log_audit(AuditLogEntry(
+        outcome="RETRY_REQUESTED",
+        details=json.dumps({
+            "retry_type": request.retry_type,
+            "canonical_ids": request.canonical_ids,
+            "papers_reset": count,
+        }),
+    ))
+
+    return JSONResponse({
+        "status": "retry_queued",
+        "papers_reset": count,
+        "retry_type": request.retry_type,
+    })
+
+
+@app.get("/api/runs")
+async def list_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> JSONResponse:
+    """List all runs ordered by most recent first."""
+    db = _get_db()
+    runs = await db.list_runs(limit=limit)
+
+    return JSONResponse({
+        "runs": [
+            {
+                "run_id": r.run_id,
+                "started_at": r.started_at,
+                "completed_at": r.completed_at,
+                "status": r.status,
+                "total_submitted": r.total_submitted,
+            }
+            for r in runs
+        ]
+    })
+
+
+@app.get("/api/run/{run_id}")
+async def get_run_detail(run_id: str) -> JSONResponse:
+    """Get detailed information about a specific run."""
+    db = _get_db()
+
+    run_record = await db.get_run(run_id)
+    if run_record is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    paper_runs = await db.get_paper_runs_for_run(run_id)
+
+    # Count outcomes
+    outcomes: Dict[str, int] = {}
+    for pr in paper_runs:
+        outcome = pr.outcome_in_this_run or "PENDING"
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
+    return JSONResponse({
+        "run_id": run_record.run_id,
+        "started_at": run_record.started_at,
+        "completed_at": run_record.completed_at,
+        "status": run_record.status,
+        "total_submitted": run_record.total_submitted,
+        "outcome_counts": outcomes,
+        "paper_count": len(paper_runs),
+    })
