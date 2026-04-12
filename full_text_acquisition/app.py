@@ -1203,6 +1203,32 @@ async def list_runs(
     })
 
 
+@app.get("/api/run/status")
+async def run_status() -> JSONResponse:
+    """Return live worker pool status + state counts for frontend polling.
+
+    Independent of SSE — called every ~2s by the UI when a run is active.
+    """
+    db = _get_db()
+    wp = _get_worker_pool()
+
+    state_counts = await db.count_papers_by_state()
+    wp_status = wp.get_status()
+
+    return JSONResponse({
+        "worker_pool": wp_status,
+        "state_counts": state_counts,
+        "total_papers": sum(state_counts.values()),
+        "ready_for_retrieval": state_counts.get(PaperState.READY_FOR_RETRIEVAL.value, 0),
+        "retrieving": state_counts.get(PaperState.RETRIEVING.value, 0),
+        "retrieved": state_counts.get(PaperState.RETRIEVED.value, 0),
+        "validating": state_counts.get(PaperState.VALIDATING.value, 0),
+        "complete": state_counts.get(PaperState.COMPLETE.value, 0),
+        "failed": state_counts.get(PaperState.FAILED.value, 0),
+        "manual_required": state_counts.get(PaperState.MANUAL_REQUIRED.value, 0),
+    })
+
+
 @app.get("/api/run/{run_id}")
 async def get_run_detail(run_id: str) -> JSONResponse:
     """Get detailed information about a specific run."""
@@ -1365,6 +1391,57 @@ async def sso_status() -> JSONResponse:
     return JSONResponse({
         "has_context": has_ctx,
         "session_valid": session_valid,
+    })
+
+
+@app.get("/api/sso/queue-count")
+async def sso_queue_count() -> JSONResponse:
+    """Return the count of papers likely to require Tier 3 SSO retrieval.
+
+    Papers with a DOI that are currently FAILED, READY_FOR_RETRIEVAL,
+    or MANUAL_REQUIRED are candidates. Once the user logs in once, the
+    persistent browser context is reused for ALL these papers without
+    requiring login again for each one.
+    """
+    db = _get_db()
+    config = _get_config()
+
+    # Count papers that would flow to Tier 3 on next attempt
+    ready = await db.read_scalar(
+        "SELECT COUNT(*) FROM papers "
+        "WHERE state IN (?, ?, ?) AND doi IS NOT NULL AND doi != ''",
+        (
+            PaperState.READY_FOR_RETRIEVAL.value,
+            PaperState.FAILED.value,
+            PaperState.MANUAL_REQUIRED.value,
+        ),
+    ) or 0
+
+    # Papers that actually failed at a pre-Tier-3 stage (most relevant)
+    failed_non_sso = await db.read_scalar(
+        "SELECT COUNT(DISTINCT canonical_id) FROM audit_log "
+        "WHERE failure_code IN (?, ?, ?)",
+        (
+            FailureCode.PAYWALL_DETECTED.value,
+            FailureCode.ACCESS_DENIED.value,
+            FailureCode.PUBLISHER_SOFT_BLOCK.value,
+        ),
+    ) or 0
+
+    sso_configured = bool(
+        config.get("sso_proxy_url") or config.get("openathens_url")
+        or config.get("institutional_resolver_url")
+    )
+
+    return JSONResponse({
+        "pending_retrieval": ready,
+        "previously_failed_paywall": failed_non_sso,
+        "sso_configured": sso_configured,
+        "session_reuse_note": (
+            "After you log in once, the browser session is reused "
+            "for all subsequent papers until you click Re-authenticate "
+            "or close the app."
+        ),
     })
 
 

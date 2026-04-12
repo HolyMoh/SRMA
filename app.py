@@ -449,6 +449,9 @@ active_pdf = st.selectbox(
     key="active_pdf_selector",
 )
 st.session_state.active_pdf = active_pdf
+if active_pdf is None or active_pdf not in st.session_state.pdf_parsed:
+    st.info("Select a PDF to continue.")
+    st.stop()
 parsed_pdf: ParsedPDF = st.session_state.pdf_parsed[active_pdf]
 
 # Design override UI
