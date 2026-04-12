@@ -1181,6 +1181,55 @@ async def retry_papers(request: RetryRequest) -> JSONResponse:
     })
 
 
+@app.post("/api/reset-and-retry-all")
+async def reset_and_retry_all() -> JSONResponse:
+    """Reset every non-COMPLETE / non-in-flight paper to READY_FOR_RETRIEVAL.
+
+    Rescues papers stuck in:
+      - NORMALIZED, ENRICHED, IDENTITY_ASSIGNED (interrupted ingestion)
+      - FAILED, MANUAL_REQUIRED (prior tier exhaustion)
+      - VALIDATED (only if identity is flagged — still needs review)
+
+    Leaves alone:
+      - COMPLETE, DUPLICATE (terminal success/dedup)
+      - RETRIEVING, VALIDATING (active workers — don't disrupt)
+      - READY_FOR_RETRIEVAL, RETRIEVED (already queued or in validation queue)
+    """
+    db = _get_db()
+
+    async def _do_full_reset(conn: Any) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        rescue_states = (
+            PaperState.NORMALIZED.value,
+            PaperState.ENRICHED.value,
+            PaperState.IDENTITY_ASSIGNED.value,
+            PaperState.FAILED.value,
+            PaperState.MANUAL_REQUIRED.value,
+        )
+        placeholders = ",".join("?" for _ in rescue_states)
+        cursor = await conn.execute(
+            f"UPDATE papers SET state = ?, previous_state = state, "
+            f"worker_id = NULL, claimed_at = NULL, "
+            f"last_failure_code = NULL, updated_at = ? "
+            f"WHERE state IN ({placeholders})",
+            (PaperState.READY_FOR_RETRIEVAL.value, now) + rescue_states,
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    count = await db._enqueue_write(_do_full_reset)
+
+    await db.log_audit(AuditLogEntry(
+        outcome="RESET_AND_RETRY_ALL",
+        details=json.dumps({"papers_reset": count}),
+    ))
+
+    return JSONResponse({
+        "status": "reset_complete",
+        "papers_reset": count,
+    })
+
+
 @app.get("/api/runs")
 async def list_runs(
     limit: int = Query(default=50, ge=1, le=200),
