@@ -416,3 +416,310 @@ class RunStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+
+
+# ===========================================================================
+# DATACLASSES
+# ===========================================================================
+
+
+@dataclass
+class Paper:
+    """Core paper record persisted in SQLite papers table.
+
+    Holds all metadata, retrieval state, validation results, and
+    file-system references for a single paper throughout the pipeline.
+    """
+
+    # --- Identity ---
+    canonical_id: str
+    doi: Optional[str] = None
+    pmid: Optional[str] = None
+    openalex_id: Optional[str] = None
+    title_hash: Optional[str] = None
+
+    # --- Bibliographic metadata ---
+    title: str = ""
+    authors: str = ""
+    first_author_lastname: str = ""
+    year: Optional[int] = None
+    journal: Optional[str] = None
+
+    # --- State machine ---
+    state: str = PaperState.INGESTED.value
+    previous_state: Optional[str] = None
+
+    # --- Publisher resolution ---
+    publisher: str = PublisherEnum.OTHER.value
+    publisher_signal_source: Optional[str] = None  # "doi_prefix" | "crossref" | "redirect_domain"
+
+    # --- Retrieval metadata ---
+    retrieval_tier: Optional[str] = None
+    retrieval_method: Optional[str] = None
+    retrieval_url: Optional[str] = None
+    attempt_count: int = 0
+    last_failure_code: Optional[str] = None
+
+    # --- File storage ---
+    pdf_path: Optional[str] = None
+    pdf_filename: Optional[str] = None
+    sha256_checksum: Optional[str] = None
+    pdf_size_bytes: Optional[int] = None
+    pdf_page_count: Optional[int] = None
+
+    # --- Validation results ---
+    validation_status: Optional[str] = None
+    identity_status: Optional[str] = None
+    version_type: str = VersionType.UNKNOWN.value
+    is_primary: bool = True
+    integrity_score: Optional[int] = None
+    confidence_level: Optional[str] = None
+
+    # --- OCR ---
+    ocr_applied: bool = False
+    ocr_text_extracted: bool = False
+
+    # --- Content drift ---
+    content_drift_status: Optional[str] = None
+    content_drift_version: int = 1
+
+    # --- Supplements ---
+    supplement_count: int = 0
+
+    # --- User override ---
+    user_override: Optional[str] = None  # "CONFIRMED_CORRECT" | "RE_RETRIEVE"
+    override_reason: Optional[str] = None
+    override_timestamp: Optional[str] = None
+
+    # --- Worker tracking ---
+    worker_id: Optional[str] = None
+    claimed_at: Optional[str] = None
+
+    # --- Run linkage ---
+    run_id: Optional[str] = None
+    run_id_of_first_success: Optional[str] = None
+
+    # --- Timestamps ---
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: Optional[str] = None
+
+    # --- Raw ingestion data ---
+    raw_doi: Optional[str] = None
+    raw_title: Optional[str] = None
+    raw_authors: Optional[str] = None
+
+    # --- Enrichment source tracking ---
+    enrichment_source: Optional[str] = None  # "openalex" | "crossref"
+    enriched_fields: Optional[str] = None    # JSON list of field names auto-filled
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for SQLite insertion."""
+        return asdict(self)
+
+
+@dataclass
+class AuditLogEntry:
+    """Single audit log entry written to SQLite and exported to JSONL.
+
+    Every retrieval attempt, validation check, state transition,
+    and system event produces one of these.
+    """
+
+    id: Optional[int] = None
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    canonical_id: Optional[str] = None
+    run_id: Optional[str] = None
+    tier: Optional[str] = None
+    method: Optional[str] = None
+    url_attempted: Optional[str] = None
+    http_status: Optional[int] = None
+    content_type_received: Optional[str] = None
+    outcome: Optional[str] = None
+    failure_code: Optional[str] = None
+    execution_time_ms: Optional[float] = None
+    retry_count: int = 0
+    cache_hit: bool = False
+    details: Optional[str] = None  # JSON string for extra context
+    exception_type: Optional[str] = None
+    exception_message: Optional[str] = None
+    exception_traceback: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for SQLite insertion."""
+        return asdict(self)
+
+
+@dataclass
+class RunRecord:
+    """Metadata for a single retrieval run (runs table)."""
+
+    run_id: str
+    started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    completed_at: Optional[str] = None
+    status: str = RunStatus.RUNNING.value
+    total_submitted: int = 0
+    config_snapshot: Optional[str] = None  # JSON copy of config at run start
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for SQLite insertion."""
+        return asdict(self)
+
+
+@dataclass
+class PaperRun:
+    """Links a paper to a specific run (paper_runs table).
+
+    Tracks per-run outcomes independently from the global paper state.
+    """
+
+    canonical_id: str
+    run_id: str
+    submitted_in_this_run: bool = True
+    retrieval_attempted_in_this_run: bool = False
+    outcome_in_this_run: Optional[str] = None  # e.g. "RETRIEVED", "FAILED", "ALREADY_RETRIEVED"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for SQLite insertion."""
+        return asdict(self)
+
+
+@dataclass
+class PublisherCooldown:
+    """Tracks adaptive cooldown state per publisher (publisher_cooldowns table)."""
+
+    publisher: str
+    failure_count: int = 0
+    success_count: int = 0
+    failure_rate: float = 0.0
+    cooldown_until: Optional[str] = None  # ISO timestamp
+    extended_count: int = 0
+    last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @property
+    def is_in_cooldown(self) -> bool:
+        """Check whether this publisher is currently in cooldown."""
+        if self.cooldown_until is None:
+            return False
+        now = datetime.now(timezone.utc)
+        try:
+            expiry = datetime.fromisoformat(self.cooldown_until)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return now < expiry
+        except (ValueError, TypeError):
+            return False
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for SQLite insertion."""
+        result = asdict(self)
+        result.pop("is_in_cooldown", None)
+        return result
+
+
+@dataclass
+class ApiCacheEntry:
+    """Cached API response (api_cache table).
+
+    Keyed by normalized DOI + api_name. Shared across all runs.
+    """
+
+    doi: str
+    api_name: str  # "unpaywall" | "openalex" | "crossref" | "semantic_scholar" | "pmc" | "europepmc"
+    response_json: str  # JSON string
+    cached_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    expires_at: Optional[str] = None
+
+    @property
+    def is_expired(self) -> bool:
+        """Check whether this cache entry has expired."""
+        if self.expires_at is None:
+            return False
+        now = datetime.now(timezone.utc)
+        try:
+            expiry = datetime.fromisoformat(self.expires_at)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return now >= expiry
+        except (ValueError, TypeError):
+            return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for SQLite insertion."""
+        result = asdict(self)
+        result.pop("is_expired", None)
+        return result
+
+
+@dataclass
+class SupplementFile:
+    """Metadata for a downloaded supplement file."""
+
+    canonical_id: str
+    supplement_index: int  # 1-based
+    filename: str
+    file_path: str
+    file_extension: str
+    file_size_bytes: Optional[int] = None
+    sha256_checksum: Optional[str] = None
+    validation_status: Optional[str] = None  # "VALID" for PDFs, "SUPPLEMENT_NON_PDF" for others
+    source_url: Optional[str] = None
+    downloaded_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for SQLite insertion."""
+        return asdict(self)
+
+
+@dataclass
+class ConfigSnapshot:
+    """Immutable snapshot of configuration at run start.
+
+    Stored as JSON in RunRecord.config_snapshot for audit reproducibility.
+    """
+
+    config_version: int
+    output_directory: str
+    supplement_directory: str
+    database_path: str
+    api_timeout_s: float
+    pdf_download_timeout_s: float
+    page_load_timeout_s: float
+    selector_timeout_s: float
+    pdf_validation_timeout_s: float
+    ocr_per_page_timeout_s: float
+    max_retries: int
+    max_total_attempts: int
+    retrieval_concurrency: int
+    validation_concurrency: int
+    backpressure_threshold: int
+    min_disk_space_bytes: int
+    cache_ttl_days: int
+    cooldown_failure_threshold: float
+    cooldown_window_size: int
+    cooldown_minutes: int
+    unpaywall_email: str
+    sso_proxy_url: str
+    openathens_url: str
+    institutional_resolver_url: str
+    scholar_min_delay_s: float
+    scholar_max_queries_per_paper: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ConfigSnapshot:
+        """Create a ConfigSnapshot from a configuration dictionary.
+
+        Ignores unknown keys so forward-compatible configs don't break.
+        """
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered)
+
+    def to_json(self) -> str:
+        """Serialize to JSON string for storage in runs table."""
+        return json.dumps(asdict(self), indent=2)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> ConfigSnapshot:
+        """Deserialize from JSON string."""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
