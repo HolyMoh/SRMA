@@ -595,7 +595,7 @@
                 <span class="nav-icon">&#9654;</span> Run
             </div>
             <div class="nav-item" data-panel="sso">
-                <span class="nav-icon">&#128274;</span> SSO
+                <span class="nav-icon">&#128274;</span> Paywalled
             </div>
             <div class="nav-item" data-panel="results">
                 <span class="nav-icon">&#128203;</span> Results
@@ -1169,18 +1169,28 @@
              ============================================================ -->
         <div id="panelSso" class="panel">
             <div class="panel-header">
-                <h2>Institutional SSO Access</h2>
+                <h2>Paywalled Retrieval</h2>
                 <span class="badge" id="ssoPhaseBadge">idle</span>
             </div>
 
-            <!-- Security reminder — always visible -->
-            <div class="card" style="border-left: 3px solid var(--success); background: #f0fdf4">
+            <!-- Strategy chooser — the three recommended paths, in priority order.
+                 Playwright-driven SSO batch automation has been demoted to
+                 "Experimental Batch Mode" below, because single-tab bookmarklet
+                 + Zotero Connector + Manual Mode together beat it on reliability
+                 and privacy for every real-world session we've observed. -->
+            <div class="card" style="border-left:3px solid var(--success); background:#f0fdf4">
                 <div style="font-size:13px; line-height:1.6">
-                    <strong style="color:var(--success)">&#128274; Your credentials stay private</strong><br>
-                    The system opens a real browser window for you. <strong>You</strong> type your login.
-                    We never read, log, store, or screenshot anything in that browser. The browser
-                    context is destroyed when you end the session — no cookies are kept.
+                    <strong style="color:var(--success)">&#128274; Your credentials stay on your machine.</strong>
+                    Pick any of the three retrieval paths below. They all use
+                    <em>your</em> browser session (the one you already logged in with) —
+                    SRMA never sees your institutional password. Use whichever
+                    matches your workflow; they can run concurrently.
                 </div>
+                <ol style="margin:10px 0 0 20px;font-size:12px;color:var(--text-secondary);line-height:1.7">
+                    <li><strong>Manual Mode</strong> — drop PDFs into a watched folder. Maximum privacy.</li>
+                    <li><strong>Zotero</strong> — push the queue as a collection; save PDFs with the Zotero Connector; we pull them back.</li>
+                    <li><strong>Bookmarklet</strong> — one-click upload from any publisher page.</li>
+                </ol>
             </div>
 
             <!-- ============================================================
@@ -1346,8 +1356,37 @@
                 <div id="manualQueueList" style="max-height:420px;overflow-y:auto;font-size:12px"></div>
             </div>
 
+            <!-- ============================================================
+                 EXPERIMENTAL BATCH MODE — Playwright-driven SSO automation.
+                 Demoted in Part 4 because publisher-side friction (CAPTCHAs,
+                 session-timeouts, consent banners, interstitials) means
+                 single-tab flows (Manual/Zotero/Bookmarklet) are more reliable.
+                 Kept behind a collapsed <details> so it doesn't distract from
+                 the three recommended paths above.
+                 ============================================================ -->
+            <details class="card" id="batchModeWrap" style="border-left:3px solid var(--warning);background:#fffbeb">
+                <summary style="cursor:pointer;padding:2px 0">
+                    <span style="font-weight:600;font-size:15px">&#9888; Experimental Batch Mode</span>
+                    <span class="badge badge-warning" style="margin-left:8px">Legacy</span>
+                </summary>
+                <div style="margin-top:12px;font-size:13px;color:var(--text-secondary);line-height:1.6">
+                    Automated Playwright SSO session. Opens a real browser you
+                    log into once; the system then navigates each paper and
+                    downloads PDFs in sequence. In practice this hits publisher
+                    interstitials, CAPTCHAs, and session timeouts often enough
+                    that the three paths above are faster and more reliable.
+                    Kept for large (&gt; 50-paper) runs where your institution
+                    exposes a well-behaved proxy.
+                </div>
+                <div style="margin-top:10px;padding:10px 12px;background:#fef3c7;border-radius:6px;font-size:12px">
+                    <strong>Before you use this:</strong> make sure Playwright
+                    and a Chromium browser are installed (see Settings &rarr;
+                    Setup Wizard). If Playwright isn't available, this whole
+                    section is inert.
+                </div>
+
             <!-- STEP 1: QUEUE VISIBILITY -->
-            <div class="card">
+            <div class="card" style="margin-top:16px">
                 <div class="card-header">
                     <h3>Step 1 &middot; SSO Queue</h3>
                     <button class="btn btn-outline btn-sm" id="btnSsoReloadQueue">Refresh</button>
@@ -1492,6 +1531,7 @@
                     <div id="ssoAuditFunctionList" style="font-family:var(--mono);font-size:11px"></div>
                 </details>
             </div>
+            </details><!-- /batchModeWrap -->
         </div>
 
         <!-- ============================================================
