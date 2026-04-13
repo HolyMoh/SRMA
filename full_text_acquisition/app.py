@@ -2299,6 +2299,63 @@ async def get_papers(
     })
 
 
+@app.get("/api/pdf/{canonical_id}")
+async def serve_paper_pdf(canonical_id: str) -> FileResponse:
+    """Stream a paper's PDF inline so the browser renders it in a tab.
+
+    SECURITY: validates that the resolved file path is inside the
+    configured output_directory (path-traversal guard). If the database
+    ever held a path like /etc/passwd (e.g. via a future bug), this
+    endpoint refuses to serve it.
+
+    Returns 404 if the paper is unknown or has no PDF on disk.
+    Returns 403 if pdf_path resolves outside output_directory.
+    """
+    db = _get_db()
+    config = _get_config()
+
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if not paper.pdf_path:
+        raise HTTPException(status_code=404, detail="No PDF for this paper")
+
+    # Path-traversal guard
+    output_dir = os.path.abspath(
+        config.get("output_directory", "./downloads")
+    )
+    pdf_abs = os.path.abspath(paper.pdf_path)
+
+    try:
+        common = os.path.commonpath([output_dir, pdf_abs])
+    except ValueError:
+        # Different drives on Windows etc.
+        common = ""
+    if common != output_dir:
+        logger.warning(
+            "Refusing to serve PDF outside output_directory: "
+            "canonical_id=%s pdf_path=%s output_dir=%s",
+            canonical_id, paper.pdf_path, output_dir,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="PDF path is outside the configured output directory",
+        )
+
+    if not os.path.isfile(pdf_abs):
+        raise HTTPException(status_code=404, detail="PDF file missing on disk")
+
+    # FileResponse streams the file; inline disposition makes the browser
+    # render it in the tab rather than offering download
+    filename = paper.pdf_filename or os.path.basename(pdf_abs)
+    return FileResponse(
+        pdf_abs,
+        media_type="application/pdf",
+        filename=filename,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
 @app.get("/api/paper/{canonical_id}")
 async def get_paper_detail(canonical_id: str) -> JSONResponse:
     """Get full detail for a single paper including audit log."""

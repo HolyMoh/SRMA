@@ -1179,6 +1179,7 @@
                                 <th data-sort="attempt_count">Att.</th>
                                 <th>Failure</th>
                                 <th>Override</th>
+                                <th>Links</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -1258,6 +1259,7 @@ const state = {
     lastCountersSnap: null,
     enrichmentSseSource: null,
     enrichmentInProgress: false,
+    proxyPrefix: '',  // EZproxy URL prefix, fetched once on load
 };
 
 /* ------------------------------------------------------------------
@@ -1983,6 +1985,9 @@ async function loadSsoStatus() {
 
 function renderSsoQueue(q) {
     const total = q.total || 0;
+    // Cache the prefix so the Results-table Links column can build
+    // EZproxy URLs without an extra round-trip per render
+    if (q.proxy_prefix) { state.proxyPrefix = q.proxy_prefix; }
     document.getElementById('ssoProxyPrefix').textContent = 'EZproxy prefix in use: ' + (q.proxy_prefix || '(none)');
     if (total === 0) {
         document.getElementById('ssoQueueSummary').innerHTML =
@@ -2165,7 +2170,7 @@ async function loadResults() {
         state.resultsTotalCount = data.total_count;
         const tbody = document.getElementById('resultsBody');
         if (!data.papers.length) {
-            tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--text-secondary);padding:32px">No papers found</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="16" style="text-align:center;color:var(--text-secondary);padding:32px">No papers found</td></tr>';
         } else {
             tbody.innerHTML = data.papers.map(renderPaperRow).join('');
         }
@@ -2178,6 +2183,82 @@ async function loadResults() {
     } catch (err) { toast('Failed to load results: ' + err.message, 'error'); }
 }
 
+function renderLinksCell(p) {
+    /* Per-paper links column. Only renders icons that have meaningful
+       URLs for this paper. Icons are unicode glyphs to avoid pulling in
+       an icon-font dependency. */
+    const links = [];
+
+    // 1. DOI — always when present
+    if (p.doi) {
+        const url = 'https://doi.org/' + encodeURIComponent(p.doi).replace(/%2F/gi, '/');
+        links.push(
+            '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" ' +
+            'title="DOI: ' + escAttr(p.doi) + '" ' +
+            'style="text-decoration:none;margin-right:6px">&#128279; DOI</a>'
+        );
+    }
+
+    // 2. Retrieval URL — only when retrieval succeeded (URL is recorded)
+    //    Note: PaperResponse exposes pdf_filename + retrieval_tier but
+    //    not retrieval_url directly. We surface what's available via
+    //    the paper-detail endpoint as a tooltip; the visible link goes
+    //    to the publisher's DOI landing page (which is what the system
+    //    navigated to anyway).
+    if (p.retrieval_tier && p.doi) {
+        const url = 'https://doi.org/' + encodeURIComponent(p.doi).replace(/%2F/gi, '/');
+        links.push(
+            '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" ' +
+            'title="Source the system used (' + escAttr(p.retrieval_tier) + ')" ' +
+            'style="text-decoration:none;margin-right:6px">&#128279; Source</a>'
+        );
+    }
+
+    // 3. EZproxy — only for MANUAL_REQUIRED papers with a DOI. Uses the
+    //    config-aware prefix cached from /api/sso/queue (defaults to
+    //    UofT if none configured).
+    if (p.state === 'MANUAL_REQUIRED' && p.doi && state.proxyPrefix) {
+        const articleUrl = 'https://doi.org/' + encodeURIComponent(p.doi).replace(/%2F/gi, '/');
+        const ezproxy = state.proxyPrefix + articleUrl;
+        links.push(
+            '<a href="' + escAttr(ezproxy) + '" target="_blank" rel="noopener" ' +
+            'title="Open via EZproxy (uses your institutional access)" ' +
+            'style="text-decoration:none;margin-right:6px;color:var(--accent)">&#128274; SSO</a>'
+        );
+    }
+
+    // 4. Local PDF — any paper that has a file on disk. The endpoint
+    //    enforces existence + path-traversal checks; if the file is
+    //    missing it returns 404 and the user gets a clean error.
+    if (p.pdf_filename) {
+        const url = '/api/pdf/' + encodeURIComponent(p.canonical_id);
+        const tooltip = (p.validation_status || '').startsWith('VALID')
+            ? 'Open local PDF (verified)'
+            : (p.validation_status === 'INVALID')
+                ? 'Open local PDF (failed validation)'
+                : 'Open local PDF (validation pending or flagged)';
+        links.push(
+            '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" ' +
+            'title="' + escAttr(tooltip) + '" ' +
+            'style="text-decoration:none;color:var(--success)">&#128196; PDF</a>'
+        );
+    }
+
+    // 5. "Try via SSO" — only when a paywall was hit. Switches the user
+    //    to the SSO panel (the queue already contains this paper).
+    if (p.state === 'MANUAL_REQUIRED' && p.last_failure_code === 'PAYWALL_DETECTED') {
+        links.push(
+            '<button class="btn btn-sm btn-outline" ' +
+            'onclick="trySsoForPaper(\'' + escAttr(p.canonical_id) + '\')" ' +
+            'title="Open the SSO panel and highlight this paper" ' +
+            'style="margin-left:6px;padding:1px 6px;font-size:11px">Try via SSO</button>'
+        );
+    }
+
+    return links.length ? links.join('') :
+        '<span style="color:var(--text-secondary);font-size:11px">—</span>';
+}
+
 function renderPaperRow(p) {
     const sc = p.confidence_level === 'HIGH' ? 'score-high' : p.confidence_level === 'MEDIUM' ? 'score-medium' : 'score-low';
     const flagged = p.identity_status === 'VERSION_MISMATCH' || p.identity_status === 'CONTENT_UNVERIFIED';
@@ -2187,14 +2268,41 @@ function renderPaperRow(p) {
     const stBadge = '<span class="badge ' + ({COMPLETE:'badge-success',FAILED:'badge-danger',MANUAL_REQUIRED:'badge-warning',RETRIEVING:'badge-info',VALIDATING:'badge-info',RETRIEVED:'badge-info'}[p.state]||'badge-neutral') + '">' + escHtml(p.state||'') + '</span>';
     const vsBadge = p.validation_status ? '<span class="badge ' + (p.validation_status.startsWith('VALID')?'badge-success':p.validation_status==='INVALID'?'badge-danger':'badge-warning') + '">' + escHtml(p.validation_status) + '</span>' : '';
     const idBadge = p.identity_status ? '<span class="badge ' + (flagged?'badge-warning':'badge-success') + '">' + escHtml(p.identity_status) + '</span>' : '';
+    const linksCell = renderLinksCell(p);
     return '<tr><td title="' + escAttr(p.title||'') + '">' + escHtml((p.title||'').substring(0,50)) + (p.title && p.title.length>50?'...':'') + '</td>' +
         '<td>' + escHtml(p.authors ? p.authors.split(';')[0].trim().substring(0,25) : '') + '</td>' +
         '<td>' + (p.year||'') + '</td><td title="' + escAttr(p.doi||'') + '">' + escHtml((p.doi||'').substring(0,20)) + '</td>' +
         '<td>' + stBadge + '</td><td>' + vsBadge + '</td><td>' + idBadge + '</td>' +
         '<td>' + escHtml(p.version_type||'') + '</td><td class="' + sc + '">' + (p.integrity_score!=null?p.integrity_score:'') + '</td>' +
         '<td>' + escHtml(p.retrieval_tier||'') + '</td><td>' + (p.supplement_count||0) + '</td><td>' + p.attempt_count + '</td>' +
-        '<td>' + escHtml(p.last_failure_code||'') + '</td><td>' + escHtml(p.user_override||'') + '</td><td>' + actions + '</td></tr>';
+        '<td>' + escHtml(p.last_failure_code||'') + '</td><td>' + escHtml(p.user_override||'') + '</td>' +
+        '<td style="white-space:nowrap">' + linksCell + '</td>' +
+        '<td>' + actions + '</td></tr>';
 }
+
+/* "Try via SSO" handler — switch panels and scroll the SSO queue list
+   to the row matching this paper, if present. The SSO queue already
+   contains every MANUAL_REQUIRED paper (per FIX 7), so no enqueue is
+   needed; we just bring the user there. */
+window.trySsoForPaper = async function(canonicalId) {
+    switchPanel('sso');
+    toast('Start the SSO session to retrieve this paper', 'info');
+    // Wait for the panel's queue to populate, then scroll the
+    // matching paper into view.
+    setTimeout(function() {
+        const list = document.getElementById('ssoQueueList');
+        if (!list) return;
+        const target = Array.from(list.children).find(function(child) {
+            return child.innerHTML.indexOf(canonicalId) >= 0
+                || child.textContent.indexOf(canonicalId) >= 0;
+        });
+        if (target) {
+            target.scrollIntoView({behavior: 'smooth', block: 'center'});
+            target.style.outline = '2px solid var(--accent)';
+            setTimeout(function() { target.style.outline = ''; }, 3000);
+        }
+    }, 600);
+};
 
 document.querySelectorAll('#resultsTabBar .tab').forEach(function(tab) {
     tab.addEventListener('click', function() {
@@ -2286,6 +2394,13 @@ function formatBytes(b) {
                 document.getElementById('uploadResults').style.display = 'block';
                 startEnrichmentSSE();
             }
+        } catch (e) {}
+
+        // Bootstrap the EZproxy prefix so Results-table Links column
+        // can build SSO URLs without requiring the user to visit SSO first.
+        try {
+            const q = await GET('/api/sso/queue');
+            if (q && q.proxy_prefix) state.proxyPrefix = q.proxy_prefix;
         } catch (e) {}
     } catch(e) { toast('Could not connect to server', 'error'); }
     updateRunButtons();
