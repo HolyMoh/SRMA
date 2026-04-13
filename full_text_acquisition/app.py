@@ -1796,6 +1796,19 @@ async def start_run(
             detail="No papers are ready for retrieval or validation.",
         )
 
+    # Auto-backup before workers touch data. Runs only when we've just
+    # passed the busy-check (wp.is_running was false at the top), so
+    # the DB is quiescent. 5-file rotation keeps disk use bounded.
+    current_slug = _current_project_slug_or_404()
+    try:
+        await _create_backup(current_slug, kind=BACKUP_KIND_AUTO)
+        _rotate_auto_backups(current_slug, keep=_AUTO_BACKUP_KEEP)
+    except Exception as exc:
+        # Do NOT abort the run if backup fails — just log and continue.
+        # The user explicitly clicked Start; a flaky disk on the backup
+        # folder shouldn't block their work.
+        logger.warning("Auto-backup failed (run will proceed): %s", exc)
+
     # Apply per-run output_directory override (if any).
     # The override is stored in the run's config_snapshot at upload time.
     # Limitation: only one active run at a time, so retargeting the
@@ -4987,6 +5000,447 @@ async def health_snapshot() -> JSONResponse:
 
 
 # ===========================================================================
+# BACKUP & RESTORE — per-project, SQLite backup API
+# ===========================================================================
+#
+# Uses stdlib sqlite3.Connection.backup() (NOT file copy) so manual
+# backups are consistent even while writers are active. Restore is a
+# teardown + overwrite + rebuild operation analogous to project switch;
+# requires quiescent state.
+
+BACKUP_KIND_MANUAL = "manual"
+BACKUP_KIND_AUTO = "auto"
+BACKUP_KIND_SAFETY = "safety"
+_AUTO_BACKUP_KEEP = 5
+_BACKUP_STALE_DAYS = 7
+
+
+def _project_backups_dir(slug: str, kind: str) -> str:
+    return os.path.join(_project_dir(slug), "backups", kind)
+
+
+def _ensure_backup_dirs(slug: str) -> None:
+    for kind in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        os.makedirs(_project_backups_dir(slug, kind), exist_ok=True)
+
+
+def _sqlite_backup_sync(source_path: str, target_path: str) -> None:
+    """Blocking SQLite backup — run in executor.
+
+    Opens a SEPARATE sqlite3 connection to the source file so we don't
+    interfere with the aiosqlite write queue. In WAL mode, the backup
+    API proceeds without blocking the writer.
+    """
+    import sqlite3 as _sqlite3
+    src = _sqlite3.connect(source_path)
+    try:
+        dst = _sqlite3.connect(target_path)
+        try:
+            # pages=500 keeps each lock window short under heavy write load
+            src.backup(dst, pages=500)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+def _sqlite_read_counts_sync(db_path: str) -> Dict[str, int]:
+    """Synchronously read paper/run/complete counts from an arbitrary DB."""
+    import sqlite3 as _sqlite3
+    counts = {"paper_count": 0, "run_count": 0, "complete_count": 0}
+    try:
+        conn = _sqlite3.connect(db_path)
+        try:
+            try:
+                counts["paper_count"] = conn.execute(
+                    "SELECT COUNT(*) FROM papers"
+                ).fetchone()[0]
+            except _sqlite3.OperationalError: pass
+            try:
+                counts["run_count"] = conn.execute(
+                    "SELECT COUNT(*) FROM runs"
+                ).fetchone()[0]
+            except _sqlite3.OperationalError: pass
+            try:
+                counts["complete_count"] = conn.execute(
+                    "SELECT COUNT(*) FROM papers WHERE state = 'COMPLETE'"
+                ).fetchone()[0]
+            except _sqlite3.OperationalError: pass
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Read counts failed for %s: %s", db_path, exc)
+    return counts
+
+
+async def _create_backup(
+    slug: str,
+    kind: str = BACKUP_KIND_MANUAL,
+) -> Dict[str, Any]:
+    """Create a backup + write metadata sidecar. Safe during active workers."""
+    if kind not in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        raise ValueError(f"Invalid backup kind: {kind}")
+
+    _ensure_backup_dirs(slug)
+    src_db = _project_db_path(slug)
+    if not os.path.isfile(src_db):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Project DB does not exist yet: {src_db}",
+        )
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    fname = f"acquisition_backup_{ts}_{suffix}.db"
+    target = os.path.join(_project_backups_dir(slug, kind), fname)
+
+    # Flush live write queue so recent ops are on disk before backup
+    db = app_state.get("db")
+    cp = app_state.get("current_project") or {}
+    if db is not None and cp.get("project_slug") == slug:
+        try:
+            await db.flush_write_queue()
+        except Exception: pass
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, _sqlite_backup_sync, src_db, target)
+    except Exception as exc:
+        try:
+            if os.path.exists(target): os.unlink(target)
+        except OSError: pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"SQLite backup failed: {exc}",
+        )
+
+    counts = await loop.run_in_executor(None, _sqlite_read_counts_sync, target)
+    size_bytes = os.path.getsize(target)
+    meta = {
+        "kind": kind,
+        "filename": fname,
+        "path": target,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "size_bytes": size_bytes,
+        "size_human": _human_bytes(size_bytes),
+        **counts,
+    }
+    with open(target + ".meta.json", "w") as fh:
+        json.dump(meta, fh, indent=2)
+
+    try:
+        if db is not None:
+            await db.log_audit(AuditLogEntry(
+                outcome=f"BACKUP_{kind.upper()}",
+                details=json.dumps({
+                    "filename": fname,
+                    "size_bytes": size_bytes,
+                    **counts,
+                }),
+            ))
+    except Exception: pass
+
+    logger.info(
+        "Created %s backup for project %s: %s (%d bytes)",
+        kind, slug, fname, size_bytes,
+    )
+    return meta
+
+
+def _read_backup_meta(backup_path: str) -> Dict[str, Any]:
+    """Read sidecar metadata; fall back to os.stat if absent."""
+    meta_path = backup_path + ".meta.json"
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r") as fh:
+                data = json.load(fh)
+            try: data["size_bytes"] = os.path.getsize(backup_path)
+            except OSError: pass
+            data["size_human"] = _human_bytes(data.get("size_bytes", 0))
+            return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    try:
+        st = os.stat(backup_path)
+        return {
+            "kind": "unknown",
+            "filename": os.path.basename(backup_path),
+            "path": backup_path,
+            "created_at": datetime.fromtimestamp(
+                st.st_mtime, tz=timezone.utc
+            ).isoformat(),
+            "size_bytes": st.st_size,
+            "size_human": _human_bytes(st.st_size),
+            "paper_count": None, "run_count": None, "complete_count": None,
+        }
+    except OSError:
+        return {}
+
+
+def _list_backups_for_project(slug: str) -> Dict[str, List[Dict[str, Any]]]:
+    """List backups by kind via sidecar metadata only — no DB opens."""
+    _ensure_backup_dirs(slug)
+    out: Dict[str, List[Dict[str, Any]]] = {
+        BACKUP_KIND_MANUAL: [], BACKUP_KIND_AUTO: [], BACKUP_KIND_SAFETY: [],
+    }
+    for kind in out.keys():
+        d = _project_backups_dir(slug, kind)
+        if not os.path.isdir(d): continue
+        for name in os.listdir(d):
+            if not name.endswith(".db"): continue
+            meta = _read_backup_meta(os.path.join(d, name))
+            if meta: out[kind].append(meta)
+        out[kind].sort(key=lambda m: m.get("created_at", ""), reverse=True)
+    return out
+
+
+def _rotate_auto_backups(slug: str, keep: int = _AUTO_BACKUP_KEEP) -> int:
+    """Delete oldest auto backups beyond the keep limit."""
+    d = _project_backups_dir(slug, BACKUP_KIND_AUTO)
+    if not os.path.isdir(d): return 0
+    entries: List[tuple] = []
+    for name in os.listdir(d):
+        if not name.endswith(".db"): continue
+        full = os.path.join(d, name)
+        try: entries.append((os.path.getmtime(full), full))
+        except OSError: continue
+    entries.sort(reverse=True)  # newest first
+
+    deleted = 0
+    for _mtime, full in entries[keep:]:
+        try: os.unlink(full); deleted += 1
+        except OSError: continue
+        meta_path = full + ".meta.json"
+        try:
+            if os.path.isfile(meta_path): os.unlink(meta_path)
+        except OSError: pass
+    if deleted:
+        logger.info("Rotated %d old auto backups for project %s", deleted, slug)
+    return deleted
+
+
+def _last_backup_info(slug: str) -> Dict[str, Any]:
+    """Summary for UI: last backup + stale flag."""
+    groups = _list_backups_for_project(slug)
+    candidates: List[Dict[str, Any]] = []
+    for k in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO):
+        candidates.extend(groups[k])
+    if not candidates:
+        return {
+            "any_backup_exists": False, "stale": True,
+            "last_backup_at": None, "last_backup_age_days": None,
+            "last_backup_size_bytes": 0,
+            "last_backup_filename": None, "last_backup_kind": None,
+        }
+    candidates.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+    latest = candidates[0]
+    try:
+        created = datetime.fromisoformat(latest["created_at"])
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - created).total_seconds() / 86400.0
+    except (ValueError, TypeError):
+        age_days = None
+    return {
+        "any_backup_exists": True,
+        "stale": age_days is None or age_days > _BACKUP_STALE_DAYS,
+        "last_backup_at": latest.get("created_at"),
+        "last_backup_age_days": round(age_days, 2) if age_days is not None else None,
+        "last_backup_size_bytes": latest.get("size_bytes", 0),
+        "last_backup_filename": latest.get("filename"),
+        "last_backup_kind": latest.get("kind"),
+    }
+
+
+async def _restore_database_from_backup(
+    slug: str, filename: str,
+) -> Dict[str, Any]:
+    """Restore the project's DB from a backup file.
+
+    CALLERS MUST have verified _check_busy_reasons() == [].
+    Sequence:
+      1. Locate backup + verify path stays inside project backups/
+      2. Flush + close current DB
+      3. Safety backup of current DB (kind=safety)
+      4. Delete -wal and -shm sidecars (CRITICAL)
+      5. Copy backup -> acquisition.db
+      6. Rebind project (reopens DB, migrations, reconciliation)
+    """
+    import shutil as _shutil
+
+    project_backup_root = os.path.abspath(
+        os.path.join(_project_dir(slug), "backups")
+    )
+    candidate: Optional[str] = None
+    for kind in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        p = os.path.join(_project_backups_dir(slug, kind), filename)
+        if os.path.isfile(p):
+            candidate = p
+            break
+    if candidate is None:
+        raise HTTPException(
+            status_code=404, detail=f"Backup not found: {filename}",
+        )
+    # Defense in depth: ensure candidate stays inside project_backup_root
+    if os.path.commonpath([
+        os.path.abspath(candidate), project_backup_root,
+    ]) != project_backup_root:
+        raise HTTPException(
+            status_code=403, detail="Backup path escapes project directory",
+        )
+
+    current_db = app_state.get("db")
+    if current_db is not None:
+        try:
+            await current_db.flush_write_queue()
+            await current_db.close()
+        except Exception as exc:
+            logger.warning("Error closing DB before restore: %s", exc)
+
+    src_db = _project_db_path(slug)
+    safety_info: Optional[Dict[str, Any]] = None
+    if os.path.isfile(src_db):
+        try:
+            safety_info = await _create_backup(slug, kind=BACKUP_KIND_SAFETY)
+        except Exception as exc:
+            logger.error("Safety backup failed: %s — aborting restore", exc)
+            # Try to restore app to a working state
+            try: await _rebind_to_project(slug)
+            except Exception: pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"Safety backup failed, restore aborted: {exc}",
+            )
+
+    # CRITICAL: delete WAL/SHM sidecars before overwriting
+    for sidecar in (src_db + "-wal", src_db + "-shm"):
+        try:
+            if os.path.isfile(sidecar):
+                os.unlink(sidecar)
+                logger.info("Removed stale sidecar: %s", sidecar)
+        except OSError as exc:
+            logger.warning("Could not remove sidecar %s: %s", sidecar, exc)
+
+    tmp_path = src_db + ".restoring"
+    try:
+        _shutil.copy2(candidate, tmp_path)
+        os.replace(tmp_path, src_db)
+    except OSError as exc:
+        # Attempt rollback from safety
+        if safety_info and os.path.isfile(safety_info["path"]):
+            try:
+                _shutil.copy2(safety_info["path"], src_db)
+            except OSError: pass
+        try:
+            if os.path.exists(tmp_path): os.unlink(tmp_path)
+        except OSError: pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Restore copy failed: {exc}",
+        )
+
+    try:
+        await _rebind_to_project(slug)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"DB restored but rebind failed: {exc}",
+        )
+
+    return {
+        "status": "restored",
+        "restored_from": filename,
+        "backup_meta": _read_backup_meta(candidate),
+        "safety_backup_filename": (safety_info or {}).get("filename"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+def _current_project_slug_or_404() -> str:
+    cp = app_state.get("current_project") or {}
+    slug = cp.get("project_slug")
+    if not slug:
+        raise HTTPException(status_code=503, detail="No active project")
+    return slug
+
+
+@app.post("/api/backup")
+async def backup_create() -> JSONResponse:
+    """Manual backup of the current project's DB.
+
+    Safe during active workers (SQLite backup API on a separate
+    connection). Writes a sidecar .meta.json for cheap listing.
+    """
+    slug = _current_project_slug_or_404()
+    meta = await _create_backup(slug, kind=BACKUP_KIND_MANUAL)
+    return JSONResponse({"status": "created", **meta})
+
+
+@app.get("/api/backup/list")
+async def backup_list() -> JSONResponse:
+    """List backups grouped by kind. Reads sidecar metadata only."""
+    slug = _current_project_slug_or_404()
+    groups = _list_backups_for_project(slug)
+    return JSONResponse({
+        "manual": groups[BACKUP_KIND_MANUAL],
+        "auto": groups[BACKUP_KIND_AUTO],
+        "safety": groups[BACKUP_KIND_SAFETY],
+        "last_backup": _last_backup_info(slug),
+        "auto_keep_limit": _AUTO_BACKUP_KEEP,
+        "stale_after_days": _BACKUP_STALE_DAYS,
+    })
+
+
+@app.post("/api/backup/restore")
+async def backup_restore(filename: str = Query(...)) -> JSONResponse:
+    """Restore current project's DB from a backup. Refuses while busy."""
+    slug = _current_project_slug_or_404()
+    busy = _check_busy_reasons()
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Cannot restore while tasks are active",
+                "active": busy,
+                "guidance": "Stop running tasks, then retry restore.",
+            },
+        )
+    return JSONResponse(await _restore_database_from_backup(slug, filename))
+
+
+@app.delete("/api/backup/{filename}")
+async def backup_delete(filename: str) -> JSONResponse:
+    """Delete a specific backup + its metadata sidecar."""
+    slug = _current_project_slug_or_404()
+    project_backup_root = os.path.abspath(
+        os.path.join(_project_dir(slug), "backups")
+    )
+    target: Optional[str] = None
+    for kind in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        p = os.path.join(_project_backups_dir(slug, kind), filename)
+        if os.path.isfile(p):
+            if os.path.commonpath([
+                os.path.abspath(p), project_backup_root,
+            ]) != project_backup_root:
+                raise HTTPException(403, "Path escapes project directory")
+            target = p
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    try:
+        os.unlink(target)
+        mp = target + ".meta.json"
+        if os.path.isfile(mp): os.unlink(mp)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return JSONResponse({"status": "deleted", "filename": filename})
+
+
+# ===========================================================================
 # PROJECTS ENDPOINTS — per-project isolation
 # ===========================================================================
 
@@ -5236,7 +5690,26 @@ async def system_status() -> JSONResponse:
         "platform": platform.system(),
         "output_directory": active_output,
         "output_directory_free_bytes": free_bytes,
+        "backup": _safe_backup_summary(),
     })
+
+
+def _safe_backup_summary() -> Dict[str, Any]:
+    """Helper: last-backup info for the current project, tolerating no-project."""
+    cp = app_state.get("current_project") or {}
+    slug = cp.get("project_slug")
+    if not slug:
+        return {"any_backup_exists": False, "stale": True,
+                "last_backup_at": None, "last_backup_age_days": None,
+                "last_backup_size_bytes": 0,
+                "last_backup_filename": None, "last_backup_kind": None}
+    try:
+        return _last_backup_info(slug)
+    except Exception:
+        return {"any_backup_exists": False, "stale": True,
+                "last_backup_at": None, "last_backup_age_days": None,
+                "last_backup_size_bytes": 0,
+                "last_backup_filename": None, "last_backup_kind": None}
 
 
 # ===========================================================================

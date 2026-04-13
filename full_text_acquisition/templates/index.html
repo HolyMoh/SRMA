@@ -926,6 +926,49 @@
                     Click "Re-run Wizard" to check system dependencies.
                 </div>
             </div>
+
+            <!-- Backup & Restore — per-project isolation -->
+            <div class="card" id="backupCard">
+                <div class="card-header">
+                    <h3>&#128190; Backup &amp; Restore</h3>
+                    <div class="btn-group">
+                        <button class="btn btn-primary btn-sm" id="btnBackupNow">Backup Now</button>
+                        <button class="btn btn-outline btn-sm" id="btnBackupListRefresh">Refresh</button>
+                    </div>
+                </div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">
+                    Backups use the SQLite <strong>backup API</strong> (not file copy) — safe during active
+                    retrieval runs. Auto-backup runs at the start of every new retrieval; the 5 most
+                    recent are kept. Restore requires that <em>nothing is running</em> and creates a
+                    safety backup first.
+                </div>
+
+                <!-- Last backup summary -->
+                <div id="backupLastInfo"
+                     style="padding:10px;background:var(--bg-primary);border-radius:var(--radius-sm);font-size:13px;margin-bottom:12px">
+                    Loading...
+                </div>
+
+                <!-- Backup lists -->
+                <details style="margin-top:12px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        Manual backups (<span id="backupCountManual">0</span>)
+                    </summary>
+                    <div id="backupListManual" style="margin-top:8px"></div>
+                </details>
+                <details style="margin-top:8px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        Auto backups (<span id="backupCountAuto">0</span> / 5 kept)
+                    </summary>
+                    <div id="backupListAuto" style="margin-top:8px"></div>
+                </details>
+                <details style="margin-top:8px">
+                    <summary style="cursor:pointer;font-size:12px;color:var(--text-secondary)">
+                        Safety backups (pre-restore, <span id="backupCountSafety">0</span>)
+                    </summary>
+                    <div id="backupListSafety" style="margin-top:8px;font-size:11px"></div>
+                </details>
+            </div>
         </div>
 
         <!-- ============================================================
@@ -1564,7 +1607,7 @@ function switchPanel(name) {
     });
     // Unified SSE is always on; individual panels only trigger one-shot loads
     if (name === 'results') { loadResults(); loadResultsOutputHeader(); }
-    if (name === 'settings') loadSettings();
+    if (name === 'settings') { loadSettings(); loadBackupPanel(); }
     if (name === 'run') loadRuns();
     if (name === 'sso') {
         loadSsoStatus();
@@ -2662,6 +2705,144 @@ document.addEventListener('toggle', function(e) {
         loadSsoAuditFunctions();
     }
 }, true);
+
+/* ------------------------------------------------------------------
+   Backup & Restore — per-project SQLite backup API
+   ------------------------------------------------------------------
+   Loaded on demand when the Settings panel is switched to.
+*/
+function _relDate(iso) {
+    if (!iso) return '';
+    try {
+        const d = new Date(iso);
+        return d.toLocaleString();
+    } catch (e) { return iso; }
+}
+
+async function loadBackupPanel() {
+    try {
+        const data = await GET('/api/backup/list');
+        const last = data.last_backup || {};
+
+        // Summary line + stale warning
+        const lastEl = document.getElementById('backupLastInfo');
+        if (!last.any_backup_exists) {
+            lastEl.innerHTML =
+                '<div style="color:var(--warning)">&#9888; <strong>No backups yet.</strong> ' +
+                'Click Backup Now to create the first one. ' +
+                'The system will also auto-backup before every new run.</div>';
+        } else {
+            const staleTag = last.stale
+                ? '<div style="color:var(--warning);margin-top:6px">&#9888; Last backup is ' +
+                  last.last_backup_age_days + ' days old (stale threshold: 7 days)</div>'
+                : '';
+            lastEl.innerHTML =
+                '<div><strong>Last backup:</strong> ' + _relDate(last.last_backup_at) +
+                ' (<span style="text-transform:capitalize">' + escHtml(last.last_backup_kind || '') + '</span>, ' +
+                formatBytes(last.last_backup_size_bytes || 0) + ', ' +
+                (last.last_backup_age_days != null ? last.last_backup_age_days + 'd ago' : '') + ')</div>' +
+                '<div style="font-family:var(--mono);font-size:11px;color:var(--text-secondary);margin-top:2px">' +
+                escHtml(last.last_backup_filename || '') + '</div>' +
+                staleTag;
+        }
+
+        // Lists
+        document.getElementById('backupCountManual').textContent = (data.manual || []).length;
+        document.getElementById('backupCountAuto').textContent = (data.auto || []).length;
+        document.getElementById('backupCountSafety').textContent = (data.safety || []).length;
+
+        document.getElementById('backupListManual').innerHTML = renderBackupList(data.manual || [], true);
+        document.getElementById('backupListAuto').innerHTML = renderBackupList(data.auto || [], true);
+        document.getElementById('backupListSafety').innerHTML = renderBackupList(data.safety || [], true);
+    } catch (err) {
+        document.getElementById('backupLastInfo').innerHTML =
+            '<span style="color:var(--danger)">Failed to load: ' + escHtml(err.message) + '</span>';
+    }
+}
+
+function renderBackupList(items, showActions) {
+    if (items.length === 0) {
+        return '<div style="color:var(--text-secondary);font-size:12px;padding:6px">None.</div>';
+    }
+    return items.map(function(b) {
+        const papers = b.paper_count != null ? b.paper_count + ' papers' : '';
+        const runs = b.run_count != null ? b.run_count + ' runs' : '';
+        const complete = b.complete_count != null ? b.complete_count + ' complete' : '';
+        const meta = [papers, runs, complete].filter(function(x){return x;}).join(' &middot; ');
+        const actions = showActions ?
+            '<button class="btn btn-sm btn-primary" onclick="restoreBackup(\'' + escAttr(b.filename) + '\')">Restore</button> ' +
+            '<button class="btn btn-sm btn-danger" onclick="deleteBackup(\'' + escAttr(b.filename) + '\')">Delete</button>' : '';
+        return '<div style="padding:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">' +
+            '<div style="flex:1">' +
+                '<div style="font-family:var(--mono);font-size:11px">' + escHtml(b.filename) + '</div>' +
+                '<div style="color:var(--text-secondary);font-size:11px">' + _relDate(b.created_at) +
+                    ' &middot; ' + formatBytes(b.size_bytes || 0) +
+                    (meta ? ' &middot; ' + meta : '') + '</div>' +
+            '</div>' +
+            '<div>' + actions + '</div>' +
+            '</div>';
+    }).join('');
+}
+
+document.getElementById('btnBackupNow').addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true; btn.textContent = 'Backing up...';
+    try {
+        const r = await POST('/api/backup');
+        toast('Backup saved: ' + r.filename + ' (' + formatBytes(r.size_bytes) + ')', 'success');
+        loadBackupPanel();
+    } catch (err) {
+        toast(err.message, 'error');
+    } finally {
+        btn.disabled = false; btn.textContent = 'Backup Now';
+    }
+});
+
+document.getElementById('btnBackupListRefresh').addEventListener('click', loadBackupPanel);
+
+window.restoreBackup = async function(filename) {
+    // Check busy state first — backend will 409 but we want to tell the user up front
+    try {
+        const s = await GET('/api/status');
+        // (Server does the authoritative check — this is purely UX)
+    } catch (e) {}
+
+    if (!confirm(
+        'Restore from backup:\n\n' + filename + '\n\n' +
+        'This will replace your current database. ' +
+        'A safety backup of the current state will be created first.\n\n' +
+        'Any running retrieval, enrichment, SSO session, or manual watcher ' +
+        'will block this operation — stop them first.\n\n' +
+        'Continue?'
+    )) return;
+
+    try {
+        const r = await POST('/api/backup/restore?filename=' + encodeURIComponent(filename));
+        toast('Restored from ' + r.restored_from + ' (safety: ' + (r.safety_backup_filename || 'none') + ')', 'success');
+        setTimeout(function() { loadBackupPanel(); location.reload(); }, 800);
+    } catch (err) {
+        const msg = err.message || '';
+        if (msg.indexOf('active') >= 0 || msg.indexOf('Cannot restore') >= 0 || msg.indexOf('409') >= 0) {
+            alert('Restore blocked:\n\n' + msg +
+                '\n\nStop the running task (Run / Upload / SSO / Manual Mode) and try again.');
+        } else {
+            toast('Restore failed: ' + msg, 'error');
+        }
+    }
+};
+
+window.deleteBackup = async function(filename) {
+    if (!confirm('Delete backup "' + filename + '"? This cannot be undone.')) return;
+    try {
+        const resp = await fetch('/api/backup/' + encodeURIComponent(filename), { method: 'DELETE' });
+        if (!resp.ok) {
+            const j = await resp.json().catch(function() { return {detail: resp.statusText}; });
+            throw new Error(j.detail || resp.statusText);
+        }
+        toast('Deleted', 'success');
+        loadBackupPanel();
+    } catch (err) { toast(err.message, 'error'); }
+};
 
 /* ------------------------------------------------------------------
    Projects — per-project isolation
