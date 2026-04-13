@@ -1312,6 +1312,31 @@
                 </div>
             </div>
 
+            <!-- ============================================================
+                 BROWSER BOOKMARKLET — one-click upload from publisher page
+                 ============================================================ -->
+            <div class="card" id="bookmarkletCard" style="border-left:3px solid var(--accent)">
+                <div class="card-header">
+                    <h3>&#128278; Browser Bookmarklet</h3>
+                    <span class="badge badge-neutral">One-click upload</span>
+                </div>
+                <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.6">
+                    Install a bookmarklet in your browser once. On any
+                    paywalled paper page (after institutional login), click it
+                    and the PDF is fetched with your session cookies and
+                    uploaded straight to this server. No drop folder needed.
+                </div>
+                <div class="btn-group" style="flex-wrap:wrap;gap:8px">
+                    <a class="btn btn-primary" href="/api/bookmarklet" target="_blank" rel="noopener noreferrer">
+                        Open Install Page
+                    </a>
+                    <a class="btn btn-outline btn-sm" href="/api/bookmarklet.js" target="_blank" rel="noopener noreferrer"
+                       title="Inspect the JS source before you install it.">
+                        View Source
+                    </a>
+                </div>
+            </div>
+
             <!-- Manual Mode Queue — augmented listing with Mark Unobtainable + suggested actions -->
             <div class="card" id="manualQueueCard" style="display:none">
                 <div class="card-header">

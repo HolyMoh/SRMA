@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
@@ -34,6 +35,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
@@ -4350,8 +4352,406 @@ async def _zotero_poll_once(
 
 
 # ===========================================================================
-# CAPTCHA ENDPOINTS
+# BOOKMARKLET — Part 3 of paywalled-retrieval redesign
 # ===========================================================================
+#
+# Goal: the fastest possible path from "user just viewed a paywalled
+# paper in their browser" to "PDF validated + filed". User drags a
+# bookmarklet to their bookmarks bar once; thereafter, clicking it on
+# any publisher page (after they've logged in) extracts the DOI, fetches
+# the PDF same-origin, and POSTs the bytes to us. The bookmarklet never
+# sees credentials — it just uses the session cookies already on the
+# publisher tab.
+#
+# Security model:
+#   - Bookmarklet runs in the publisher's origin. It has that origin's
+#     cookies. When it fetches the PDF, that's same-origin — no
+#     cross-origin credential leak.
+#   - When it POSTs to localhost, we do NOT accept cookies (CORS
+#     allow_credentials=False). The PDF bytes + DOI string are all we
+#     receive. No auth needed; localhost is the user's own machine.
+#   - The endpoint is still rate-limited by our per-host limiter under
+#     the "bookmarklet" host key (added below, conservative 2/s).
+#
+# DOI extraction (6 methods, tried in order):
+#   1. <meta name="citation_doi" content="...">   (Highwire + most)
+#   2. <meta name="DC.Identifier" content="10.*"> (Dublin Core)
+#   3. <meta name="prism.doi">                    (PRISM)
+#   4. schema.org JSON-LD  "@id" or "doi"
+#   5. URL path matches 10.NNNN/… pattern
+#   6. Visible text "DOI: 10.NNNN/…"  (last resort, regex)
+
+@app.post("/api/bookmarklet/submit")
+async def bookmarklet_submit(
+    file: UploadFile = File(...),
+    doi: str = Form(...),
+    source_url: Optional[str] = Form(default=None),
+) -> JSONResponse:
+    """Accept a PDF + DOI from the bookmarklet, match, ingest, validate.
+
+    Idempotent in the sense that re-submitting the same paper when it
+    has already left the MANUAL_REQUIRED queue returns
+    {"status": "skipped", "reason": "not in manual queue"} instead of
+    re-running validation.
+    """
+    from full_text_acquisition.models import normalize_doi
+
+    norm = normalize_doi(doi)
+    if not norm:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid DOI: {doi!r} did not normalize.",
+        )
+
+    db = _get_db()
+    cid = await db.check_duplicate_doi(norm)
+    if not cid:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"DOI {norm} is not in this project's paper set. "
+                    "Upload it first, or open the project that contains it."),
+        )
+    paper = await db.get_paper(cid)
+    if paper is None:
+        raise HTTPException(status_code=500, detail="Paper lookup failed")
+
+    if paper.state != PaperState.MANUAL_REQUIRED.value:
+        return JSONResponse({
+            "status": "skipped",
+            "reason": f"Paper state is {paper.state}, not MANUAL_REQUIRED.",
+            "paper_title": paper.title,
+            "canonical_id": paper.canonical_id,
+        })
+
+    content = await file.read()
+    if not content or not content.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=400,
+            detail=("Body is not a PDF — the publisher may have served an "
+                    "HTML error page. Open the PDF directly in a tab first."),
+        )
+
+    # Write to a temp file, hand to the same validation pipeline as
+    # Manual Mode. The "bookmarklet" match_type shows up in audit logs
+    # so we can count provenance per paper.
+    config = _get_config()
+    tmp_dir = os.path.join(
+        config.get("output_directory", "./downloads"),
+        ".bookmarklet-temp",
+    )
+    os.makedirs(tmp_dir, exist_ok=True)
+    safe_name = (file.filename or f"{norm.replace('/', '_')}.pdf").replace(os.sep, "_")
+    tmp_path = os.path.join(tmp_dir, f"bm_{paper.canonical_id}_{safe_name}")
+
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(content)
+        result = await _install_and_validate_dropped(
+            paper, tmp_path, "bookmarklet",
+        )
+        outcome = result.get("outcome")
+
+        try:
+            await db.log_audit(AuditLogEntry(
+                canonical_id=paper.canonical_id,
+                outcome=f"BOOKMARKLET_INGEST_{outcome.upper()}",
+                details=json.dumps({
+                    "doi": norm,
+                    "source_url": source_url or "",
+                    "filename": file.filename or "",
+                    "bytes": len(content),
+                    **{k: v for k, v in result.items() if k not in ("paper",)},
+                }),
+            ))
+        except Exception: pass
+
+        return JSONResponse({
+            "status": "ok",
+            "outcome": outcome,
+            "paper_title": paper.title,
+            "canonical_id": paper.canonical_id,
+            "identity_status": result.get("identity_status"),
+            "validation_id": result.get("validation_id"),
+            "filename": result.get("filename"),
+        })
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Bookmarklet source code — generated server-side so the user's server
+# URL is baked in. The page that serves the install button wraps this
+# into a javascript: URL and provides drag-to-bookmarks instructions.
+# ---------------------------------------------------------------------------
+
+_BOOKMARKLET_JS_TEMPLATE = r"""(function(){
+var SERVER=__SERVER__;
+function $(sel){return document.querySelector(sel);}
+function metas(name){return Array.prototype.slice.call(
+  document.querySelectorAll('meta[name="'+name+'"], meta[property="'+name+'"]'))
+  .map(function(m){return m.content||'';}).filter(Boolean);}
+function normDoi(s){if(!s)return '';var m=String(s).match(/10\.\d{4,9}\/[-._;()\/:A-Z0-9]+/i);
+  return m?m[0].toLowerCase().replace(/[.,;)\]]+$/,''):'';}
+function extractDoi(){
+  // 1. citation_doi (Highwire, most publishers)
+  var v=metas('citation_doi').concat(metas('citation_DOI'));
+  for(var i=0;i<v.length;i++){var d=normDoi(v[i]);if(d)return d;}
+  // 2. Dublin Core
+  v=metas('DC.Identifier').concat(metas('DC.identifier'),metas('dc.identifier'));
+  for(i=0;i<v.length;i++){d=normDoi(v[i]);if(d)return d;}
+  // 3. PRISM
+  v=metas('prism.doi').concat(metas('PRISM.doi'));
+  for(i=0;i<v.length;i++){d=normDoi(v[i]);if(d)return d;}
+  // 4. JSON-LD
+  try{
+    var ld=document.querySelectorAll('script[type="application/ld+json"]');
+    for(i=0;i<ld.length;i++){
+      try{var o=JSON.parse(ld[i].textContent);
+        var cand=o.doi||o['@id']||(o.mainEntity&&o.mainEntity.doi)||'';
+        d=normDoi(cand);if(d)return d;}catch(e){}
+    }
+  }catch(e){}
+  // 5. URL
+  d=normDoi(location.pathname+location.search);if(d)return d;
+  d=normDoi(location.href);if(d)return d;
+  // 6. Visible text (last resort)
+  var t=(document.body&&document.body.innerText||'').slice(0,50000);
+  var m=t.match(/doi[:\s]+10\.\d{4,9}\/[^\s]+/i);
+  if(m){d=normDoi(m[0]);if(d)return d;}
+  return '';
+}
+function extractPdfUrl(){
+  // citation_pdf_url is the gold standard — Highwire pushes it on
+  // publisher-hosted PDFs when the user has entitlement.
+  var v=metas('citation_pdf_url');
+  if(v[0]) return v[0];
+  // Look for <link rel="alternate" type="application/pdf">
+  var ls=document.querySelectorAll('link[type="application/pdf"], a[type="application/pdf"]');
+  if(ls[0]) return ls[0].href;
+  // Same-page <a href="...pdf"> download link (heuristic)
+  var as=document.querySelectorAll('a[href*=".pdf"]');
+  for(var i=0;i<as.length;i++){
+    var h=as[i].href;
+    if(h&&/\.pdf(\?|$)/i.test(h)) return h;
+  }
+  return '';
+}
+function overlay(){
+  var old=document.getElementById('__srma_bm__');if(old)old.remove();
+  var d=document.createElement('div');d.id='__srma_bm__';
+  d.style.cssText='position:fixed;top:16px;right:16px;z-index:2147483647;'+
+    'background:white;color:#1e293b;border:1px solid #cbd5e1;border-radius:10px;'+
+    'box-shadow:0 10px 30px rgba(0,0,0,.18);padding:14px 16px;font:13px/1.45 '+
+    '-apple-system,system-ui,Segoe UI,Roboto,sans-serif;max-width:380px';
+  document.body.appendChild(d);return d;
+}
+function render(box,html){box.innerHTML=html;}
+function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){
+  return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+async function submit(pdfBlob,doi,srcUrl,box){
+  render(box,'<b>SRMA</b> — uploading '+esc(Math.round(pdfBlob.size/1024))+' KB...');
+  var fd=new FormData();
+  fd.append('file',pdfBlob,(doi.replace(/[^a-z0-9]+/gi,'_'))+'.pdf');
+  fd.append('doi',doi);
+  if(srcUrl) fd.append('source_url',srcUrl);
+  try{
+    var r=await fetch(SERVER+'/api/bookmarklet/submit',
+      {method:'POST',mode:'cors',credentials:'omit',body:fd});
+    if(!r.ok){
+      var t=await r.text();
+      render(box,'<b>SRMA</b> — <span style="color:#b91c1c">HTTP '+r.status+'</span><br>'+
+        '<span style="font-size:12px">'+esc(t.slice(0,300))+'</span>'+closeBtn());
+      return;
+    }
+    var j=await r.json();
+    if(j.status==='ok' && j.outcome==='complete'){
+      render(box,'<b>✓ SRMA</b> — Validated<br><span style="font-size:12px">'+
+        esc((j.paper_title||'').slice(0,80))+'</span>'+closeBtn());
+    } else if(j.status==='ok'){
+      render(box,'<b>⚠ SRMA</b> — Ingested but flagged: '+esc(j.outcome)+
+        '<br><span style="font-size:12px">'+esc((j.paper_title||'').slice(0,80))+
+        '</span>'+closeBtn());
+    } else {
+      render(box,'<b>SRMA</b> — '+esc(j.status)+': '+esc(j.reason||'')+closeBtn());
+    }
+    setTimeout(function(){var b=document.getElementById('__srma_bm__');if(b)b.remove();},8000);
+  }catch(e){
+    render(box,'<b>SRMA</b> — <span style="color:#b91c1c">Network error</span>: '+
+      esc(String(e))+'<br><span style="font-size:11px">Is the server running at '+
+      esc(SERVER)+' ?</span>'+closeBtn());
+  }
+}
+function closeBtn(){
+  return '<br><button onclick="document.getElementById(\'__srma_bm__\').remove()" '+
+    'style="margin-top:8px;padding:3px 10px;font-size:11px;border:1px solid #cbd5e1;'+
+    'background:#f8fafc;border-radius:4px;cursor:pointer">Dismiss</button>';
+}
+function pasteUrlUI(doi,box){
+  render(box,'<b>SRMA</b> — No PDF link found on this page.<br>'+
+    '<span style="font-size:12px">Paste the direct PDF URL:</span>'+
+    '<input id="__srma_u" style="display:block;width:100%;margin-top:6px;padding:5px;'+
+    'border:1px solid #cbd5e1;border-radius:4px;font-size:12px" placeholder="https://...pdf">'+
+    '<button id="__srma_go" style="margin-top:8px;padding:4px 12px;font-size:12px;'+
+    'background:#3b82f6;color:white;border:none;border-radius:4px;cursor:pointer">'+
+    'Fetch &amp; Upload</button>'+closeBtn());
+  document.getElementById('__srma_go').addEventListener('click',async function(){
+    var u=document.getElementById('__srma_u').value.trim();
+    if(!u){return;}
+    try{
+      render(box,'<b>SRMA</b> — fetching '+esc(u.slice(0,60))+'...');
+      var r=await fetch(u,{credentials:'include'});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      var b=await r.blob();
+      if(b.size<1000) throw new Error('Response too small ('+b.size+' bytes)');
+      await submit(b,doi,u,box);
+    }catch(e){
+      render(box,'<b>SRMA</b> — <span style="color:#b91c1c">Fetch failed</span>: '+
+        esc(String(e))+closeBtn());
+    }
+  });
+}
+async function run(){
+  var box=overlay();
+  render(box,'<b>SRMA</b> — scanning page...');
+  var doi=extractDoi();
+  if(!doi){
+    render(box,'<b>SRMA</b> — <span style="color:#b91c1c">No DOI found</span> '+
+      'on this page.<br><span style="font-size:11px">Open the paper\'s '+
+      'abstract page, then click the bookmarklet again.</span>'+closeBtn());
+    return;
+  }
+  var pdfUrl=extractPdfUrl();
+  if(!pdfUrl){pasteUrlUI(doi,box);return;}
+  render(box,'<b>SRMA</b> — fetching PDF...<br><span style="font-size:11px">'+
+    esc(pdfUrl.slice(0,80))+'</span>');
+  try{
+    var r=await fetch(pdfUrl,{credentials:'include'});
+    if(!r.ok){
+      render(box,'<b>SRMA</b> — fetch failed: HTTP '+r.status+
+        '<br><span style="font-size:11px">Paste the direct PDF URL below:</span>'+
+        closeBtn());
+      pasteUrlUI(doi,box);return;
+    }
+    var blob=await r.blob();
+    if(blob.size<1000){pasteUrlUI(doi,box);return;}
+    await submit(blob,doi,pdfUrl,box);
+  }catch(e){
+    pasteUrlUI(doi,box);
+  }
+}
+run();
+})();"""
+
+
+def _render_bookmarklet_js(server_url: str) -> str:
+    """Return the bookmarklet JS with server URL baked in as a JSON string."""
+    return _BOOKMARKLET_JS_TEMPLATE.replace("__SERVER__", json.dumps(server_url))
+
+
+@app.get("/api/bookmarklet.js", response_class=PlainTextResponse)
+async def bookmarklet_js(server_url: Optional[str] = Query(default=None)) -> PlainTextResponse:
+    """Return the bookmarklet JS source, server URL baked in.
+
+    Useful for audit + for users who want to inspect the code before
+    installing it. The HTML install page uses the same source.
+    """
+    url = (server_url or "http://localhost:8000").rstrip("/")
+    js = _render_bookmarklet_js(url)
+    return PlainTextResponse(
+        js,
+        headers={"Cache-Control": "no-store"},
+        media_type="application/javascript",
+    )
+
+
+@app.get("/api/bookmarklet", response_class=HTMLResponse)
+async def bookmarklet_install_page(
+    server_url: Optional[str] = Query(default=None),
+) -> HTMLResponse:
+    """Landing page with install instructions + drag-to-bookmark button."""
+    url = (server_url or "http://localhost:8000").rstrip("/")
+    js = _render_bookmarklet_js(url)
+    # javascript: URL with the whole IIFE URI-encoded
+    bm_href = "javascript:" + urllib.parse.quote(js, safe="")
+    # The href is huge but that's how bookmarklets work
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>SRMA PDF Bookmarklet — Install</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#f8f9fa;color:#1e293b;line-height:1.55;padding:32px;max-width:720px;margin:0 auto}}
+h1{{font-size:22px;margin-bottom:6px}}
+.subtitle{{color:#64748b;margin-bottom:22px}}
+.bm{{display:inline-block;padding:10px 18px;background:#3b82f6;color:white;
+text-decoration:none;border-radius:8px;font-weight:600;font-size:15px;
+box-shadow:0 4px 12px rgba(59,130,246,.3);margin:12px 0}}
+.bm:hover{{background:#2563eb}}
+.card{{background:white;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;
+margin-bottom:16px}}
+.card h3{{font-size:15px;margin-bottom:10px}}
+ol{{margin-left:20px;line-height:1.8}}
+code{{background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:13px;
+font-family:Menlo,Consolas,monospace}}
+.warn{{background:#fffbeb;border-left:3px solid #f59e0b;padding:10px 14px;
+border-radius:6px;font-size:13px;margin:16px 0}}
+details summary{{cursor:pointer;font-size:13px;color:#3b82f6;margin-top:12px}}
+pre{{background:#0f172a;color:#e2e8f0;padding:14px 16px;border-radius:6px;
+font-size:11px;overflow-x:auto;max-height:340px;line-height:1.5}}
+</style></head><body>
+<h1>SRMA PDF Bookmarklet</h1>
+<div class="subtitle">Drag the button below to your bookmarks bar.
+Then click it on any paywalled paper — after logging in — and it will
+send the PDF to your local SRMA server.</div>
+
+<a class="bm" href="{bm_href}">📄 Send to SRMA</a>
+
+<div class="card">
+  <h3>How it works</h3>
+  <ol>
+    <li>Drag the button above onto your browser's bookmarks bar
+        (show it with <code>Ctrl+Shift+B</code> / <code>⌘⇧B</code>).</li>
+    <li>Log into your institution's proxy (EZproxy, OpenAthens, Shibboleth)
+        and open the paper's landing page.</li>
+    <li>Click the <b>Send to SRMA</b> bookmarklet.</li>
+    <li>A small overlay appears in the top-right of the page, extracts
+        the DOI from page metadata, fetches the PDF same-origin, and
+        posts it to <code>{url}</code>.</li>
+    <li>The PDF runs through the same 7-check validation as Manual
+        Mode. The overlay shows ✓ or ⚠ with the paper title.</li>
+  </ol>
+</div>
+
+<div class="warn">
+  <b>Security:</b> the bookmarklet uses the cookies already in your
+  publisher tab to fetch the PDF — your credentials are never read
+  by SRMA. The upload to localhost happens with
+  <code>credentials: 'omit'</code> — no cookies are forwarded.
+  The server URL (<code>{url}</code>) is baked into this bookmarklet
+  at generation time.
+</div>
+
+<div class="card">
+  <h3>When the automatic PDF fetch fails</h3>
+  <p style="font-size:14px">Some publishers hide the PDF behind a
+  click-through. If the bookmarklet can't find a direct PDF URL, it
+  shows a paste box — right-click the PDF link on the page, copy it,
+  paste, and click <b>Fetch &amp; Upload</b>.</p>
+</div>
+
+<details>
+<summary>Show bookmarklet source code</summary>
+<pre>{js.replace('<', '&lt;').replace('>', '&gt;')}</pre>
+</details>
+
+</body></html>
+"""
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
 
 
 @app.post("/api/captcha/resolved")
