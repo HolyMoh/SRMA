@@ -1492,6 +1492,50 @@
     </div>
 </div>
 
+<!-- PDF preview modal — flagged-paper review only =========================
+     Shows the local PDF inline so reviewers can decide between
+     Confirm-Correct and Re-retrieve without leaving the Results page.
+     The iframe uses the browser's NATIVE PDF renderer (no PDF.js); the
+     "Open in new tab" link is a fallback for browsers that don't inline
+     render PDFs (mostly mobile).
+     ========================================================================= -->
+<div class="modal-backdrop" id="previewModal" style="z-index:950">
+    <div class="modal" style="max-width:80vw;width:80vw;max-height:80vh;height:80vh;display:flex;flex-direction:column;padding:0">
+
+        <!-- Header row: metadata + action buttons -->
+        <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;gap:16px;align-items:flex-start">
+            <div style="flex:1;min-width:0">
+                <div id="previewTitle"
+                     style="font-weight:600;font-size:14px;line-height:1.3;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis">
+                    Loading...
+                </div>
+                <div id="previewMeta"
+                     style="font-size:12px;color:var(--text-secondary);margin-bottom:4px"></div>
+                <div id="previewFlags" style="font-size:11px"></div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+                <button class="btn btn-sm btn-success" id="btnPreviewConfirm"
+                        title="Mark as correct (reason required)">Confirm Correct</button>
+                <button class="btn btn-sm btn-warning" id="btnPreviewReretrieve"
+                        title="Reset to READY_FOR_RETRIEVAL">Re-retrieve</button>
+                <a class="btn btn-sm btn-outline" id="previewOpenNewTab"
+                   target="_blank" rel="noopener"
+                   title="Open in a new tab if this viewer doesn't render PDFs">Open in new tab</a>
+                <button class="btn btn-sm btn-outline" id="btnClosePreview"
+                        title="Close preview (Esc)">Close</button>
+            </div>
+        </div>
+
+        <!-- PDF area: browser's native renderer via iframe -->
+        <div style="flex:1;background:#222;overflow:hidden">
+            <iframe id="previewIframe" src="about:blank"
+                    style="width:100%;height:100%;border:0;background:white"
+                    title="PDF preview"></iframe>
+        </div>
+
+    </div>
+</div>
+
 <!-- Project picker modal ================================================== -->
 <div class="modal-backdrop" id="projectModal">
     <div class="modal" style="max-width:640px">
@@ -3359,9 +3403,22 @@ function renderLinksCell(p) {
 function renderPaperRow(p) {
     const sc = p.confidence_level === 'HIGH' ? 'score-high' : p.confidence_level === 'MEDIUM' ? 'score-medium' : 'score-low';
     const flagged = p.identity_status === 'VERSION_MISMATCH' || p.identity_status === 'CONTENT_UNVERIFIED';
-    const actions = flagged && !p.user_override ?
+    // Preview is ONLY for rows that need human review — VERSION_MISMATCH,
+    // CONTENT_UNVERIFIED, or TITLE_VERIFIED_WEAK (added in FIX 3). Never
+    // shown on COMPLETE+VALID — those users open via the Links column.
+    const needsReview = (
+        p.identity_status === 'VERSION_MISMATCH' ||
+        p.identity_status === 'CONTENT_UNVERIFIED' ||
+        p.identity_status === 'TITLE_VERIFIED_WEAK'
+    );
+    const canPreview = needsReview && !!p.pdf_filename;
+    const previewBtn = canPreview ?
+        '<button class="btn btn-sm btn-outline" onclick="openPreview(\'' + escAttr(p.canonical_id) + '\')" title="Review PDF inline before deciding">Preview</button> ' : '';
+    const actions = (flagged && !p.user_override) ?
+        previewBtn +
         '<button class="btn btn-sm btn-success" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'confirm_correct\')">OK</button> ' +
-        '<button class="btn btn-sm btn-warning" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'re_retrieve\')">Redo</button>' : '';
+        '<button class="btn btn-sm btn-warning" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'re_retrieve\')">Redo</button>'
+        : previewBtn;
     const stBadge = '<span class="badge ' + ({COMPLETE:'badge-success',FAILED:'badge-danger',MANUAL_REQUIRED:'badge-warning',RETRIEVING:'badge-info',VALIDATING:'badge-info',RETRIEVED:'badge-info'}[p.state]||'badge-neutral') + '">' + escHtml(p.state||'') + '</span>';
     const vsBadge = p.validation_status ? '<span class="badge ' + (p.validation_status.startsWith('VALID')?'badge-success':p.validation_status==='INVALID'?'badge-danger':'badge-warning') + '">' + escHtml(p.validation_status) + '</span>' : '';
     const idBadge = p.identity_status ? '<span class="badge ' + (flagged?'badge-warning':'badge-success') + '">' + escHtml(p.identity_status) + '</span>' : '';
@@ -3417,6 +3474,110 @@ document.querySelectorAll('th[data-sort]').forEach(function(th) {
 document.getElementById('btnPrevPage').addEventListener('click', function() { if (state.resultsPage > 0) { state.resultsPage--; loadResults(); } });
 document.getElementById('btnNextPage').addEventListener('click', function() { state.resultsPage++; loadResults(); });
 document.getElementById('resultsRunFilter').addEventListener('change', function() { state.resultsPage = 0; loadResults(); });
+
+/* ------------------------------------------------------------------
+   Inline PDF preview — flagged-paper review only
+   ------------------------------------------------------------------
+   Uses the browser's NATIVE PDF renderer via <iframe>. No PDF.js
+   dependency. The /api/pdf/{cid} endpoint (FIX 1) handles streaming
+   with Content-Disposition: inline + path-traversal guards.
+*/
+let _previewCurrentCid = null;
+
+window.openPreview = async function(cid) {
+    _previewCurrentCid = cid;
+    const modal = document.getElementById('previewModal');
+
+    // Reset header + open link while we fetch metadata
+    const pdfUrl = '/api/pdf/' + encodeURIComponent(cid);
+    document.getElementById('previewTitle').textContent = 'Loading...';
+    document.getElementById('previewMeta').textContent = '';
+    document.getElementById('previewFlags').innerHTML = '';
+    document.getElementById('previewOpenNewTab').href = pdfUrl;
+
+    // Fetch paper metadata for the header (title, authors, DOI, flags)
+    try {
+        const d = await GET('/api/paper/' + encodeURIComponent(cid));
+        const p = d.paper || {};
+        document.getElementById('previewTitle').textContent = p.title || '(no title)';
+        const parts = [];
+        if (p.authors) parts.push(p.authors.split(';')[0].trim());
+        if (p.year) parts.push(String(p.year));
+        if (p.journal) parts.push(p.journal);
+        if (p.doi) parts.push('DOI: ' + p.doi);
+        document.getElementById('previewMeta').textContent = parts.join(' · ');
+
+        // Flag summary with relevant badge
+        const flagParts = [];
+        if (p.validation_status) {
+            const vc = p.validation_status.startsWith('VALID') ? 'badge-success' :
+                       p.validation_status === 'INVALID' ? 'badge-danger' : 'badge-warning';
+            flagParts.push('<span class="badge ' + vc + '">' + escHtml(p.validation_status) + '</span>');
+        }
+        if (p.identity_status) {
+            flagParts.push('<span class="badge badge-warning">' + escHtml(p.identity_status) + '</span>');
+        }
+        if (p.integrity_score != null) {
+            const sc = p.confidence_level === 'HIGH' ? 'score-high' :
+                       p.confidence_level === 'MEDIUM' ? 'score-medium' : 'score-low';
+            flagParts.push('<span class="' + sc + '" style="font-weight:700">Score ' + p.integrity_score + '</span>');
+        }
+        document.getElementById('previewFlags').innerHTML = flagParts.join(' ');
+    } catch (e) {
+        document.getElementById('previewTitle').textContent = 'Paper ' + cid;
+    }
+
+    // Point iframe at the PDF — browser's native renderer takes over
+    document.getElementById('previewIframe').src = pdfUrl;
+    modal.classList.add('active');
+};
+
+function closePreview() {
+    const modal = document.getElementById('previewModal');
+    // Critical: unset iframe src so the browser frees the PDF from memory
+    // and stops any ongoing render work. Otherwise cycling through 20
+    // flagged papers leaks 20 loaded PDFs.
+    try { document.getElementById('previewIframe').src = 'about:blank'; } catch (e) {}
+    modal.classList.remove('active');
+    _previewCurrentCid = null;
+}
+
+document.getElementById('btnClosePreview').addEventListener('click', closePreview);
+
+// Escape key closes the preview (standard modal UX)
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('previewModal').classList.contains('active')) {
+        closePreview();
+    }
+});
+
+// "Confirm Correct" — reuse the existing override-with-reason flow.
+// Clicking Confirm closes the preview and opens the reason modal on top.
+document.getElementById('btnPreviewConfirm').addEventListener('click', function() {
+    const cid = _previewCurrentCid;
+    if (!cid) return;
+    closePreview();
+    // Small delay so the preview close animation finishes before the
+    // override modal opens (prevents visual flash on some browsers)
+    setTimeout(function() { window.showOverride(cid, 'confirm_correct'); }, 50);
+});
+
+// "Re-retrieve" — no reason needed; post directly and refresh.
+document.getElementById('btnPreviewReretrieve').addEventListener('click', async function() {
+    const cid = _previewCurrentCid;
+    if (!cid) return;
+    if (!confirm('Reset this paper to READY_FOR_RETRIEVAL and re-attempt retrieval?')) return;
+    try {
+        await POST('/api/override', {
+            canonical_id: cid,
+            action: 're_retrieve',
+            reason: 'Reviewer re-retrieve from preview',
+        });
+        toast('Paper queued for re-retrieval', 'success');
+        closePreview();
+        if (typeof loadResults === 'function') loadResults();
+    } catch (err) { toast(err.message, 'error'); }
+});
 
 /* Override modal */
 window.showOverride = function(cid, action) {
