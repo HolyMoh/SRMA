@@ -1173,7 +1173,14 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
+    expose_headers=[
+        "Content-Disposition",
+        # Bookmarklet debug headers — let the overlay tell users what the
+        # publisher actually sent when a non-PDF body is rejected.
+        "X-Received-Bytes",
+        "X-Received-Content-Type",
+        "X-Received-Preview",
+    ],
     max_age=3600,
 )
 
@@ -4424,11 +4431,34 @@ async def bookmarklet_submit(
         })
 
     content = await file.read()
+    # Defend against HTML error pages that publishers serve instead of
+    # the PDF (Elsevier interstitials, Wiley "access denied", Cloudflare
+    # challenges, etc.). The bookmarklet already tries to catch this
+    # client-side, but keep server-side validation as a hard boundary.
     if not content or not content.startswith(b"%PDF"):
+        received_ct = (file.content_type or "unknown")
+        preview = ""
+        if content:
+            try:
+                preview = content[:120].decode("utf-8", errors="replace")
+            except Exception:
+                preview = repr(content[:60])
         raise HTTPException(
             status_code=400,
-            detail=("Body is not a PDF — the publisher may have served an "
-                    "HTML error page. Open the PDF directly in a tab first."),
+            detail=(
+                f"Body is not a PDF (got {len(content)} bytes, "
+                f"Content-Type: {received_ct}). The publisher likely "
+                f"served an HTML wrapper instead of the PDF. Open the "
+                f"PDF directly in a tab (URL should end in .pdf or the "
+                f"browser should show the PDF viewer), then click the "
+                f"bookmarklet on that tab — or paste the direct PDF URL "
+                f"into the fallback box."
+            ),
+            headers={
+                "X-Received-Bytes": str(len(content)),
+                "X-Received-Content-Type": received_ct,
+                "X-Received-Preview": preview[:120].replace("\n", " ").replace("\r", " "),
+            },
         )
 
     # Write to a temp file, hand to the same validation pipeline as
@@ -4532,13 +4562,48 @@ function extractPdfUrl(){
   // Look for <link rel="alternate" type="application/pdf">
   var ls=document.querySelectorAll('link[type="application/pdf"], a[type="application/pdf"]');
   if(ls[0]) return ls[0].href;
-  // Same-page <a href="...pdf"> download link (heuristic)
+  // Publisher-specific patterns — the landing page rarely points at
+  // the real PDF, so check a few known-good URL shapes.
+  var host=location.hostname.toLowerCase();
+  var href=location.href;
+  // Elsevier / ScienceDirect: pii-based PDF
+  var m=href.match(/sciencedirect\.com\/science\/article\/(?:pii|abs\/pii)\/([A-Z0-9]+)/i);
+  if(m){return location.protocol+'//'+host+'/science/article/pii/'+m[1]+'/pdfft?isDTMRedir=true&download=true';}
+  // Wiley: /epdf/ → /pdfdirect/
+  if(/wiley\.com|onlinelibrary\.wiley/.test(host)){
+    var m2=href.match(/\/(?:doi|epdf|full)\/(10\.\d+\/[^?#]+)/);
+    if(m2){return location.protocol+'//'+host+'/doi/pdfdirect/'+m2[1]+'?download=true';}
+  }
+  // Springer / Nature: content/pdf
+  if(/springer|springernature|nature\.com/.test(host)){
+    var m3=href.match(/\/(?:article|chapter)\/(10\.\d+\/[^?#]+)/);
+    if(m3){return location.protocol+'//'+host+'/content/pdf/'+m3[1]+'.pdf';}
+  }
+  // Tandfonline
+  if(/tandfonline\.com/.test(host)){
+    var m4=href.match(/\/doi\/(?:abs|full)\/(10\.\d+\/[^?#]+)/);
+    if(m4){return location.protocol+'//'+host+'/doi/pdf/'+m4[1]+'?download=true';}
+  }
+  // Generic fallback: same-page <a href="...pdf"> download link
   var as=document.querySelectorAll('a[href*=".pdf"]');
   for(var i=0;i<as.length;i++){
     var h=as[i].href;
     if(h&&/\.pdf(\?|$)/i.test(h)) return h;
   }
   return '';
+}
+// Client-side PDF sniff — reads the first 4 bytes of the blob.
+// Cheap and prevents round-tripping HTML error pages to the server.
+function isPdfBlob(blob){
+  return new Promise(function(resolve){
+    var fr=new FileReader();
+    fr.onload=function(){
+      var b=new Uint8Array(fr.result);
+      resolve(b.length>=4 && b[0]===0x25 && b[1]===0x50 && b[2]===0x44 && b[3]===0x46);
+    };
+    fr.onerror=function(){resolve(false);};
+    fr.readAsArrayBuffer(blob.slice(0,4));
+  });
 }
 function overlay(){
   var old=document.getElementById('__srma_bm__');if(old)old.remove();
@@ -4553,6 +4618,14 @@ function render(box,html){box.innerHTML=html;}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){
   return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
 async function submit(pdfBlob,doi,srcUrl,box){
+  // Client-side %PDF sniff first — saves a round-trip when the
+  // "download" the browser fetched is actually an HTML error page
+  // (common on Elsevier, Wiley, Springer landing pages).
+  var ok=await isPdfBlob(pdfBlob);
+  if(!ok){
+    pasteUrlUI(doi,box,'Not a PDF: '+Math.round(pdfBlob.size/1024)+' KB starting with non-%PDF bytes.');
+    return;
+  }
   render(box,'<b>SRMA</b> — uploading '+esc(Math.round(pdfBlob.size/1024))+' KB...');
   var fd=new FormData();
   fd.append('file',pdfBlob,(doi.replace(/[^a-z0-9]+/gi,'_'))+'.pdf');
@@ -4563,8 +4636,11 @@ async function submit(pdfBlob,doi,srcUrl,box){
       {method:'POST',mode:'cors',credentials:'omit',body:fd});
     if(!r.ok){
       var t=await r.text();
+      var ct=r.headers.get('X-Received-Content-Type')||'';
+      var extra=ct?('<br><span style="font-size:11px;color:#64748b">Server saw: '+
+        esc(ct)+'</span>'):'';
       render(box,'<b>SRMA</b> — <span style="color:#b91c1c">HTTP '+r.status+'</span><br>'+
-        '<span style="font-size:12px">'+esc(t.slice(0,300))+'</span>'+closeBtn());
+        '<span style="font-size:12px">'+esc(t.slice(0,300))+'</span>'+extra+closeBtn());
       return;
     }
     var j=await r.json();
@@ -4590,9 +4666,15 @@ function closeBtn(){
     'style="margin-top:8px;padding:3px 10px;font-size:11px;border:1px solid #cbd5e1;'+
     'background:#f8fafc;border-radius:4px;cursor:pointer">Dismiss</button>';
 }
-function pasteUrlUI(doi,box){
-  render(box,'<b>SRMA</b> — No PDF link found on this page.<br>'+
-    '<span style="font-size:12px">Paste the direct PDF URL:</span>'+
+function pasteUrlUI(doi,box,reason){
+  var hdr=reason?('<b>SRMA</b> — <span style="color:#b91c1c">'+esc(reason)+'</span>'):
+    '<b>SRMA</b> — No PDF link found on this page.';
+  render(box,hdr+'<br>'+
+    '<span style="font-size:12px">Tip: right-click the download button → '+
+    'Copy Link, then paste below. Or open the PDF in a fresh tab '+
+    '(URL ends in <code>.pdf</code> or <code>pdfft</code> / '+
+    '<code>/pdf/</code>) and click the bookmarklet there.<br><br>'+
+    'Paste the direct PDF URL:</span>'+
     '<input id="__srma_u" style="display:block;width:100%;margin-top:6px;padding:5px;'+
     'border:1px solid #cbd5e1;border-radius:4px;font-size:12px" placeholder="https://...pdf">'+
     '<button id="__srma_go" style="margin-top:8px;padding:4px 12px;font-size:12px;'+
