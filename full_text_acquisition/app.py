@@ -1041,6 +1041,49 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
+# CORS — REQUIRED for the Queue Pack HTML (file:// origin) and for the
+# optional browser bookmarklet that talks to localhost from publisher
+# pages. Three origins need to reach this server:
+#
+#   1. null                        — HTML opened via file:// in Chrome/FF
+#   2. http://localhost, 127.0.0.1 — dev + the UI itself
+#   3. https://*                   — publisher pages running a bookmarklet
+#
+# SECURITY: credentials=False unconditionally. We NEVER accept cross-origin
+# cookies. A bookmarklet on elsevier.com may have the user's Elsevier
+# session, but when it POSTs bytes to us, those cookies are not forwarded.
+# Our own localhost UI doesn't rely on cross-origin cookies either —
+# same-origin by definition.
+# ---------------------------------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    # We accept:
+    #  - "null" for file:// (Chrome sends Origin: null for HTML opened
+    #    from disk; this is the Queue Pack's primary origin)
+    #  - explicit localhost variants for the main UI + future dev tools
+    # Publisher sites go through the regex below because CORSMiddleware's
+    # allow_origins is literal-only.
+    allow_origins=[
+        "null",
+        "http://localhost",
+        "http://localhost:8000",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8000",
+    ],
+    # Any https://* publisher page (bookmarklet use-case) matches this.
+    # We still never accept cookies cross-origin.
+    allow_origin_regex=r"^https://.+",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=3600,
+)
+
+
+# ---------------------------------------------------------------------------
 # Signal handlers
 # ---------------------------------------------------------------------------
 
@@ -4141,6 +4184,387 @@ async def export_integration(
         filepath,
         media_type="application/json",
         filename=filename,
+    )
+
+
+@app.get("/api/export/queue-pack")
+async def export_queue_pack(
+    run_id: Optional[str] = Query(default=None),
+) -> FileResponse:
+    """Self-contained HTML navigation dashboard for MANUAL_REQUIRED papers.
+
+    Philosophy: the user's OWN browser is the retrieval environment.
+    This HTML file is a navigation aid that opens EZproxy-wrapped DOI
+    links in new tabs. The actual PDF ingestion happens through the
+    FIX 4 Manual Mode watched folder — there is NO "Mark as Retrieved
+    without file" path. The HTML polls /api/manual/queue every 10s
+    and turns cards green as papers leave the queue (validated by
+    the watcher).
+
+    REQUIREMENTS:
+      - Manual Mode must have a drop folder configured. If not, the
+        HTML page renders a banner telling the user what to set.
+      - CORS (Part 0) must allow Origin: null so fetch() from file://
+        reaches localhost successfully.
+
+    The file is completely self-contained: no CDN fonts, no external
+    scripts, no external CSS. Works opened as file://.
+    """
+    db = _get_db()
+
+    # Validate run_id if given
+    if run_id:
+        run_record = await db.get_run(run_id)
+        if run_record is None:
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    # Build the HTML at request time so the EZproxy prefix and server
+    # URL reflect current config/runtime.
+    proxy_prefix = _ezproxy_prefix()
+    config = _get_config()
+    drop_folder = config.get("manual_drop_folder") or ""
+    current_project = app_state.get("current_project") or {}
+    project_name = current_project.get("project_name", "Default")
+
+    # The server URL is what the USER's file:// page will fetch from.
+    # We bake in http://localhost:8000 by convention; if the server
+    # runs on a different port, this breaks, but the current launch
+    # path (app.main) always uses 8000.
+    server_url = "http://localhost:8000"
+
+    html = _render_queue_pack_html(
+        run_id=run_id or "",
+        project_name=project_name,
+        proxy_prefix=proxy_prefix,
+        drop_folder=drop_folder,
+        server_url=server_url,
+    )
+
+    export_dir = os.path.join(
+        config.get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    proj_slug = current_project.get("project_slug") or "project"
+    fname = f"{proj_slug}_queue_pack_{ts}.html"
+    fpath = os.path.join(export_dir, fname)
+    with open(fpath, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+    return FileResponse(fpath, media_type="text/html", filename=fname)
+
+
+_QUEUE_PACK_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SRMA Queue Pack — {project_name}</title>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#f8f9fa;color:#1e293b;line-height:1.5;padding:24px;max-width:1100px;margin:0 auto}}
+h1{{font-size:22px;margin-bottom:4px}}
+.subtitle{{font-size:13px;color:#64748b;margin-bottom:16px}}
+.banner{{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:13px;line-height:1.5}}
+.banner.err{{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}}
+.banner.warn{{background:#fffbeb;border:1px solid #fde68a;color:#92400e}}
+.banner.info{{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}}
+.banner.ok{{background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}}
+.progress{{display:flex;align-items:center;gap:12px;padding:14px 18px;background:white;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:16px}}
+.progress-bar{{flex:1;height:10px;background:#e2e8f0;border-radius:5px;overflow:hidden}}
+.progress-fill{{height:100%;background:#10b981;transition:width 0.3s ease}}
+.progress-text{{font-weight:600;font-size:14px;white-space:nowrap}}
+.tabs{{display:flex;gap:0;border-bottom:2px solid #e2e8f0;margin-bottom:14px}}
+.tab{{padding:8px 14px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;
+font-size:13px;color:#64748b;font-weight:500}}
+.tab.active{{color:#3b82f6;border-bottom-color:#3b82f6}}
+.tab .cnt{{background:#f1f5f9;padding:1px 6px;border-radius:8px;font-size:11px;margin-left:6px}}
+.card{{background:white;border:1px solid #e2e8f0;border-radius:8px;padding:14px 16px;margin-bottom:10px;
+display:flex;flex-direction:column;gap:6px;transition:background 0.3s,opacity 0.3s}}
+.card.retrieved{{background:#f0fdf4;border-color:#bbf7d0}}
+.card.unavail{{opacity:0.55;background:#fafafa}}
+.card-title{{font-weight:600;font-size:14px;color:#1e293b}}
+.card-meta{{font-size:12px;color:#64748b}}
+.card-doi{{font-family:'SF Mono',Consolas,monospace;font-size:11px;color:#475569}}
+.badges{{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;
+text-transform:uppercase;letter-spacing:0.3px}}
+.b-success{{background:#d1fae5;color:#065f46}}
+.b-warn{{background:#fef3c7;color:#92400e}}
+.b-neutral{{background:#f1f5f9;color:#475569}}
+.b-info{{background:#cffafe;color:#155e75}}
+.actions{{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}}
+.btn{{padding:5px 12px;border:none;border-radius:4px;font-size:12px;font-weight:500;
+cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:4px}}
+.btn-primary{{background:#3b82f6;color:white}}
+.btn-primary:hover{{background:#2563eb}}
+.btn-outline{{background:white;border:1px solid #e2e8f0;color:#1e293b}}
+.btn-outline:hover{{background:#f1f5f9}}
+.btn-danger{{background:white;border:1px solid #fecaca;color:#991b1b}}
+.btn-danger:hover{{background:#fef2f2}}
+.btn-success{{background:#10b981;color:white;cursor:default}}
+#refresh-info{{font-size:11px;color:#94a3b8;margin-top:12px;text-align:right}}
+.spinner{{display:inline-block;width:10px;height:10px;border:2px solid #e2e8f0;
+border-top-color:#3b82f6;border-radius:50%;animation:spin 0.8s linear infinite}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+</style>
+</head>
+<body>
+
+<h1>SRMA Queue Pack</h1>
+<div class="subtitle">
+  Project: <strong>{project_name}</strong>
+  &middot; Run: <span id="run-display">{run_display}</span>
+  &middot; Generated: <span id="gen-ts">{gen_ts}</span>
+</div>
+
+<div id="status-banner"></div>
+
+<div class="progress">
+  <div class="progress-text" id="progress-text">Loading...</div>
+  <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+  <div class="progress-text" id="progress-pct"></div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-filter="all">All <span class="cnt" id="cnt-all">0</span></div>
+  <div class="tab" data-filter="pending">Pending <span class="cnt" id="cnt-pending">0</span></div>
+  <div class="tab" data-filter="retrieved">Retrieved <span class="cnt" id="cnt-retrieved">0</span></div>
+  <div class="tab" data-filter="unavail">Unavailable <span class="cnt" id="cnt-unavail">0</span></div>
+</div>
+
+<div id="queue-list"></div>
+
+<div id="refresh-info">
+  <span class="spinner"></span> Auto-refreshing every 10 seconds from <code>{server_url}</code>
+</div>
+
+<script>
+(function() {{
+'use strict';
+var SERVER = {server_url_js};
+var PROXY_PREFIX = {proxy_prefix_js};
+var DROP_FOLDER = {drop_folder_js};
+var POLL_INTERVAL_MS = 10000;
+
+var currentFilter = 'all';
+var snapshot = {{ papers: [] }};  // last server snapshot
+
+function escHtml(s) {{ if (!s) return ''; var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }}
+function escAttr(s) {{ return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;'); }}
+
+function classifyPaper(p) {{
+  // Drop-folder handoff means we infer "retrieved" from the paper no
+  // longer being in MANUAL_REQUIRED. But for THIS HTML we only fetch
+  // /api/manual/queue which is always MANUAL_REQUIRED. So we need a
+  // second signal: we track which canonical_ids were in the queue the
+  // first time we saw it, and any that subsequently DISAPPEAR from
+  // /api/manual/queue are marked retrieved.
+  if (p.permanently_unavailable) return 'unavail';
+  // ever-seen-and-now-missing is handled in pollQueue()
+  return 'pending';
+}}
+
+var everSeen = {{}};   // canonical_id -> last-known metadata
+var retrievedIds = {{}};  // canonical_id -> true once we infer retrieval
+var unavailableIds = {{}}; // canonical_id -> true for permanently unavailable
+
+function render() {{
+  var all = Object.keys(everSeen).map(function(cid) {{ return everSeen[cid]; }});
+  var list = document.getElementById('queue-list');
+  if (all.length === 0) {{
+    list.innerHTML = '<div class="banner info">The manual-required queue is empty. Trigger a retrieval run first.</div>';
+    document.getElementById('progress-text').textContent = '0 / 0';
+    document.getElementById('progress-pct').textContent = '';
+    document.getElementById('progress-fill').style.width = '100%';
+    document.getElementById('cnt-all').textContent = 0;
+    document.getElementById('cnt-pending').textContent = 0;
+    document.getElementById('cnt-retrieved').textContent = 0;
+    document.getElementById('cnt-unavail').textContent = 0;
+    return;
+  }}
+
+  var pending = [], retrieved = [], unavail = [];
+  for (var i = 0; i < all.length; i++) {{
+    var p = all[i];
+    if (retrievedIds[p.canonical_id]) retrieved.push(p);
+    else if (unavailableIds[p.canonical_id] || p.permanently_unavailable) unavail.push(p);
+    else pending.push(p);
+  }}
+  var total = all.length;
+  var done = retrieved.length + unavail.length;
+  var pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+  document.getElementById('progress-text').textContent = done + ' / ' + total + ' done';
+  document.getElementById('progress-pct').textContent = pct + '%';
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('cnt-all').textContent = total;
+  document.getElementById('cnt-pending').textContent = pending.length;
+  document.getElementById('cnt-retrieved').textContent = retrieved.length;
+  document.getElementById('cnt-unavail').textContent = unavail.length;
+
+  var visible;
+  if (currentFilter === 'pending') visible = pending;
+  else if (currentFilter === 'retrieved') visible = retrieved;
+  else if (currentFilter === 'unavail') visible = unavail;
+  else visible = all;
+
+  if (visible.length === 0) {{
+    list.innerHTML = '<div class="banner info">No papers match this filter.</div>';
+    return;
+  }}
+
+  list.innerHTML = visible.map(function(p) {{ return renderCard(p); }}).join('');
+}}
+
+function renderCard(p) {{
+  var isRetrieved = !!retrievedIds[p.canonical_id];
+  var isUnavail = !!unavailableIds[p.canonical_id] || !!p.permanently_unavailable;
+  var cls = 'card';
+  if (isRetrieved) cls += ' retrieved';
+  if (isUnavail) cls += ' unavail';
+
+  var badges = [];
+  if (isRetrieved) badges.push('<span class="badge b-success">&#10003; Retrieved</span>');
+  else if (isUnavail) badges.push('<span class="badge b-neutral">Unavailable</span>');
+  else badges.push('<span class="badge b-warn">Pending</span>');
+  if (p.publisher) badges.push('<span class="badge b-info">' + escHtml(p.publisher) + '</span>');
+  if (p.last_failure_code) badges.push('<span class="badge b-neutral">' + escHtml(p.last_failure_code) + '</span>');
+
+  var ezproxyBtn = p.ezproxy_url
+    ? '<a class="btn btn-primary" href="' + escAttr(p.ezproxy_url) + '" target="_blank" rel="noopener">Open via Library</a>' : '';
+  var doiBtn = p.doi_url
+    ? '<a class="btn btn-outline" href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">Open DOI</a>' : '';
+  var unavailBtn = (!isRetrieved && !isUnavail)
+    ? '<button class="btn btn-danger" onclick="markUnavailable(\\'' + escAttr(p.canonical_id) + '\\')">Mark Unavailable</button>' : '';
+  var retrievedMark = isRetrieved
+    ? '<span class="btn btn-success">&#10003; File validated in system</span>' : '';
+
+  var meta = [];
+  if (p.first_author) meta.push(escHtml(p.first_author));
+  if (p.year) meta.push(String(p.year));
+  if (p.journal) meta.push(escHtml(p.journal));
+  var metaStr = meta.join(' &middot; ');
+
+  return '<div class="' + cls + '" id="card-' + escAttr(p.canonical_id) + '">' +
+    '<div class="card-title">' + escHtml(p.title || '(no title)') + '</div>' +
+    (metaStr ? '<div class="card-meta">' + metaStr + '</div>' : '') +
+    (p.doi ? '<div class="card-doi">DOI: ' + escHtml(p.doi) + '</div>' : '') +
+    '<div class="badges">' + badges.join('') + '</div>' +
+    '<div class="actions">' + ezproxyBtn + doiBtn + unavailBtn + retrievedMark + '</div>' +
+    '</div>';
+}}
+
+window.markUnavailable = function(cid) {{
+  var note = prompt('Reason this paper is permanently unavailable? (optional)') || '';
+  fetch(SERVER + '/api/manual/paper/' + encodeURIComponent(cid) + '/mark-unobtainable?note=' + encodeURIComponent(note), {{method:'POST'}})
+    .then(function(r) {{
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      unavailableIds[cid] = true;
+      render();
+    }})
+    .catch(function(err) {{
+      alert('Failed to mark unavailable: ' + err.message);
+    }});
+}};
+
+async function pollQueue() {{
+  try {{
+    var r = await fetch(SERVER + '/api/manual/queue');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var data = await r.json();
+
+    // Clear prior banner on success
+    document.getElementById('status-banner').innerHTML = '';
+
+    var currentIds = {{}};
+    for (var i = 0; i < (data.papers || []).length; i++) {{
+      var p = data.papers[i];
+      currentIds[p.canonical_id] = true;
+      everSeen[p.canonical_id] = p;
+      if (p.permanently_unavailable) unavailableIds[p.canonical_id] = true;
+    }}
+    // Inference: any paper we saw before but is now gone from the
+    // queue has left MANUAL_REQUIRED. That happens when the FIX 4
+    // watcher validates a drop-folder file and marks COMPLETE (or
+    // when the paper goes to any non-MANUAL_REQUIRED state).
+    Object.keys(everSeen).forEach(function(cid) {{
+      if (!currentIds[cid] && !unavailableIds[cid]) {{
+        retrievedIds[cid] = true;
+      }}
+    }});
+
+    render();
+  }} catch (err) {{
+    showBanner('err',
+      'Cannot reach SRMA server at <code>' + SERVER + '</code>. ' +
+      'Make sure the app is running. (' + escHtml(err.message) + ')');
+  }}
+}}
+
+function showBanner(kind, html) {{
+  document.getElementById('status-banner').innerHTML =
+    '<div class="banner ' + kind + '">' + html + '</div>';
+}}
+
+// Guard: if drop folder isn't configured, show a sticky error.
+if (!DROP_FOLDER) {{
+  showBanner('warn',
+    '<strong>&#9888; Manual Mode drop folder is not configured.</strong> ' +
+    'Open the app, go to SSO → Manual Mode, set a drop folder, ' +
+    'and enable Manual Mode. The HTML pack is useless without the watcher.');
+}} else {{
+  showBanner('info',
+    'Drop folder: <code>' + escHtml(DROP_FOLDER) + '</code> &nbsp;·&nbsp; ' +
+    'Download PDFs here; the system validates automatically.');
+}}
+
+// Tab switching
+var tabs = document.querySelectorAll('.tab');
+for (var i = 0; i < tabs.length; i++) {{
+  tabs[i].addEventListener('click', function(e) {{
+    for (var j = 0; j < tabs.length; j++) tabs[j].classList.remove('active');
+    e.currentTarget.classList.add('active');
+    currentFilter = e.currentTarget.getAttribute('data-filter');
+    render();
+  }});
+}}
+
+// Kick off polling
+pollQueue();
+setInterval(pollQueue, POLL_INTERVAL_MS);
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+def _render_queue_pack_html(
+    run_id: str,
+    project_name: str,
+    proxy_prefix: str,
+    drop_folder: str,
+    server_url: str,
+) -> str:
+    """Produce the self-contained HTML queue pack.
+
+    All user-controlled strings go through json.dumps() for safe
+    interpolation into inline JavaScript, and through html.escape()
+    for interpolation into HTML text.
+    """
+    import html as _html
+
+    return _QUEUE_PACK_HTML_TEMPLATE.format(
+        project_name=_html.escape(project_name),
+        run_display=_html.escape(run_id or "(all)"),
+        gen_ts=_html.escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
+        server_url=_html.escape(server_url),
+        # JS-safe (JSON-quoted) — injects safely inside <script>
+        server_url_js=json.dumps(server_url),
+        proxy_prefix_js=json.dumps(proxy_prefix),
+        drop_folder_js=json.dumps(drop_folder),
     )
 
 

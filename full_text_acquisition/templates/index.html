@@ -1387,6 +1387,8 @@
                     <button class="btn btn-outline btn-sm" id="btnExportIntegration">Export Integration</button>
                     <button class="btn btn-primary btn-sm" id="btnExportBundle"
                             title="Submission bundle: config, audit log, PRISMA, PDFs, supplements, SHA-256 manifest">Download Submission Bundle</button>
+                    <button class="btn btn-success btn-sm" id="btnDownloadQueuePack"
+                            title="Self-contained HTML navigation dashboard for paywalled papers. Open in your own browser; downloads go into Manual Mode drop folder.">Download Queue Pack</button>
                 </div>
             </div>
 
@@ -3620,6 +3622,32 @@ document.getElementById('btnExportBundle').addEventListener('click', function() 
     }
     toast('Preparing submission bundle — this may take a moment for large runs...', 'info');
     window.location.href = '/api/export/bundle?run_id=' + encodeURIComponent(r);
+});
+
+document.getElementById('btnDownloadQueuePack').addEventListener('click', async function() {
+    // Warn if Manual Mode isn't configured — the queue pack is a
+    // navigation aid ON TOP of FIX 4's watched folder; without that
+    // folder, the user has nowhere to drop their downloaded PDFs.
+    try {
+        const s = await GET('/api/settings');
+        const folder = (s.config && s.config.manual_drop_folder) || '';
+        if (!folder) {
+            if (!confirm(
+                'Manual Mode drop folder is NOT configured.\n\n' +
+                'The Queue Pack is a browser dashboard that opens EZproxy ' +
+                'links for you. Actual PDF ingestion happens through the ' +
+                'Manual Mode watched folder — without one, you have ' +
+                'nowhere to drop your downloads.\n\n' +
+                'Download the Queue Pack anyway? (You can configure ' +
+                'Manual Mode later in the SSO panel.)'
+            )) return;
+        }
+    } catch (e) {}
+
+    const r = document.getElementById('resultsRunFilter').value;
+    const suffix = r ? '?run_id=' + encodeURIComponent(r) : '';
+    toast('Downloading Queue Pack — open it in your own browser', 'info');
+    window.location.href = '/api/export/queue-pack' + suffix;
 });
 
 /* ------------------------------------------------------------------
