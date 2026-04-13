@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -596,7 +596,10 @@ def _get_config() -> Dict[str, Any]:
 
 
 @app.post("/api/upload", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
+async def upload_file(
+    file: UploadFile = File(...),
+    output_directory_override: Optional[str] = Form(default=None),
+) -> UploadResponse:
     """Upload a CSV or Excel file for ingestion.
 
     Performs:
@@ -607,6 +610,11 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
         5. Canonical ID assignment
         6. ALREADY_RETRIEVED detection
         7. Create run record and paper_runs linkage
+
+    output_directory_override: optional per-batch override. If valid,
+    is recorded in the run's config_snapshot JSON and used (instead
+    of the global default) when this run is Started. Must pass the
+    same validation as /api/fs/check-path.
     """
     db = _get_db()
     config = _get_config()
@@ -626,9 +634,25 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     # Auto-detect columns
     detected = auto_detect_columns(headers)
 
-    # Create run
+    # Resolve the output directory for THIS run.
+    # Order: per-batch override > global config setting > project default.
+    effective_output_dir = config.get("output_directory", "./downloads")
+    override_validation: Optional[Dict[str, Any]] = None
+    if output_directory_override and output_directory_override.strip():
+        override_validation = _validate_output_path(output_directory_override)
+        if not override_validation["ok"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid output_directory_override: "
+                       f"{override_validation.get('error') or 'unknown error'}",
+            )
+        effective_output_dir = override_validation["abs_path"]
+
+    # Create run with snapshot reflecting the effective output_dir
     run_id = f"run-{uuid.uuid4().hex[:12]}"
-    config_snap = ConfigSnapshot.from_dict(config)
+    snapshot_config = dict(config)
+    snapshot_config["output_directory"] = effective_output_dir
+    config_snap = ConfigSnapshot.from_dict(snapshot_config)
     run_record = RunRecord(
         run_id=run_id,
         total_submitted=len(rows),
@@ -810,6 +834,7 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
         enrichment_result=enrichment,
         already_retrieved_count=already_retrieved_count,
         ready_for_retrieval_count=inserted,
+        output_directory=os.path.abspath(effective_output_dir),
     )
 
 
@@ -1268,6 +1293,29 @@ async def start_run(
             status_code=400,
             detail="No papers are ready for retrieval or validation.",
         )
+
+    # Apply per-run output_directory override (if any).
+    # The override is stored in the run's config_snapshot at upload time.
+    # Limitation: only one active run at a time, so retargeting the
+    # engine's _output_dir on Start is safe. Concurrent runs are not
+    # supported and would race; the WorkerPool already enforces single-run
+    # semantics via wp.is_running.
+    engine = _get_engine()
+    try:
+        snap = json.loads(run_record.config_snapshot or "{}")
+        run_output_dir = snap.get("output_directory") or ""
+        if run_output_dir:
+            run_output_abs = os.path.abspath(os.path.expanduser(run_output_dir))
+            os.makedirs(run_output_abs, exist_ok=True)
+            engine._output_dir = run_output_abs
+            engine._supplement_dir = os.path.join(run_output_abs, "Supplements")
+            os.makedirs(engine._supplement_dir, exist_ok=True)
+            logger.info(
+                "Run %s: output directory set to %s (per-run override)",
+                run_id, run_output_abs,
+            )
+    except Exception as exc:
+        logger.warning("Failed to apply per-run output dir for %s: %s", run_id, exc)
 
     # Start workers
     await wp.start(run_id)
@@ -2916,6 +2964,168 @@ def _build_bundle_readme(
 
 
 # ===========================================================================
+# FILESYSTEM VALIDATION
+# ===========================================================================
+
+# Belt-and-suspenders blocklist. The REAL test is the probe-write below;
+# this just labels system-y paths so the UI can warn even if the path
+# happens to be writable as root.
+SYSTEM_PATH_PREFIXES_POSIX: List[str] = [
+    "/etc", "/usr", "/bin", "/sbin", "/sys", "/proc", "/dev",
+    "/var", "/opt", "/boot", "/root",
+    "/Library", "/System", "/Applications", "/private",
+]
+
+SYSTEM_PATH_PREFIXES_WINDOWS: List[str] = [
+    r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)",
+    r"C:\ProgramData", r"C:\Users\Default",
+]
+
+
+def _is_system_path(real_path: str) -> bool:
+    """Return True if real_path is inside a known OS-managed directory.
+
+    Uses path-prefix matching after realpath resolution. Case-insensitive
+    on Windows-style paths.
+    """
+    if not real_path:
+        return False
+
+    # POSIX
+    norm = os.path.normpath(real_path)
+    for prefix in SYSTEM_PATH_PREFIXES_POSIX:
+        if norm == prefix or norm.startswith(prefix + os.sep):
+            return True
+
+    # Windows
+    norm_lower = norm.lower()
+    for prefix in SYSTEM_PATH_PREFIXES_WINDOWS:
+        p_lower = prefix.lower()
+        if norm_lower == p_lower or norm_lower.startswith(p_lower + os.sep) \
+                or norm_lower.startswith(p_lower + "/"):
+            return True
+    return False
+
+
+def _human_bytes(b: int) -> str:
+    """Pretty-print byte counts."""
+    if not b or b <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024.0:
+            return f"{b:.1f} {unit}"
+        b /= 1024.0
+    return f"{b:.1f} PB"
+
+
+def _validate_output_path(raw_path: str) -> Dict[str, Any]:
+    """Validate a candidate output_directory.
+
+    Steps:
+      1. Expand ~ and resolve to absolute path
+      2. Resolve symlinks via os.path.realpath
+      3. Check against system-path blocklist (warn, but do not auto-fail —
+         labelled in the response so UI can decide)
+      4. If path doesn't exist, check that the closest existing ancestor
+         is writable (so we can mkdir)
+      5. If path exists, attempt a probe-write of a tiny file and delete
+         it immediately
+      6. Compute free disk space at the resolved location
+      7. Return structured result
+
+    Returns a dict with at minimum:
+        ok           bool   — overall verdict (writable AND not system)
+        abs_path     str    — input expanded + made absolute
+        real_path    str    — symlinks resolved
+        exists       bool
+        writable     bool   — actually verified by probe-write
+        system_path  bool   — labelled by blocklist
+        free_bytes   int
+        free_human   str
+        error        str | None — human-readable explanation if !ok
+    """
+    result: Dict[str, Any] = {
+        "ok": False, "abs_path": "", "real_path": "",
+        "exists": False, "writable": False, "system_path": False,
+        "free_bytes": 0, "free_human": "0 B", "error": None,
+    }
+    if not raw_path or not raw_path.strip():
+        result["error"] = "Path is empty"
+        return result
+
+    try:
+        expanded = os.path.expanduser(raw_path.strip())
+        abs_path = os.path.abspath(expanded)
+        real_path = os.path.realpath(abs_path)
+    except (OSError, ValueError) as exc:
+        result["error"] = f"Cannot resolve path: {exc}"
+        return result
+
+    result["abs_path"] = abs_path
+    result["real_path"] = real_path
+    result["system_path"] = _is_system_path(real_path)
+
+    if result["system_path"]:
+        result["error"] = "Path is inside a system-managed directory"
+        return result
+
+    # Find the deepest existing ancestor — that's where mkdir-ability matters
+    exists = os.path.exists(real_path)
+    result["exists"] = exists
+    probe_dir = real_path if exists else os.path.dirname(real_path)
+    while probe_dir and not os.path.exists(probe_dir):
+        parent = os.path.dirname(probe_dir)
+        if parent == probe_dir:
+            break
+        probe_dir = parent
+
+    if not probe_dir or not os.path.exists(probe_dir):
+        result["error"] = "No writable ancestor directory exists"
+        return result
+
+    # Probe-write — the only authoritative writability test
+    probe_name = f".permcheck_{uuid.uuid4().hex[:12]}"
+    probe_path = os.path.join(probe_dir, probe_name)
+    try:
+        with open(probe_path, "w") as fh:
+            fh.write("ok")
+        result["writable"] = True
+    except (OSError, PermissionError) as exc:
+        result["error"] = f"Probe write failed: {exc}"
+        result["writable"] = False
+    finally:
+        try:
+            if os.path.exists(probe_path):
+                os.unlink(probe_path)
+        except OSError:
+            pass
+
+    # Free disk space at the deepest existing ancestor
+    try:
+        usage = shutil.disk_usage(probe_dir)
+        result["free_bytes"] = usage.free
+        result["free_human"] = _human_bytes(usage.free)
+    except (OSError, AttributeError):
+        pass
+
+    result["ok"] = result["writable"] and not result["system_path"]
+    return result
+
+
+@app.post("/api/fs/check-path")
+async def check_output_path(
+    path: str = Query(..., description="Candidate output directory path"),
+) -> JSONResponse:
+    """Validate an output_directory candidate.
+
+    Used by the live validator next to the path inputs in Settings and
+    the per-batch override on Upload. Cheap (write+delete a single
+    byte) but synchronous — clients should debounce calls.
+    """
+    return JSONResponse(_validate_output_path(path))
+
+
+# ===========================================================================
 # SETTINGS ENDPOINTS
 # ===========================================================================
 
@@ -3307,6 +3517,32 @@ async def system_status() -> JSONResponse:
     """Overall system status for the UI to check on load."""
     wp = app_state.get("worker_pool")
     wizard: Optional[WizardResult] = app_state.get("wizard_result")
+    config = _get_config()
+    engine = app_state.get("engine")
+
+    # Resolve the currently-active output directory:
+    # - If a run is in progress with an override, the engine's
+    #   _output_dir reflects it.
+    # - Otherwise, fall back to the configured default.
+    if engine is not None and getattr(engine, "_output_dir", None):
+        active_output = os.path.abspath(engine._output_dir)
+    else:
+        active_output = os.path.abspath(
+            config.get("output_directory", "./downloads")
+        )
+
+    free_bytes = 0
+    try:
+        # Probe the deepest existing ancestor for free-space figure
+        probe = active_output
+        while probe and not os.path.exists(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe: break
+            probe = parent
+        if probe and os.path.exists(probe):
+            free_bytes = shutil.disk_usage(probe).free
+    except (OSError, AttributeError):
+        pass
 
     return JSONResponse({
         "initialized": app_state.get("db") is not None,
@@ -3320,6 +3556,8 @@ async def system_status() -> JSONResponse:
         "wizard_errors": wizard.errors if wizard else [],
         "ocr_mode": wizard.ocr_mode if wizard else "disabled",
         "platform": platform.system(),
+        "output_directory": active_output,
+        "output_directory_free_bytes": free_bytes,
     })
 
 

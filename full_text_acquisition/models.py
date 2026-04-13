@@ -808,6 +808,11 @@ class UploadResponse(BaseModel):
     enrichment_result: Optional[EnrichmentResult] = None
     already_retrieved_count: int = 0
     ready_for_retrieval_count: int = 0
+    output_directory: str = Field(
+        default="",
+        description="Resolved absolute output directory used for THIS run "
+                    "(reflects per-batch override if one was supplied)",
+    )
 
 
 class RetryRequest(BaseModel):

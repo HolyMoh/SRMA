@@ -607,6 +607,16 @@
             </div>
 
             <div class="card">
+                <div class="form-group" style="margin-bottom:16px">
+                    <label>Output folder for this batch (optional)</label>
+                    <input type="text" class="form-control" id="uploadOutputOverride"
+                           placeholder="Leave blank to use default from Settings"
+                           data-path-input="upload"
+                           data-status-id="uploadOverrideStatus"
+                           autocomplete="off">
+                    <div class="form-hint" id="uploadOverrideStatus"
+                         style="margin-top:6px"></div>
+                </div>
                 <div class="drop-zone" id="dropZone">
                     <div class="drop-zone-icon">&#128196;</div>
                     <div class="drop-zone-text">
@@ -651,6 +661,14 @@
                         <div class="metric-value" id="uploadReady">0</div>
                         <div class="metric-label">Ready for Retrieval</div>
                     </div>
+                </div>
+
+                <!-- Output directory used for THIS run -->
+                <div style="margin-bottom:16px;padding:10px;background:var(--bg-primary);border-radius:var(--radius-sm);font-size:13px">
+                    <strong>Output folder for this run:</strong>
+                    <span id="uploadOutputResolved" style="font-family:var(--mono);font-size:12px;margin-left:8px">—</span>
+                    <button class="btn btn-outline btn-sm" id="btnCopyUploadOutput"
+                            style="margin-left:8px;padding:2px 8px;font-size:11px">Copy</button>
                 </div>
 
                 <!-- Column mapping -->
@@ -835,6 +853,18 @@
                         <label>Cooldown Minutes</label>
                         <input type="number" class="form-control" id="cfgCooldownMinutes" min="1" max="60">
                     </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>Output Directory</h3></div>
+                <div class="form-group">
+                    <label>Where downloaded PDFs and supplements are saved</label>
+                    <input type="text" class="form-control" id="cfgOutputDir"
+                           placeholder="./downloads"
+                           data-path-input="settings"
+                           autocomplete="off">
+                    <div class="form-hint" id="cfgOutputDirStatus" style="margin-top:6px"></div>
                 </div>
             </div>
 
@@ -1150,6 +1180,23 @@
                 </div>
             </div>
 
+            <!-- Where the files live -->
+            <div class="card" style="padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+                <span style="font-size:13px;color:var(--text-secondary)">Files saved to:</span>
+                <span id="resultsOutputPath"
+                      style="font-family:var(--mono);font-size:12px;flex:1;word-break:break-all">—</span>
+                <span id="resultsOutputFree"
+                      style="font-size:12px;color:var(--text-secondary)">—</span>
+                <button class="btn btn-outline btn-sm" id="btnCopyResultsPath"
+                        title="Copy the absolute path to your clipboard"
+                        style="padding:4px 10px">Copy path</button>
+                <span style="font-size:11px;color:var(--text-secondary)">
+                    Then paste in: <strong>macOS</strong> &#8984;&#8679;G &middot;
+                    <strong>Windows</strong> Win+R &middot;
+                    <strong>Linux</strong> Files &rarr; Ctrl+L
+                </span>
+            </div>
+
             <!-- Filter tabs -->
             <div class="tab-bar" id="resultsTabBar">
                 <div class="tab active" data-filter="">All <span class="tab-count" id="tabCountAll">0</span></div>
@@ -1319,7 +1366,7 @@ function switchPanel(name) {
         p.classList.toggle('active', p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1));
     });
     // Unified SSE is always on; individual panels only trigger one-shot loads
-    if (name === 'results') loadResults();
+    if (name === 'results') { loadResults(); loadResultsOutputHeader(); }
     if (name === 'settings') loadSettings();
     if (name === 'run') loadRuns();
     if (name === 'sso') loadSsoStatus();
@@ -1352,6 +1399,17 @@ async function handleUpload(file) {
     try {
         const fd = new FormData();
         fd.append('file', file);
+        // Per-batch output dir override (only if validated OK)
+        const overrideEl = document.getElementById('uploadOutputOverride');
+        const overrideVal = (overrideEl.value || '').trim();
+        if (overrideVal) {
+            if (overrideEl.dataset.pathOk !== 'true') {
+                document.getElementById('uploadProgress').style.display = 'none';
+                toast('Output folder override is invalid — fix or clear it', 'error');
+                return;
+            }
+            fd.append('output_directory_override', overrideVal);
+        }
         const data = await POST('/api/upload', fd);
 
         document.getElementById('uploadProgressBar').style.width = '100%';
@@ -1362,6 +1420,9 @@ async function handleUpload(file) {
         document.getElementById('uploadTotal').textContent = data.total_submitted;
         document.getElementById('uploadDedup').textContent = data.deduplication_report.duplicates_removed;
         document.getElementById('uploadAlready').textContent = data.already_retrieved_count;
+        if (data.output_directory) {
+            document.getElementById('uploadOutputResolved').textContent = data.output_directory;
+        }
         document.getElementById('uploadReady').textContent = data.ready_for_retrieval_count;
 
         // Column mapping
@@ -1600,6 +1661,91 @@ document.getElementById('btnStartAfterUpload').addEventListener('click', async f
 /* ------------------------------------------------------------------
    Settings
    ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+   Path validator — debounced, shared by Settings + Upload override
+   ------------------------------------------------------------------ */
+const _pathValidationTimers = new WeakMap();
+const _pathValidationLatest = new WeakMap();  // for race protection
+
+async function validatePathInput(inputEl) {
+    if (!inputEl) return;
+    const statusEl = inputEl.parentElement.querySelector('[data-path-status], #cfgOutputDirStatus, #uploadOverrideStatus')
+        || document.getElementById(inputEl.dataset.statusId || '');
+    if (!statusEl) return;
+
+    const raw = (inputEl.value || '').trim();
+    if (!raw) {
+        statusEl.innerHTML = '<span style="color:var(--text-secondary)">Empty (will use default)</span>';
+        inputEl.dataset.pathOk = 'empty';
+        return;
+    }
+
+    statusEl.innerHTML = '<span style="color:var(--text-secondary)">Checking...</span>';
+
+    // Race-protection token
+    const token = Symbol();
+    _pathValidationLatest.set(inputEl, token);
+
+    try {
+        const r = await fetch('/api/fs/check-path?path=' + encodeURIComponent(raw),
+            { method: 'POST' });
+        if (_pathValidationLatest.get(inputEl) !== token) return;  // stale
+        if (!r.ok) {
+            statusEl.innerHTML = '<span style="color:var(--danger)">&#9888; check failed (' + r.status + ')</span>';
+            inputEl.dataset.pathOk = 'false';
+            return;
+        }
+        const data = await r.json();
+        if (_pathValidationLatest.get(inputEl) !== token) return;
+        renderPathStatus(statusEl, inputEl, data);
+    } catch (e) {
+        if (_pathValidationLatest.get(inputEl) !== token) return;
+        statusEl.innerHTML = '<span style="color:var(--danger)">&#9888; ' + escHtml(e.message) + '</span>';
+        inputEl.dataset.pathOk = 'false';
+    }
+}
+
+function renderPathStatus(statusEl, inputEl, data) {
+    if (data.ok) {
+        const existsLabel = data.exists ? 'exists' : 'will be created';
+        statusEl.innerHTML =
+            '<span style="color:var(--success)">&#10003; ' + escHtml(data.real_path) + '</span> ' +
+            '<span style="color:var(--text-secondary)">(' + existsLabel +
+            ', ' + escHtml(data.free_human) + ' free)</span>';
+        inputEl.dataset.pathOk = 'true';
+    } else {
+        statusEl.innerHTML =
+            '<span style="color:var(--danger)">&#9888; ' +
+            escHtml(data.error || 'invalid path') + '</span> ' +
+            (data.real_path ? '<span style="color:var(--text-secondary);font-family:var(--mono);font-size:11px">' + escHtml(data.real_path) + '</span>' : '');
+        inputEl.dataset.pathOk = 'false';
+    }
+}
+
+// Debounce on input
+function attachPathValidator(input) {
+    if (!input || input.dataset.validatorAttached) return;
+    input.dataset.validatorAttached = '1';
+    input.addEventListener('input', function() {
+        clearTimeout(_pathValidationTimers.get(input));
+        _pathValidationTimers.set(input, setTimeout(function() {
+            validatePathInput(input);
+        }, 750));
+    });
+    // Also validate on blur (immediate)
+    input.addEventListener('blur', function() {
+        clearTimeout(_pathValidationTimers.get(input));
+        validatePathInput(input);
+    });
+}
+
+// Auto-attach to all path inputs on load
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('[data-path-input]').forEach(attachPathValidator);
+});
+// Also attach immediately in case DOM is already ready
+document.querySelectorAll('[data-path-input]').forEach(attachPathValidator);
+
 async function loadSettings() {
     try {
         const data = await GET('/api/settings');
@@ -1624,6 +1770,9 @@ async function loadSettings() {
         document.getElementById('cfgResolver').value = c.institutional_resolver_url || '';
         document.getElementById('cfgUnpaywallEmail').value = c.unpaywall_email || '';
         document.getElementById('cfgCacheTtl').value = c.cache_ttl_days || '';
+        document.getElementById('cfgOutputDir').value = c.output_directory || '';
+        // Trigger an initial validation of the loaded value
+        validatePathInput(document.getElementById('cfgOutputDir'));
 
         const ocrEl = document.getElementById('settingsOcrStatus');
         ocrEl.textContent = data.ocr_available ? (data.ghostscript_available ? 'Full OCR' : 'Tesseract Only') : 'Disabled';
@@ -1668,7 +1817,7 @@ document.getElementById('btnSaveSettings').addEventListener('click', async funct
         if (!isNaN(v)) body[f[0]] = v;
     });
     body.min_disk_space_bytes = diskMb * 1048576;
-    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail']];
+    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail'],['output_directory','cfgOutputDir']];
     strFields.forEach(function(f) { const v = document.getElementById(f[1]).value; if (v) body[f[0]] = v; });
 
     try {
@@ -2159,6 +2308,61 @@ document.getElementById('btnCaptchaResolved').addEventListener('click', async fu
 /* ------------------------------------------------------------------
    Results
    ------------------------------------------------------------------ */
+async function loadResultsOutputHeader() {
+    /* Populate the "Files saved to:" header at the top of Results.
+       Uses /api/status, which reflects the engine's current output dir
+       (per-run override if a run is active, otherwise the global default). */
+    try {
+        const s = await GET('/api/status');
+        document.getElementById('resultsOutputPath').textContent =
+            s.output_directory || '(not set)';
+        if (s.output_directory_free_bytes) {
+            document.getElementById('resultsOutputFree').textContent =
+                formatBytes(s.output_directory_free_bytes) + ' free';
+        } else {
+            document.getElementById('resultsOutputFree').textContent = '';
+        }
+    } catch (e) {
+        document.getElementById('resultsOutputPath').textContent = '(unavailable)';
+    }
+}
+
+async function copyTextToClipboard(text) {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (e) {}
+    // Fallback for non-secure contexts (http://localhost is fine in modern browsers,
+    // but we still keep this as a safety net)
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+        document.body.appendChild(ta); ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+    } catch (e) { return false; }
+}
+
+document.getElementById('btnCopyResultsPath').addEventListener('click', async function() {
+    const path = document.getElementById('resultsOutputPath').textContent;
+    if (!path || path === '—' || path === '(not set)' || path === '(unavailable)') {
+        toast('No output path to copy', 'warning'); return;
+    }
+    const ok = await copyTextToClipboard(path);
+    toast(ok ? 'Path copied: ' + path : 'Copy failed — select and copy manually',
+          ok ? 'success' : 'error');
+});
+
+document.getElementById('btnCopyUploadOutput').addEventListener('click', async function() {
+    const path = document.getElementById('uploadOutputResolved').textContent;
+    if (!path || path === '—') { toast('No output path yet', 'warning'); return; }
+    const ok = await copyTextToClipboard(path);
+    toast(ok ? 'Path copied' : 'Copy failed', ok ? 'success' : 'error');
+});
+
 async function loadResults() {
     try {
         const runFilter = document.getElementById('resultsRunFilter').value;
