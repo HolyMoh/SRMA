@@ -571,6 +571,16 @@
          ============================================================ -->
     <aside class="sidebar">
         <h1>FT Acquisition</h1>
+
+        <!-- Project selector — per-project isolation -->
+        <div style="padding:10px 14px;margin:10px 12px;background:rgba(255,255,255,0.05);border-radius:var(--radius-sm);cursor:pointer"
+             id="projectSelectorBlock" title="Click to switch or create projects">
+            <div style="font-size:10px;color:rgba(255,255,255,0.5);letter-spacing:0.5px;text-transform:uppercase">Project</div>
+            <div style="font-size:13px;font-weight:600;color:var(--text-light);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+                 id="projectSelectorName">—</div>
+            <div style="font-size:10px;color:rgba(255,255,255,0.4);margin-top:2px" id="projectSelectorSlug"></div>
+        </div>
+
         <nav>
             <div class="nav-item active" data-panel="upload">
                 <span class="nav-icon">&#128194;</span> Upload
@@ -1439,6 +1449,36 @@
     </div>
 </div>
 
+<!-- Project picker modal ================================================== -->
+<div class="modal-backdrop" id="projectModal">
+    <div class="modal" style="max-width:640px">
+        <h3>Projects</h3>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">
+            Each project has its own database, downloads folder, and settings overlay.
+            Switching requires that no background task is running.
+        </div>
+
+        <div id="projectList" style="max-height:300px;overflow-y:auto;margin-bottom:16px"></div>
+
+        <div style="padding:12px;background:var(--bg-primary);border-radius:var(--radius-sm);margin-bottom:16px">
+            <strong style="font-size:13px">Create a new project</strong>
+            <div class="form-group" style="margin-top:8px;margin-bottom:8px">
+                <input type="text" class="form-control" id="newProjectName"
+                       placeholder="e.g. COVID-19 Systematic Review"
+                       maxlength="200">
+                <div class="form-hint" id="newProjectSlugPreview" style="margin-top:4px"></div>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btnCreateProject">Create &amp; Switch</button>
+        </div>
+
+        <div id="projectMigrationNotice" style="margin-bottom:12px;font-size:12px"></div>
+
+        <div class="btn-group" style="justify-content:flex-end">
+            <button class="btn btn-outline" id="btnCloseProjectModal">Close</button>
+        </div>
+    </div>
+</div>
+
 <script>
 /* ==================================================================
    Full-Text Acquisition System — Frontend
@@ -2176,6 +2216,11 @@ function handleStreamEvent(m) {
     if (m.manual_mode && typeof renderManualModeFromStream === 'function') {
         renderManualModeFromStream(m.manual_mode);
     }
+
+    // --- Current project: keeps sidebar header in sync ---
+    if (m.current_project && typeof updateProjectHeader === 'function') {
+        updateProjectHeader(m.current_project);
+    }
 }
 
 window.forceCooldownReset = async function(pub) {
@@ -2617,6 +2662,151 @@ document.addEventListener('toggle', function(e) {
         loadSsoAuditFunctions();
     }
 }, true);
+
+/* ------------------------------------------------------------------
+   Projects — per-project isolation
+   ------------------------------------------------------------------
+   The current project name is rendered in the sidebar header.
+   Clicking it opens a modal with the full list + New Project form.
+*/
+
+function updateProjectHeader(cp) {
+    if (!cp) return;
+    document.getElementById('projectSelectorName').textContent = cp.project_name || '—';
+    document.getElementById('projectSelectorSlug').textContent = cp.project_slug ? '(' + cp.project_slug + ')' : '';
+}
+
+async function openProjectModal() {
+    document.getElementById('projectModal').classList.add('active');
+    await refreshProjectList();
+    document.getElementById('newProjectName').value = '';
+    document.getElementById('newProjectSlugPreview').textContent = '';
+}
+
+function closeProjectModal() {
+    document.getElementById('projectModal').classList.remove('active');
+}
+
+async function refreshProjectList() {
+    try {
+        const data = await GET('/api/projects');
+        const list = document.getElementById('projectList');
+        list.innerHTML = data.projects.map(function(p) {
+            const badge = p.is_current
+                ? '<span class="badge badge-success" style="margin-left:8px">Current</span>' : '';
+            const switchBtn = p.is_current ? '' :
+                '<button class="btn btn-sm btn-primary" onclick="switchToProject(\'' + escAttr(p.project_slug) + '\')">Switch</button>';
+            const renameBtn = '<button class="btn btn-sm btn-outline" onclick="renameProject(\'' + escAttr(p.project_slug) + '\',\'' + escAttr(p.project_name) + '\')">Rename</button>';
+            const deleteBtn = (p.is_current || p.project_slug === 'default') ? '' :
+                '<button class="btn btn-sm btn-danger" onclick="deleteProject(\'' + escAttr(p.project_slug) + '\',\'' + escAttr(p.project_name) + '\')">Delete</button>';
+            return '<div style="padding:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">' +
+                '<div style="flex:1">' +
+                    '<div style="font-weight:500">' + escHtml(p.project_name) + badge + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary);font-family:var(--mono)">slug: ' + escHtml(p.project_slug) + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary);font-family:var(--mono)">db: ' + escHtml(p.db_path) + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary);font-family:var(--mono)">out: ' + escHtml(p.output_dir) + '</div>' +
+                '</div>' +
+                '<div style="display:flex;gap:4px">' + switchBtn + ' ' + renameBtn + ' ' + deleteBtn + '</div>' +
+                '</div>';
+        }).join('');
+
+        // Migration notice (once, at top)
+        if (data.migration_notice && data.migration_notice.migrated) {
+            document.getElementById('projectMigrationNotice').innerHTML =
+                '<div style="padding:10px;background:#fffbeb;border:1px solid var(--warning);border-radius:var(--radius-sm)">' +
+                '<strong>&#9888; Legacy data migrated</strong><br>' +
+                escHtml(data.migration_notice.reason || '') +
+                '<div style="font-size:11px;margin-top:4px;color:var(--text-secondary)">' +
+                'Original <code>./acquisition.db</code> and <code>./downloads/</code> were COPIED (not moved). ' +
+                'They remain on disk as a backup. Delete them manually once you confirm the Default project is intact.' +
+                '</div></div>';
+        } else {
+            document.getElementById('projectMigrationNotice').innerHTML = '';
+        }
+    } catch (e) {
+        document.getElementById('projectList').innerHTML =
+            '<div style="color:var(--danger)">Failed to load: ' + escHtml(e.message) + '</div>';
+    }
+}
+
+document.getElementById('projectSelectorBlock').addEventListener('click', openProjectModal);
+document.getElementById('btnCloseProjectModal').addEventListener('click', closeProjectModal);
+
+// Live slug preview as user types a new project name
+document.getElementById('newProjectName').addEventListener('input', function() {
+    const v = (this.value || '').trim();
+    if (!v) {
+        document.getElementById('newProjectSlugPreview').textContent = '';
+        return;
+    }
+    // Client-side approximation of the server-side slugify (just the base part)
+    const base = v.toLowerCase()
+        .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+        .slice(0, 50).replace(/-+$/, '') || 'project';
+    document.getElementById('newProjectSlugPreview').innerHTML =
+        '<span style="color:var(--text-secondary)">Folder will be: </span>' +
+        '<span style="font-family:var(--mono)">./projects/' + escHtml(base) + '-xxxxxxxx/</span>';
+});
+
+document.getElementById('btnCreateProject').addEventListener('click', async function() {
+    const name = document.getElementById('newProjectName').value.trim();
+    if (!name) { toast('Project name is required', 'warning'); return; }
+    try {
+        const p = await POST('/api/projects', { project_name: name });
+        toast('Project created: ' + p.project_name, 'success');
+        // Now activate it (will fail if busy)
+        try {
+            await POST('/api/projects/activate?slug=' + encodeURIComponent(p.project_slug));
+            toast('Switched to ' + p.project_name, 'success');
+            // Reload everything — SSE will deliver the new project name shortly
+            setTimeout(function() { location.reload(); }, 500);
+        } catch (e) {
+            toast('Project created but switch failed: ' + e.message, 'warning');
+            refreshProjectList();
+        }
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+window.switchToProject = async function(slug) {
+    try {
+        await POST('/api/projects/activate?slug=' + encodeURIComponent(slug));
+        toast('Switching to ' + slug + '...', 'info');
+        setTimeout(function() { location.reload(); }, 500);
+    } catch (err) {
+        // 409 = busy. Show the list of active tasks from the server's response.
+        const msg = err.message || '';
+        if (msg.indexOf('Cannot switch') >= 0 || msg.indexOf('active') >= 0) {
+            alert('Cannot switch projects right now:\n\n' + msg +
+                '\n\nStop the active task (see Run / SSO / Manual Mode / Upload panels) and try again.');
+        } else {
+            toast(msg, 'error');
+        }
+    }
+};
+
+window.renameProject = async function(slug, currentName) {
+    const name = prompt('New project name:', currentName);
+    if (!name || name === currentName) return;
+    try {
+        await PUT('/api/projects/' + encodeURIComponent(slug), { project_name: name });
+        toast('Renamed', 'success');
+        refreshProjectList();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+window.deleteProject = async function(slug, name) {
+    if (!confirm('Delete project "' + name + '"?\n\nThis will permanently remove:\n' +
+        '  ./projects/' + slug + '/acquisition.db\n' +
+        '  ./projects/' + slug + '/downloads/\n\n' +
+        'This cannot be undone.')) return;
+    try {
+        await fetch('/api/projects/' + encodeURIComponent(slug), { method: 'DELETE' });
+        toast('Deleted: ' + name, 'success');
+        refreshProjectList();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
 
 /* ------------------------------------------------------------------
    MANUAL ORCHESTRATION MODE — no browser, no credentials

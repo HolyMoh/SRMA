@@ -51,6 +51,8 @@ from full_text_acquisition.models import (
     DEFAULT_BACKPRESSURE_THRESHOLD,
     DEFAULT_CACHE_TTL_DAYS,
     DEFAULT_CONFIG,
+    ProjectCreate,
+    ProjectResponse,
     AuditLogEntry,
     ColumnMapping,
     ConfigSnapshot,
@@ -130,6 +132,294 @@ def setup_logging(log_dir: str = ".") -> None:
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = "config.json"
+
+# ---------------------------------------------------------------------------
+# Per-project isolation — filesystem layout
+# ---------------------------------------------------------------------------
+PROJECTS_ROOT = "./projects"
+PROJECTS_MANIFEST_PATH = os.path.join(PROJECTS_ROOT, "projects.json")
+PROJECTS_MIGRATION_MARKER = os.path.join(PROJECTS_ROOT, ".migrated")
+DEFAULT_PROJECT_SLUG = "default"   # the one migration target with a stable name
+DEFAULT_PROJECT_DISPLAY = "Default"
+
+
+def _slugify_project_name(name: str, existing_slugs: Set[str]) -> str:
+    """Sanitize a user-supplied project name into a filesystem-safe slug.
+
+    Rules:
+      - Lowercase
+      - Strip diacritics via NFKD decomposition
+      - Replace anything not in [a-z0-9] with '-'
+      - Collapse multiple hyphens, strip leading/trailing
+      - Truncate to 50 chars
+      - Append an 8-char UUID suffix to GUARANTEE uniqueness and to
+        side-step Windows reserved names (CON, PRN, NUL, etc.)
+
+    Returns a slug that matches ^[a-z0-9][a-z0-9-]*-[a-f0-9]{8}$ so
+    path-traversal is structurally impossible.
+    """
+    import re as _re
+    import unicodedata as _unicodedata
+
+    normalized = _unicodedata.normalize("NFKD", name or "")
+    ascii_only = "".join(c for c in normalized if not _unicodedata.combining(c))
+    lower = ascii_only.lower()
+    # Replace any run of non-alphanumeric with single hyphen
+    base = _re.sub(r'[^a-z0-9]+', '-', lower).strip('-')
+    base = base[:50].strip('-') or "project"
+    # Append uniqueness suffix
+    suffix = uuid.uuid4().hex[:8]
+    slug = f"{base}-{suffix}"
+    # Guard against the (astronomically unlikely) collision
+    while slug in existing_slugs:
+        slug = f"{base}-{uuid.uuid4().hex[:8]}"
+    return slug
+
+
+def _project_dir(slug: str) -> str:
+    return os.path.join(PROJECTS_ROOT, slug)
+
+
+def _project_db_path(slug: str) -> str:
+    return os.path.join(_project_dir(slug), "acquisition.db")
+
+
+def _project_config_path(slug: str) -> str:
+    return os.path.join(_project_dir(slug), "config.json")
+
+
+def _project_output_dir(slug: str) -> str:
+    return os.path.join(_project_dir(slug), "downloads")
+
+
+def _project_supplement_dir(slug: str) -> str:
+    return os.path.join(_project_output_dir(slug), "Supplements")
+
+
+def _load_projects_manifest() -> Dict[str, Any]:
+    """Load ./projects/projects.json, returning an empty manifest if absent."""
+    if not os.path.isfile(PROJECTS_MANIFEST_PATH):
+        return {"version": 1, "current_project_slug": None, "projects": []}
+    try:
+        with open(PROJECTS_MANIFEST_PATH, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to read projects manifest: %s", exc)
+        return {"version": 1, "current_project_slug": None, "projects": []}
+
+
+def _save_projects_manifest(manifest: Dict[str, Any]) -> None:
+    """Atomically persist the manifest."""
+    os.makedirs(PROJECTS_ROOT, exist_ok=True)
+    tmp = PROJECTS_MANIFEST_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, PROJECTS_MANIFEST_PATH)
+
+
+def _find_project(manifest: Dict[str, Any], slug: str) -> Optional[Dict[str, Any]]:
+    for p in manifest.get("projects", []):
+        if p.get("project_slug") == slug:
+            return p
+    return None
+
+
+def _load_project_config_overlay(slug: str) -> Dict[str, Any]:
+    """Read the per-project config.json overlay. Empty dict if absent."""
+    path = _project_config_path(slug)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_project_config_overlay(slug: str, overlay: Dict[str, Any]) -> None:
+    """Persist the per-project config overlay."""
+    os.makedirs(_project_dir(slug), exist_ok=True)
+    path = _project_config_path(slug)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(overlay, f, indent=2)
+    os.replace(tmp, path)
+
+
+# Fields the user is allowed to override per-project. Other global
+# fields (config_version, database_path) are never project-scoped.
+_PROJECT_OVERRIDABLE_KEYS: Set[str] = {
+    "output_directory", "supplement_directory",
+    "sso_proxy_url", "openathens_url", "institutional_resolver_url",
+    "unpaywall_email",
+    "manual_drop_folder", "manual_mode_enabled",
+    "cooldown_minutes", "cooldown_failure_threshold", "cooldown_window_size",
+    "retrieval_concurrency", "validation_concurrency",
+    "backpressure_threshold",
+    "api_timeout_s", "pdf_download_timeout_s",
+    "page_load_timeout_s", "selector_timeout_s",
+    "pdf_validation_timeout_s", "ocr_per_page_timeout_s",
+    "max_retries", "max_total_attempts",
+    "min_disk_space_bytes",
+    "cache_ttl_days",
+    "scholar_min_delay_s", "scholar_max_queries_per_paper",
+}
+
+
+def _merge_project_config(
+    slug: str,
+    global_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compose the effective runtime config for a project.
+
+    Precedence: DEFAULT_CONFIG (implicit via global) ← global config.json
+    ← project config.json overlay. Plus project-specific path defaults
+    for output/supplement dirs if not overridden.
+    """
+    effective = dict(global_config)
+    effective["database_path"] = _project_db_path(slug)
+
+    # Sensible per-project defaults
+    if not effective.get("output_directory"):
+        effective["output_directory"] = _project_output_dir(slug)
+    if not effective.get("supplement_directory"):
+        effective["supplement_directory"] = _project_supplement_dir(slug)
+
+    # Apply overlay (only whitelisted keys)
+    overlay = _load_project_config_overlay(slug)
+    for k, v in overlay.items():
+        if k in _PROJECT_OVERRIDABLE_KEYS:
+            effective[k] = v
+
+    # If overlay omitted output_directory but the user had previously
+    # set a global one, we should still honor the project default.
+    # Use project-path if the current value is the global default.
+    if "output_directory" not in overlay:
+        effective["output_directory"] = _project_output_dir(slug)
+    if "supplement_directory" not in overlay:
+        effective["supplement_directory"] = _project_supplement_dir(slug)
+
+    return effective
+
+
+def _ensure_default_project(
+    manifest: Dict[str, Any],
+    global_config: Dict[str, Any],
+) -> str:
+    """Ensure the Default project entry exists + its directories exist.
+
+    Returns the Default project's slug (always 'default').
+    """
+    default = _find_project(manifest, DEFAULT_PROJECT_SLUG)
+    if default is None:
+        default = {
+            "project_id": str(uuid.uuid4()),
+            "project_name": DEFAULT_PROJECT_DISPLAY,
+            "project_slug": DEFAULT_PROJECT_SLUG,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        manifest.setdefault("projects", []).append(default)
+
+    # Ensure directories exist
+    os.makedirs(_project_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+    os.makedirs(_project_output_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+    os.makedirs(_project_supplement_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+
+    # Ensure overlay file exists (empty means "inherit everything")
+    if not os.path.isfile(_project_config_path(DEFAULT_PROJECT_SLUG)):
+        _save_project_config_overlay(DEFAULT_PROJECT_SLUG, {})
+
+    # Seed current_project_slug if absent
+    if not manifest.get("current_project_slug"):
+        manifest["current_project_slug"] = DEFAULT_PROJECT_SLUG
+
+    _save_projects_manifest(manifest)
+    return DEFAULT_PROJECT_SLUG
+
+
+def _migrate_legacy_to_default(global_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Idempotent copy of legacy ./acquisition.db + ./downloads/ into
+    ./projects/default/. Never overwrites existing default data.
+
+    Returns a dict summarizing what happened.
+    """
+    import shutil as _shutil
+    result: Dict[str, Any] = {
+        "migrated": False, "skipped": True, "reason": "",
+        "db_copied": False, "downloads_copied": False,
+    }
+
+    os.makedirs(PROJECTS_ROOT, exist_ok=True)
+    if os.path.isfile(PROJECTS_MIGRATION_MARKER):
+        result["reason"] = "Migration marker already present"
+        return result
+
+    legacy_db = global_config.get("database_path", "./acquisition.db")
+    legacy_downloads = global_config.get("output_directory", "./downloads")
+    default_db = _project_db_path(DEFAULT_PROJECT_SLUG)
+    default_downloads = _project_output_dir(DEFAULT_PROJECT_SLUG)
+
+    # If the default project directory already has content, refuse to touch it.
+    if os.path.isdir(_project_dir(DEFAULT_PROJECT_SLUG)) and (
+        os.path.isfile(default_db)
+        or (os.path.isdir(default_downloads) and os.listdir(default_downloads))
+    ):
+        # Mark migration as done (to avoid re-checking) but note the skip.
+        with open(PROJECTS_MIGRATION_MARKER, "w") as f:
+            f.write(f"skipped-existing-default at "
+                    f"{datetime.now(timezone.utc).isoformat()}\n")
+        result["reason"] = (
+            "Default project directory already has data — not touched"
+        )
+        logger.warning("Skipping legacy migration: %s", result["reason"])
+        return result
+
+    os.makedirs(_project_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+
+    # COPY (not move) the legacy DB
+    try:
+        if os.path.isfile(legacy_db):
+            _shutil.copy2(legacy_db, default_db)
+            # Also copy WAL/SHM sidecars if present
+            for sidecar in ("-wal", "-shm"):
+                src = legacy_db + sidecar
+                if os.path.isfile(src):
+                    _shutil.copy2(src, default_db + sidecar)
+            result["db_copied"] = True
+            logger.info("Migration copy: %s -> %s", legacy_db, default_db)
+    except OSError as exc:
+        logger.error("Failed to copy legacy DB: %s", exc)
+
+    # COPY the legacy downloads tree
+    try:
+        if os.path.isdir(legacy_downloads):
+            _shutil.copytree(legacy_downloads, default_downloads, dirs_exist_ok=True)
+            result["downloads_copied"] = True
+            logger.info(
+                "Migration copy: %s -> %s", legacy_downloads, default_downloads
+            )
+        else:
+            os.makedirs(default_downloads, exist_ok=True)
+    except OSError as exc:
+        logger.error("Failed to copy legacy downloads: %s", exc)
+
+    # Write marker so this never runs again
+    with open(PROJECTS_MIGRATION_MARKER, "w") as f:
+        f.write(
+            f"migrated at {datetime.now(timezone.utc).isoformat()}\n"
+            f"legacy_db={legacy_db}\n"
+            f"legacy_downloads={legacy_downloads}\n"
+            f"db_copied={result['db_copied']}\n"
+            f"downloads_copied={result['downloads_copied']}\n"
+            "Original files LEFT IN PLACE as backup. Delete manually "
+            "once you're confident Default project is working.\n"
+        )
+    result["migrated"] = True
+    result["skipped"] = False
+    result["reason"] = "Legacy data copied to Default project"
+    return result
+
+
 
 
 def load_config() -> Dict[str, Any]:
@@ -338,6 +628,158 @@ def _check_binary(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Project switching: activity check + rebind
+# ---------------------------------------------------------------------------
+
+def _check_busy_reasons() -> List[str]:
+    """Return a list of human reasons why project-switching is not safe.
+
+    Used by activate_project to refuse the switch rather than corrupt
+    data by swapping the DB + output dir out from under live workers.
+    """
+    reasons: List[str] = []
+    wp = app_state.get("worker_pool")
+    if wp is not None:
+        try:
+            if wp.is_running:
+                reasons.append("a retrieval run is active")
+        except Exception:
+            pass
+
+    mm = app_state.get("manual_mode") or {}
+    if mm.get("watcher_running") or mm.get("enabled"):
+        reasons.append("Manual Mode watcher is running")
+
+    sso = app_state.get("sso_session") or {}
+    if sso.get("active"):
+        reasons.append("an SSO session is active")
+
+    enr = app_state.get("enrichment_status") or {}
+    if enr.get("in_progress"):
+        reasons.append("enrichment is still in progress")
+    return reasons
+
+
+async def _rebind_to_project(slug: str) -> Dict[str, Any]:
+    """Tear down current DB + engine + worker pool, rebind to a project.
+
+    CRITICAL: callers MUST have verified _check_busy_reasons() is
+    empty first. This function does NOT protect against live tasks.
+
+    Returns the new project's manifest record.
+    """
+    manifest = _load_projects_manifest()
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+
+    # 1. Close current DB (flush write queue first)
+    current_db = app_state.get("db")
+    if current_db is not None:
+        try:
+            await current_db.flush_write_queue()
+            await current_db.close()
+        except Exception as exc:
+            logger.warning("Error closing current DB during rebind: %s", exc)
+
+    # 2. Close current engine's HTTP client
+    current_engine = app_state.get("engine")
+    if current_engine is not None:
+        try:
+            await current_engine.close()
+        except Exception as exc:
+            logger.debug("Error closing engine during rebind: %s", exc)
+
+    # 3. Compose effective config for the new project
+    global_config = load_config()  # reads ./config.json
+    effective_config = _merge_project_config(slug, global_config)
+
+    # 4. Open new DB + run schema migration + interrupted/filesystem reset
+    new_db_path = _project_db_path(slug)
+    os.makedirs(os.path.dirname(new_db_path), exist_ok=True)
+    new_db = Database(new_db_path)
+    await new_db.initialize()
+    effective_config = await new_db.run_config_migration(effective_config)
+    # Persist migrated overlay if keys changed
+    overlay = _load_project_config_overlay(slug)
+    _save_project_config_overlay(slug, overlay)  # no-op touch keeps file present
+    await new_db.reset_interrupted_states()
+    await new_db.reconcile_filesystem()
+
+    # 5. Create new engine bound to this project's paths
+    output_dir = effective_config.get("output_directory") or _project_output_dir(slug)
+    supp_dir = effective_config.get("supplement_directory") or _project_supplement_dir(slug)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(supp_dir, exist_ok=True)
+
+    wizard = app_state.get("wizard_result")
+    browser_mgr = app_state.get("browser_manager")
+    new_engine = RetrievalEngine(
+        db=new_db, browser_manager=browser_mgr,
+        config=effective_config,
+        output_directory=output_dir,
+        supplement_directory=supp_dir,
+    )
+    if wizard is not None:
+        new_engine.tesseract_available = wizard.tesseract_available
+        new_engine.ghostscript_available = wizard.ghostscript_available
+
+    # 6. Create new worker pool bound to new engine + DB
+    new_pool = WorkerPool(
+        db=new_db, engine=new_engine,
+        config=effective_config, output_dir=output_dir,
+    )
+
+    # 7. Atomic swap of app_state references
+    app_state["db"] = new_db
+    app_state["engine"] = new_engine
+    app_state["worker_pool"] = new_pool
+    app_state["config"] = effective_config
+    app_state["current_project"] = dict(project)
+
+    # 8. Reset per-project live state (enrichment progress, manual mode).
+    # These are project-local; a new project starts fresh.
+    app_state["enrichment_status"] = {
+        "in_progress": False, "run_id": None, "total": 0, "completed": 0,
+        "enriched_count": 0, "failed_count": 0,
+        "started_at": None, "completed_at": None,
+    }
+    app_state["enrichment_task"] = None
+    app_state["manual_mode"] = {
+        "enabled": bool(effective_config.get("manual_mode_enabled")),
+        "drop_folder": effective_config.get("manual_drop_folder", ""),
+        "watcher_running": False, "last_scan_at": None,
+        "last_file_seen": None, "last_file_seen_at": None,
+        "last_message": "",
+        "matched_and_validated": 0, "validation_failed": 0,
+        "unmatched_count": 0, "unmatched_files": [],
+        "pending_disambiguation": None, "permanently_unavailable": 0,
+    }
+    app_state["manual_task"] = None
+    app_state["manual_cancel_event"] = None
+    app_state["sso_session"] = {
+        "active": False, "phase": "idle", "proxy_url": "",
+        "login_url": "", "started_at": None, "login_detected_at": None,
+        "ended_at": None, "queue_total": 0, "queue_processed": 0,
+        "queue_succeeded": 0, "queue_manual": 0,
+        "current_paper_id": None, "current_paper_title": None,
+        "last_message": "", "session_expired": False,
+    }
+    app_state["sso_task"] = None
+    app_state["sso_cancel_event"] = None
+
+    # 9. Persist the switch in the manifest
+    manifest["current_project_slug"] = slug
+    _save_projects_manifest(manifest)
+
+    logger.info(
+        "Project rebound: %s (slug=%s, db=%s)",
+        project["project_name"], slug, new_db_path,
+    )
+    return project
+
+
+# ---------------------------------------------------------------------------
 # FastAPI lifespan (startup + shutdown)
 # ---------------------------------------------------------------------------
 
@@ -373,18 +815,44 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     logger.info("Full-Text Acquisition System starting...")
     logger.info("=" * 60)
 
-    # Load config
+    # Load global config (defaults; projects can override)
     config = load_config()
 
-    # Initialize database (steps 1, 6: WAL, FK, schema, write queue)
-    db_path = config.get("database_path", "./acquisition.db")
+    # --- Projects setup (runs BEFORE DB init so we know which DB to open) ---
+    os.makedirs(PROJECTS_ROOT, exist_ok=True)
+    # Idempotent migration of legacy ./acquisition.db + ./downloads/ into
+    # ./projects/default/. Copy-not-move; leaves originals in place.
+    migration_result = _migrate_legacy_to_default(config)
+    if migration_result.get("migrated"):
+        logger.info("Legacy data migrated to Default project: %s",
+                    migration_result.get("reason"))
+    manifest = _load_projects_manifest()
+    _ensure_default_project(manifest, config)
+    # Re-read manifest (ensure_default persisted it)
+    manifest = _load_projects_manifest()
+    current_slug = manifest.get("current_project_slug") or DEFAULT_PROJECT_SLUG
+    if _find_project(manifest, current_slug) is None:
+        # Manifest references a project that no longer exists — fall back
+        current_slug = DEFAULT_PROJECT_SLUG
+        manifest["current_project_slug"] = current_slug
+        _save_projects_manifest(manifest)
+    current_project = _find_project(manifest, current_slug)
+    app_state["current_project"] = dict(current_project) if current_project else None
+    app_state["migration_notice"] = migration_result
+
+    # Compose effective config for the current project (global ← overlay)
+    config = _merge_project_config(current_slug, config)
+
+    # Initialize database for the current project
+    db_path = config["database_path"]  # set by _merge_project_config
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     db = Database(db_path)
     await db.initialize()
 
-    # Step 2: Config migration
+    # Step 2: Config migration (schema additive)
     try:
         config = await db.run_config_migration(config)
-        save_config(config)
+        save_config(config)  # persist global
     except ValueError as exc:
         logger.critical("Config version error: %s — exiting", exc)
         await db.close()
@@ -407,9 +875,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Initialize browser manager
     browser_mgr = BrowserManager.get_instance()
 
-    # Step 7: Initialize RetrievalEngine
-    output_dir = config.get("output_directory", "./downloads")
-    supplement_dir = config.get("supplement_directory", "./downloads/Supplements")
+    # Step 7: Initialize RetrievalEngine for current project
+    output_dir = config.get("output_directory") or _project_output_dir(current_slug)
+    supplement_dir = config.get("supplement_directory") or _project_supplement_dir(current_slug)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(supplement_dir, exist_ok=True)
 
@@ -3700,7 +4168,11 @@ async def export_bundle(
     )
     os.makedirs(export_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    bundle_filename = f"submission_bundle_{run_id}_{timestamp}.zip"
+    # Include project slug so bundles from different projects are
+    # immediately distinguishable when collected in a drop folder.
+    current_proj = app_state.get("current_project") or {}
+    proj_slug = current_proj.get("project_slug") or "project"
+    bundle_filename = f"{proj_slug}_submission_bundle_{run_id}_{timestamp}.zip"
     bundle_path = os.path.join(export_dir, bundle_filename)
 
     # Gather data
@@ -4409,6 +4881,14 @@ async def _build_stream_snapshot() -> Dict[str, Any]:
         "session_expired": bool(sso.get("session_expired")),
     }
 
+    # Current project (per-project isolation)
+    cp = app_state.get("current_project") or {}
+    payload["current_project"] = {
+        "project_id": cp.get("project_id"),
+        "project_name": cp.get("project_name"),
+        "project_slug": cp.get("project_slug"),
+    }
+
     # Manual Orchestration Mode — drop-folder watcher progress
     mm = app_state.get("manual_mode") or {}
     payload["manual_mode"] = {
@@ -4504,6 +4984,188 @@ async def health_snapshot() -> JSONResponse:
         ),
     )
     return JSONResponse(metrics.model_dump())
+
+
+# ===========================================================================
+# PROJECTS ENDPOINTS — per-project isolation
+# ===========================================================================
+
+
+@app.get("/api/projects")
+async def list_projects() -> JSONResponse:
+    """List every project + which one is current."""
+    manifest = _load_projects_manifest()
+    current = manifest.get("current_project_slug")
+    items: List[Dict[str, Any]] = []
+    for p in manifest.get("projects", []):
+        items.append({
+            **p,
+            "is_current": p.get("project_slug") == current,
+            "db_path": _project_db_path(p["project_slug"]),
+            "output_dir": _project_output_dir(p["project_slug"]),
+        })
+    # Sort: current first, then by created_at
+    items.sort(key=lambda x: (not x["is_current"], x.get("created_at", "")))
+    return JSONResponse({
+        "projects": items,
+        "current_slug": current,
+        "migration_notice": app_state.get("migration_notice") or {},
+    })
+
+
+@app.post("/api/projects")
+async def create_project(body: "ProjectCreate") -> JSONResponse:
+    """Create a new project: fresh slug, directory tree, empty DB with schema."""
+    from full_text_acquisition.models import ProjectCreate as _PC
+    # Validate via Pydantic (body already enforced by FastAPI, but be defensive)
+    name = (body.project_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="project_name is required")
+
+    manifest = _load_projects_manifest()
+    existing_slugs = {p.get("project_slug") for p in manifest.get("projects", [])}
+    slug = _slugify_project_name(name, existing_slugs)
+
+    # Create directory tree
+    os.makedirs(_project_dir(slug), exist_ok=True)
+    os.makedirs(_project_output_dir(slug), exist_ok=True)
+    os.makedirs(_project_supplement_dir(slug), exist_ok=True)
+    _save_project_config_overlay(slug, {})  # empty overlay — inherits all
+
+    # Initialize empty SQLite DB with full schema
+    try:
+        new_db = Database(_project_db_path(slug))
+        await new_db.initialize()
+        await new_db.close()
+    except Exception as exc:
+        # Roll back directory creation on DB init failure
+        import shutil as _shutil
+        try: _shutil.rmtree(_project_dir(slug))
+        except OSError: pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initialize project DB: {exc}",
+        )
+
+    project = {
+        "project_id": str(uuid.uuid4()),
+        "project_name": name,
+        "project_slug": slug,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    manifest.setdefault("projects", []).append(project)
+    _save_projects_manifest(manifest)
+
+    return JSONResponse({
+        **project,
+        "is_current": False,
+        "db_path": _project_db_path(slug),
+        "output_dir": _project_output_dir(slug),
+    })
+
+
+@app.post("/api/projects/activate")
+async def activate_project(slug: str = Query(...)) -> JSONResponse:
+    """Switch to a different project.
+
+    Refuses with 409 if any background task is active (retrieval run,
+    enrichment, SSO session, or Manual Mode watcher) — user must stop
+    those first to avoid data corruption.
+    """
+    manifest = _load_projects_manifest()
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+
+    if slug == manifest.get("current_project_slug"):
+        return JSONResponse({
+            "status": "already_current",
+            "current": dict(project),
+        })
+
+    busy = _check_busy_reasons()
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Cannot switch projects while any of these are running",
+                "active": busy,
+                "guidance": "Stop each task from its own panel, then try again.",
+            },
+        )
+
+    new_project = await _rebind_to_project(slug)
+    return JSONResponse({
+        "status": "switched",
+        "current": new_project,
+    })
+
+
+@app.put("/api/projects/{slug}")
+async def rename_project(
+    slug: str,
+    body: "ProjectCreate",
+) -> JSONResponse:
+    """Rename a project's DISPLAY NAME. Slug never changes (immutable path)."""
+    name = (body.project_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="project_name is required")
+
+    manifest = _load_projects_manifest()
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project["project_name"] = name
+    _save_projects_manifest(manifest)
+
+    if slug == manifest.get("current_project_slug"):
+        app_state["current_project"] = dict(project)
+
+    return JSONResponse({
+        **project,
+        "is_current": slug == manifest.get("current_project_slug"),
+    })
+
+
+@app.delete("/api/projects/{slug}")
+async def delete_project(slug: str) -> JSONResponse:
+    """Delete a project (directory + DB). Refuses on current project.
+
+    DESTRUCTIVE: this wipes the project's entire data. Frontend must
+    confirm before calling this.
+    """
+    manifest = _load_projects_manifest()
+    current = manifest.get("current_project_slug")
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if slug == current:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete the current project — switch to another first.",
+        )
+    if slug == DEFAULT_PROJECT_SLUG:
+        raise HTTPException(
+            status_code=409,
+            detail="The Default project cannot be deleted.",
+        )
+
+    pdir = _project_dir(slug)
+    import shutil as _shutil
+    if os.path.isdir(pdir):
+        try:
+            _shutil.rmtree(pdir)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"rmtree failed: {exc}")
+
+    manifest["projects"] = [
+        p for p in manifest.get("projects", [])
+        if p.get("project_slug") != slug
+    ]
+    _save_projects_manifest(manifest)
+
+    return JSONResponse({"status": "deleted", "slug": slug})
 
 
 # ===========================================================================

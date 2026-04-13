@@ -662,6 +662,25 @@ class ApiCacheEntry:
 
 
 @dataclass
+class ProjectRecord:
+    """Per-project isolation record (filesystem-backed, not in SQLite).
+
+    Each project has its own SQLite database, output directory, and
+    config overlay. project_slug is the filesystem-safe identifier;
+    project_name is the user-facing display name (may contain spaces,
+    unicode, punctuation). project_id is a stable UUID.
+    """
+
+    project_id: str
+    project_name: str
+    project_slug: str
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class SupplementFile:
     """Metadata for a downloaded supplement file."""
 
@@ -821,6 +840,28 @@ class UploadResponse(BaseModel):
         description="Resolved absolute output directory used for THIS run "
                     "(reflects per-batch override if one was supplied)",
     )
+
+
+class ProjectCreate(BaseModel):
+    """Request body for creating or renaming a project.
+
+    project_name is user-supplied display text; the filesystem slug
+    is derived server-side by sanitization + UUID suffix.
+    """
+
+    project_name: str = Field(..., min_length=1, max_length=200)
+
+
+class ProjectResponse(BaseModel):
+    """Project metadata returned to the UI."""
+
+    project_id: str
+    project_name: str
+    project_slug: str
+    created_at: str
+    is_current: bool = False
+    db_path: str = ""
+    output_dir: str = ""
 
 
 class RetryRequest(BaseModel):
