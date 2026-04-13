@@ -473,6 +473,27 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     app_state["sso_task"] = None
     app_state["sso_cancel_event"] = None
 
+    # Manual Orchestration Mode — system watches a drop folder for
+    # user-downloaded PDFs and matches them to the MANUAL_REQUIRED queue.
+    # Never opens a browser, never touches credentials.
+    app_state["manual_mode"] = {
+        "enabled": False,
+        "drop_folder": "",
+        "watcher_running": False,
+        "last_scan_at": None,
+        "last_file_seen": None,
+        "last_file_seen_at": None,
+        "last_message": "",
+        "matched_and_validated": 0,
+        "validation_failed": 0,
+        "unmatched_count": 0,
+        "unmatched_files": [],
+        "pending_disambiguation": None,
+        "permanently_unavailable": 0,
+    }
+    app_state["manual_task"] = None
+    app_state["manual_cancel_event"] = None
+
     logger.info(
         "Startup complete: %d interrupted resets, %d missing files reconciled",
         len(resets), len(missing),
@@ -492,6 +513,19 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Step 1-2: Signal shutdown
     shutdown_event: asyncio.Event = app_state.get("shutdown_event", asyncio.Event())
     shutdown_event.set()
+
+    # Stop the Manual Mode watcher if running
+    mm_cancel: Optional[asyncio.Event] = app_state.get("manual_cancel_event")
+    mm_task: Optional[asyncio.Task] = app_state.get("manual_task")
+    if mm_cancel:
+        mm_cancel.set()
+    if mm_task and not mm_task.done():
+        try:
+            await asyncio.wait_for(mm_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            mm_task.cancel()
+            try: await mm_task
+            except (asyncio.CancelledError, Exception): pass
 
     # Step 3-4: Drain workers
     wp: Optional[WorkerPool] = app_state.get("worker_pool")
@@ -2493,6 +2527,770 @@ async def _sso_queue_processor(cancel_event: asyncio.Event) -> None:
 
 
 # ===========================================================================
+# MANUAL ORCHESTRATION MODE — watch-folder, match, validate, install
+# ===========================================================================
+#
+# Philosophy: in Manual Mode, the system NEVER opens a browser or
+# touches credentials. The user downloads PDFs themselves through
+# their own browser and drops them into a configured folder. The
+# system watches that folder, matches dropped files to papers in
+# the MANUAL_REQUIRED queue, runs the same validation pipeline as
+# automatic retrieval, and marks matches as COMPLETE.
+
+MANUAL_WATCHER_POLL_INTERVAL_S = 5.0
+MANUAL_FILE_STABLE_POLLS = 2        # file size unchanged across 2 polls = ~10s
+MANUAL_FUZZY_THRESHOLD = 85.0       # 0-100 scale (rapidfuzz token_set_ratio)
+MANUAL_FUZZY_GAP_REQUIRED = 15.0    # best vs second-best gap for auto-match
+
+
+def _publisher_suggested_action(paper: Paper) -> str:
+    """Human hint for where the user should get this paper."""
+    pub = (paper.publisher or "").upper()
+    last = paper.last_failure_code or ""
+    hints = {
+        "ELSEVIER":        "Available via ScienceDirect — use the EZproxy link.",
+        "SPRINGER":        "Available via SpringerLink — use the EZproxy link.",
+        "WILEY":           "Available via Wiley Online Library — use the EZproxy link.",
+        "NATURE":          "Available via Nature.com — use the EZproxy link.",
+        "BMJ":             "Available via BMJ Journals — use the EZproxy link.",
+        "LANCET":          "Available via TheLancet.com — use the EZproxy link.",
+        "TAYLOR_FRANCIS":  "Available via Taylor & Francis Online — use the EZproxy link.",
+        "SAGE":            "Available via SAGE Journals — use the EZproxy link.",
+    }
+    base = hints.get(pub, "Use the DOI link or EZproxy-wrapped link above.")
+    if last == FailureCode.PAYWALL_DETECTED.value:
+        return base + " (Paywall detected earlier — institutional access required.)"
+    if last == FailureCode.NO_OA_SOURCE.value:
+        return base + " (No open-access copy available.)"
+    return base
+
+
+async def _read_pdf_text_first_pages(pdf_path: str, max_pages: int = 3) -> str:
+    """Best-effort first-N-pages text extraction for matching.
+
+    Returns empty string on failure. Used only for matching —
+    never logged or persisted.
+    """
+    try:
+        try:
+            import fitz
+            doc = fitz.open(pdf_path)
+            text = ""
+            for i in range(min(max_pages, len(doc))):
+                text += doc[i].get_text() + "\n"
+            doc.close()
+            return text
+        except ImportError:
+            from pypdf import PdfReader
+            reader = PdfReader(pdf_path)
+            text = ""
+            for i in range(min(max_pages, len(reader.pages))):
+                text += (reader.pages[i].extract_text() or "") + "\n"
+            return text
+    except Exception as exc:
+        logger.debug("Text extraction failed for %s: %s", pdf_path, exc)
+        return ""
+
+
+async def _match_dropped_file(pdf_path: str) -> Dict[str, Any]:
+    """Match a dropped PDF to a paper in the MANUAL_REQUIRED queue.
+
+    Strategy:
+        1. DOI in text → exact match
+        2. Fuzzy title via rapidfuzz.token_set_ratio, BUT only
+           auto-match when the top score >= 85 AND the gap to the
+           second-best score is >= 15 points (Concern 1 guard).
+        3. Narrow-gap or weak scores → return candidates for user
+           disambiguation.
+
+    Returns:
+        {
+            "matched": Paper | None,
+            "confidence": float (0-100),
+            "match_type": "doi" | "fuzzy" | "ambiguous" | "none",
+            "candidates": [{"canonical_id", "title", "first_author",
+                           "year", "score"}],
+            "reason": str  # human explanation
+        }
+    """
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+    if not papers:
+        return {"matched": None, "confidence": 0.0, "match_type": "none",
+                "candidates": [], "reason": "No papers in MANUAL_REQUIRED queue"}
+
+    text = await _read_pdf_text_first_pages(pdf_path, max_pages=3)
+    if not text:
+        return {"matched": None, "confidence": 0.0, "match_type": "none",
+                "candidates": [], "reason": "Could not extract text from PDF"}
+    text_lower = text.lower()
+
+    # 1. DOI match
+    for p in papers:
+        if p.doi and p.doi.lower() in text_lower:
+            return {"matched": p, "confidence": 100.0, "match_type": "doi",
+                    "candidates": [], "reason": "DOI matched in PDF text"}
+
+    # 2. Fuzzy title match
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return {"matched": None, "confidence": 0.0, "match_type": "none",
+                "candidates": [], "reason": "rapidfuzz not available"}
+
+    scores: List[tuple] = []
+    for p in papers:
+        title_norm = normalize_title(p.title or "")
+        if len(title_norm) < 10:
+            continue
+        s = float(fuzz.token_set_ratio(title_norm, text_lower))
+        scores.append((p, s))
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    if not scores or scores[0][1] < MANUAL_FUZZY_THRESHOLD:
+        return {"matched": None, "confidence": scores[0][1] if scores else 0.0,
+                "match_type": "none", "candidates": [],
+                "reason": f"No fuzzy match ≥ {MANUAL_FUZZY_THRESHOLD}"}
+
+    top_paper, top_score = scores[0]
+    second_score = scores[1][1] if len(scores) > 1 else 0.0
+    gap = top_score - second_score
+
+    if gap < MANUAL_FUZZY_GAP_REQUIRED:
+        # Ambiguous — surface candidates for user to pick
+        candidates = []
+        for p, s in scores[:5]:
+            if s < MANUAL_FUZZY_THRESHOLD:
+                break
+            candidates.append({
+                "canonical_id": p.canonical_id,
+                "title": p.title,
+                "first_author": p.first_author_lastname,
+                "year": p.year,
+                "doi": p.doi,
+                "score": round(s, 1),
+            })
+        return {"matched": None, "confidence": top_score,
+                "match_type": "ambiguous", "candidates": candidates,
+                "reason": (f"Top candidate scored {top_score:.1f}, "
+                           f"second {second_score:.1f} "
+                           f"(gap {gap:.1f} < {MANUAL_FUZZY_GAP_REQUIRED}) — "
+                           "please pick manually")}
+
+    # Clear winner
+    return {"matched": top_paper, "confidence": top_score,
+            "match_type": "fuzzy", "candidates": [],
+            "reason": f"Fuzzy title match: {top_score:.1f} (gap {gap:.1f})"}
+
+
+async def _install_and_validate_dropped(
+    paper: Paper,
+    dropped_path: str,
+    match_type: str,
+) -> Dict[str, Any]:
+    """Install a matched dropped file as the paper's PDF and validate.
+
+    Steps:
+        1. Atomic copy into output_directory with canonical filename
+        2. Update paper.pdf_path / sha256 / size
+        3. Walk the state machine MANUAL_REQUIRED → READY → RETRIEVING
+           → RETRIEVED → VALIDATING via the normal claim methods
+        4. Run engine.run_validation_pipeline (same 7 checks as
+           automatic retrieval — including FIX 3's page-location-
+           aware fuzzy check)
+        5. On VALID + un-flagged identity: transition VALIDATED →
+           COMPLETE, delete the dropped file
+        6. On INVALID or flagged identity: leave at VALIDATED (user
+           can override in Results) or FAILED; do NOT delete dropped
+           file so user can inspect
+
+    Returns a result dict for the watcher's status update.
+    """
+    import hashlib as _hashlib
+    import shutil as _shutil
+
+    db = _get_db()
+    engine = _get_engine()
+    config = _get_config()
+
+    # 1. Atomic copy
+    output_dir = os.path.abspath(
+        getattr(engine, "_output_dir", None) or
+        config.get("output_directory", "./downloads")
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    from full_text_acquisition.models import generate_filename as _gen_fn
+    filename = _gen_fn(paper.first_author_lastname, paper.year, paper.title or "manual")
+    final_path = os.path.join(output_dir, filename)
+
+    # Handle collisions — append _v{N}
+    if os.path.isfile(final_path):
+        base, ext = os.path.splitext(final_path)
+        v = 2
+        while os.path.isfile(f"{base}_v{v}{ext}"):
+            v += 1
+        final_path = f"{base}_v{v}{ext}"
+        filename = os.path.basename(final_path)
+
+    tmp_path = final_path + ".tmp"
+    try:
+        _shutil.copy2(dropped_path, tmp_path)
+        os.replace(tmp_path, final_path)
+    except OSError as exc:
+        if os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except OSError: pass
+        return {"outcome": "install_failed", "error": str(exc),
+                "paper": paper.canonical_id, "filename": None}
+
+    # Compute hash + size
+    with open(final_path, "rb") as fh:
+        content = fh.read()
+    sha = _hashlib.sha256(content).hexdigest()
+
+    await db.update_paper_fields(
+        paper.canonical_id,
+        pdf_path=final_path,
+        pdf_filename=filename,
+        sha256_checksum=sha,
+        pdf_size_bytes=len(content),
+        retrieval_tier="MANUAL",
+        retrieval_method=f"user_dropped_file_{match_type}",
+        retrieval_url=f"file://{os.path.abspath(dropped_path)}",
+    )
+
+    # 2. Walk state machine
+    run_id = f"manual-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    worker_id = "manual-watcher"
+
+    # MANUAL_REQUIRED → READY_FOR_RETRIEVAL
+    await db.reset_paper_for_retry(paper.canonical_id)
+    # READY → RETRIEVING
+    claimed = await db.claim_retrieval_task(paper.canonical_id, worker_id)
+    if not claimed:
+        return {"outcome": "claim_failed", "paper": paper.canonical_id,
+                "filename": filename}
+    # RETRIEVING → RETRIEVED
+    await db.transition_state(paper.canonical_id, PaperState.RETRIEVED.value,
+                              run_id=run_id)
+    # RETRIEVED → VALIDATING
+    await db.claim_validation_task(paper.canonical_id, worker_id)
+
+    # 3. Run validation pipeline
+    refreshed = await db.get_paper(paper.canonical_id)
+    if refreshed is None:
+        return {"outcome": "paper_vanished", "paper": paper.canonical_id,
+                "filename": filename}
+    try:
+        vstatus, istatus, score = await engine.run_validation_pipeline(
+            refreshed, run_id
+        )
+    except Exception as exc:
+        logger.error("Manual validation error: %s", exc)
+        vstatus, istatus, score = "INVALID", "CONTENT_UNVERIFIED", 0
+
+    # 4. Transition to terminal state
+    flagged = istatus in ("VERSION_MISMATCH", "CONTENT_UNVERIFIED",
+                          "TITLE_VERIFIED_WEAK")
+    if vstatus == "INVALID":
+        # VALIDATING → FAILED (terminal for this check, user can retry)
+        await db.transition_state(
+            paper.canonical_id, PaperState.FAILED.value,
+            failure_code=FailureCode.MANUAL_VALIDATION_FAILED.value,
+            run_id=run_id,
+        )
+        return {"outcome": "validation_failed",
+                "paper": paper.canonical_id, "filename": filename,
+                "validation_status": vstatus, "identity_status": istatus}
+
+    # VALIDATING → VALIDATED
+    await db.transition_state(paper.canonical_id, PaperState.VALIDATED.value,
+                              run_id=run_id)
+
+    if flagged:
+        # Leave at VALIDATED — user will resolve via Confirm/Re-retrieve
+        return {"outcome": "flagged",
+                "paper": paper.canonical_id, "filename": filename,
+                "validation_status": vstatus, "identity_status": istatus,
+                "score": score}
+
+    # COMPLETE
+    await db.transition_state(paper.canonical_id, PaperState.COMPLETE.value,
+                              run_id=run_id)
+
+    # Delete the dropped source file — we have it now under the canonical name
+    try:
+        if os.path.abspath(dropped_path) != os.path.abspath(final_path):
+            os.unlink(dropped_path)
+    except OSError as exc:
+        logger.debug("Could not remove dropped file %s: %s", dropped_path, exc)
+
+    return {"outcome": "complete",
+            "paper": paper.canonical_id, "filename": filename,
+            "validation_status": vstatus, "identity_status": istatus,
+            "score": score}
+
+
+async def _manual_mode_watcher(cancel_event: asyncio.Event) -> None:
+    """Background task: poll drop folder every 5s with stable-size
+    check, match to queue, install, validate.
+
+    File is only processed when its size has been unchanged across
+    MANUAL_FILE_STABLE_POLLS consecutive polls (~10s). This avoids
+    race conditions where the OS is still writing a large PDF.
+    """
+    status = app_state["manual_mode"]
+    observed: Dict[str, Dict[str, Any]] = {}  # path -> {size, mtime, stable_count}
+    processed_recently: Set[str] = set()      # paths we've already attempted
+    status["watcher_running"] = True
+
+    try:
+        while not cancel_event.is_set():
+            folder = (_get_config().get("manual_drop_folder") or "").strip()
+            status["drop_folder"] = folder
+            status["last_scan_at"] = datetime.now(timezone.utc).isoformat()
+
+            if folder and os.path.isdir(folder):
+                try:
+                    entries = os.listdir(folder)
+                except OSError:
+                    entries = []
+
+                current_paths = set()
+                for name in entries:
+                    if name.startswith(".") or not name.lower().endswith(".pdf"):
+                        continue
+                    full = os.path.join(folder, name)
+                    if not os.path.isfile(full):
+                        continue
+                    current_paths.add(full)
+
+                    if full in processed_recently:
+                        continue
+
+                    try:
+                        st = os.stat(full)
+                        key = (st.st_size, int(st.st_mtime))
+                    except OSError:
+                        continue
+
+                    prev = observed.get(full)
+                    if prev and prev["key"] == key:
+                        prev["stable_count"] += 1
+                        if prev["stable_count"] >= MANUAL_FILE_STABLE_POLLS:
+                            # File is stable — process it
+                            try:
+                                await _process_dropped_file(full)
+                            except Exception as exc:
+                                logger.error(
+                                    "Watcher error on %s: %s\n%s",
+                                    full, exc, traceback.format_exc(),
+                                )
+                            processed_recently.add(full)
+                    else:
+                        observed[full] = {"key": key, "stable_count": 0}
+
+                # Forget files that disappeared from the folder
+                stale = set(observed.keys()) - current_paths
+                for path in stale:
+                    observed.pop(path, None)
+                    processed_recently.discard(path)
+
+            try:
+                await asyncio.wait_for(
+                    cancel_event.wait(),
+                    timeout=MANUAL_WATCHER_POLL_INTERVAL_S,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        status["watcher_running"] = False
+        logger.info("Manual mode watcher stopped")
+
+
+async def _process_dropped_file(pdf_path: str) -> None:
+    """Match + (install+validate) a single dropped PDF."""
+    status = app_state["manual_mode"]
+    status["last_file_seen"] = os.path.basename(pdf_path)
+    status["last_file_seen_at"] = datetime.now(timezone.utc).isoformat()
+    db = _get_db()
+
+    match = await _match_dropped_file(pdf_path)
+
+    if match["match_type"] == "ambiguous":
+        status["pending_disambiguation"] = {
+            "file_path": pdf_path,
+            "file_name": os.path.basename(pdf_path),
+            "candidates": match["candidates"],
+        }
+        status["last_message"] = (
+            f"⚠ Ambiguous: {os.path.basename(pdf_path)} matches "
+            f"{len(match['candidates'])} candidates — pick one in the UI"
+        )
+        try:
+            await db.log_audit(AuditLogEntry(
+                outcome="MANUAL_DROP_AMBIGUOUS",
+                details=json.dumps({
+                    "file": os.path.basename(pdf_path),
+                    "candidates": match["candidates"],
+                }),
+            ))
+        except Exception: pass
+        return
+
+    if match["matched"] is None:
+        status["unmatched_count"] += 1
+        entry = {
+            "file_name": os.path.basename(pdf_path),
+            "file_path": pdf_path,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "reason": match.get("reason", "No match"),
+        }
+        status["unmatched_files"].append(entry)
+        # Keep list bounded
+        if len(status["unmatched_files"]) > 200:
+            status["unmatched_files"] = status["unmatched_files"][-200:]
+        status["last_message"] = (
+            f"⚠ No match: {os.path.basename(pdf_path)} — "
+            "please rename to include the DOI"
+        )
+        try:
+            await db.log_audit(AuditLogEntry(
+                outcome="MANUAL_DROP_UNMATCHED",
+                details=json.dumps(entry),
+            ))
+        except Exception: pass
+        return
+
+    # Matched — install + validate
+    paper = match["matched"]
+    result = await _install_and_validate_dropped(
+        paper, pdf_path, match["match_type"]
+    )
+    outcome = result.get("outcome")
+
+    try:
+        await db.log_audit(AuditLogEntry(
+            canonical_id=paper.canonical_id,
+            outcome=f"MANUAL_DROP_{outcome.upper()}",
+            details=json.dumps({
+                "file": os.path.basename(pdf_path),
+                "match_type": match["match_type"],
+                "confidence": match["confidence"],
+                **{k: v for k, v in result.items() if k not in ("paper",)},
+            }),
+        ))
+    except Exception: pass
+
+    if outcome == "complete":
+        status["matched_and_validated"] += 1
+        status["last_message"] = (
+            f"✓ {result.get('filename') or os.path.basename(pdf_path)} "
+            f"→ {paper.title[:50]} (VALID)"
+        )
+    elif outcome == "flagged":
+        status["matched_and_validated"] += 1
+        status["last_message"] = (
+            f"⚠ {os.path.basename(pdf_path)} → {paper.title[:50]} "
+            f"(flagged {result.get('identity_status')} — review in Results)"
+        )
+    else:
+        status["validation_failed"] += 1
+        reason = result.get("validation_status") or outcome
+        status["last_message"] = (
+            f"✗ {os.path.basename(pdf_path)} → {paper.title[:50]} "
+            f"failed: {reason}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/manual/start")
+async def manual_mode_start() -> JSONResponse:
+    """Start the drop-folder watcher.
+
+    Requires a configured manual_drop_folder. Idempotent — calling
+    twice is a no-op.
+    """
+    config = _get_config()
+    folder = (config.get("manual_drop_folder") or "").strip()
+    if not folder:
+        raise HTTPException(
+            status_code=400,
+            detail="manual_drop_folder is not set. Configure it in Settings.",
+        )
+
+    validation = _validate_output_path(folder)
+    if not validation["ok"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Drop folder invalid: {validation.get('error') or 'unknown'}",
+        )
+
+    status = app_state["manual_mode"]
+    if status.get("watcher_running"):
+        return JSONResponse({"status": "already_running",
+                             "drop_folder": status["drop_folder"]})
+
+    # Reset counters for a fresh session
+    status.update({
+        "enabled": True,
+        "drop_folder": validation["abs_path"],
+        "last_message": "Watcher started",
+        "matched_and_validated": 0,
+        "validation_failed": 0,
+        "unmatched_count": 0,
+        "unmatched_files": [],
+        "pending_disambiguation": None,
+    })
+
+    cancel = asyncio.Event()
+    task = asyncio.create_task(
+        _manual_mode_watcher(cancel),
+        name="manual-mode-watcher",
+    )
+    app_state["manual_cancel_event"] = cancel
+    app_state["manual_task"] = task
+
+    # Persist enabled state
+    config["manual_mode_enabled"] = True
+    save_config(config)
+
+    await _get_db().log_audit(AuditLogEntry(
+        outcome="MANUAL_MODE_STARTED",
+        details=json.dumps({"drop_folder": validation["abs_path"]}),
+    ))
+
+    return JSONResponse({"status": "started",
+                         "drop_folder": validation["abs_path"]})
+
+
+@app.post("/api/manual/stop")
+async def manual_mode_stop() -> JSONResponse:
+    """Stop the drop-folder watcher."""
+    status = app_state["manual_mode"]
+    cancel: Optional[asyncio.Event] = app_state.get("manual_cancel_event")
+    task: Optional[asyncio.Task] = app_state.get("manual_task")
+
+    if cancel:
+        cancel.set()
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try: await task
+            except (asyncio.CancelledError, Exception): pass
+
+    status["enabled"] = False
+    status["watcher_running"] = False
+    status["last_message"] = "Watcher stopped"
+    app_state["manual_task"] = None
+    app_state["manual_cancel_event"] = None
+
+    config = _get_config()
+    config["manual_mode_enabled"] = False
+    save_config(config)
+
+    await _get_db().log_audit(AuditLogEntry(
+        outcome="MANUAL_MODE_STOPPED",
+        details=json.dumps({
+            "matched": status.get("matched_and_validated", 0),
+            "failed": status.get("validation_failed", 0),
+            "unmatched": status.get("unmatched_count", 0),
+        }),
+    ))
+
+    return JSONResponse({"status": "stopped"})
+
+
+@app.get("/api/manual/status")
+async def manual_mode_status() -> JSONResponse:
+    """Full snapshot of Manual Mode state (heavier than the SSE slice)."""
+    status = dict(app_state.get("manual_mode") or {})
+    return JSONResponse(status)
+
+
+@app.get("/api/manual/queue")
+async def manual_mode_queue() -> JSONResponse:
+    """Enriched queue listing with publisher-aware suggested action."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+    prefix = _ezproxy_prefix()
+    items: List[Dict[str, Any]] = []
+    permanently = 0
+    for p in papers:
+        doi_url = f"https://doi.org/{p.doi}" if p.doi else None
+        ezproxy_url = f"{prefix}{doi_url}" if doi_url else None
+        is_unavail = p.user_override == "PERMANENTLY_UNAVAILABLE"
+        if is_unavail:
+            permanently += 1
+        items.append({
+            "canonical_id": p.canonical_id,
+            "title": p.title,
+            "first_author": p.first_author_lastname,
+            "year": p.year,
+            "journal": p.journal,
+            "doi": p.doi,
+            "doi_url": doi_url,
+            "ezproxy_url": ezproxy_url,
+            "publisher": p.publisher,
+            "last_failure_code": p.last_failure_code,
+            "suggested_action": _publisher_suggested_action(p),
+            "user_override": p.user_override,
+            "permanently_unavailable": is_unavail,
+        })
+    # Update gauge
+    app_state["manual_mode"]["permanently_unavailable"] = permanently
+    return JSONResponse({
+        "total": len(items),
+        "permanently_unavailable": permanently,
+        "proxy_prefix": prefix,
+        "papers": items,
+    })
+
+
+@app.get("/api/manual/queue.csv")
+async def manual_mode_queue_csv() -> FileResponse:
+    """CSV of the manual queue with EZproxy URLs for offline work."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+    prefix = _ezproxy_prefix()
+
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"manual_queue_{ts}.csv"
+    fpath = os.path.join(export_dir, fname)
+
+    with open(fpath, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow([
+            "canonical_id", "title", "first_author", "year", "journal",
+            "publisher", "doi", "doi_url", "ezproxy_url",
+            "last_failure_code", "suggested_action", "user_override",
+        ])
+        for p in papers:
+            doi_url = f"https://doi.org/{p.doi}" if p.doi else ""
+            w.writerow([
+                p.canonical_id, p.title, p.first_author_lastname,
+                p.year or "", p.journal or "", p.publisher,
+                p.doi or "", doi_url,
+                f"{prefix}{doi_url}" if doi_url else "",
+                p.last_failure_code or "",
+                _publisher_suggested_action(p),
+                p.user_override or "",
+            ])
+
+    return FileResponse(fpath, media_type="text/csv", filename=fname)
+
+
+@app.post("/api/manual/paper/{canonical_id}/mark-unobtainable")
+async def manual_mark_unobtainable(
+    canonical_id: str,
+    note: str = Query(default=""),
+) -> JSONResponse:
+    """Tag a paper as PERMANENTLY_UNAVAILABLE.
+
+    Keeps the paper in MANUAL_REQUIRED (so reviewers can still see
+    it in the queue and in PRISMA reports) but marks it so it's
+    visually distinguished and excluded from retry loops.
+    """
+    db = _get_db()
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.update_paper_fields(
+        canonical_id,
+        user_override="PERMANENTLY_UNAVAILABLE",
+        override_reason=note or "Marked as permanently unavailable",
+        override_timestamp=now_iso,
+        last_failure_code=FailureCode.PERMANENTLY_UNAVAILABLE.value,
+    )
+    await db.log_audit(AuditLogEntry(
+        canonical_id=canonical_id,
+        outcome="PERMANENTLY_UNAVAILABLE",
+        failure_code=FailureCode.PERMANENTLY_UNAVAILABLE.value,
+        details=json.dumps({"note": note or ""}),
+    ))
+    return JSONResponse({"status": "marked", "canonical_id": canonical_id})
+
+
+@app.post("/api/manual/assign")
+async def manual_mode_assign(
+    file_path: str = Query(...),
+    canonical_id: str = Query(...),
+) -> JSONResponse:
+    """User resolves an ambiguous match by picking a specific paper.
+
+    Takes a dropped file that the auto-matcher couldn't confidently
+    assign (narrow gap in fuzzy scores) and assigns it to the
+    specified paper, then runs install + validation.
+    """
+    status = app_state["manual_mode"]
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File no longer exists")
+
+    db = _get_db()
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if paper.state != PaperState.MANUAL_REQUIRED.value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Paper is in state {paper.state}, not MANUAL_REQUIRED",
+        )
+
+    result = await _install_and_validate_dropped(
+        paper, file_path, match_type="user_assigned"
+    )
+    # Clear pending disambiguation if this was the candidate
+    pd = status.get("pending_disambiguation") or {}
+    if pd.get("file_path") == file_path:
+        status["pending_disambiguation"] = None
+
+    outcome = result.get("outcome")
+    if outcome == "complete":
+        status["matched_and_validated"] += 1
+        status["last_message"] = f"✓ User-assigned: {os.path.basename(file_path)} → {paper.title[:40]}"
+    elif outcome == "flagged":
+        status["matched_and_validated"] += 1
+        status["last_message"] = f"⚠ User-assigned (flagged): {paper.title[:40]}"
+    else:
+        status["validation_failed"] += 1
+        status["last_message"] = f"✗ User-assigned failed: {outcome}"
+
+    return JSONResponse({"status": "processed", "outcome": outcome, **result})
+
+
+@app.post("/api/manual/discard-unmatched")
+async def manual_mode_discard_unmatched(
+    file_path: str = Query(...),
+) -> JSONResponse:
+    """Remove an unmatched file from the drop folder + the unmatched list."""
+    status = app_state["manual_mode"]
+    try:
+        if os.path.isfile(file_path):
+            os.unlink(file_path)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    status["unmatched_files"] = [
+        f for f in status.get("unmatched_files", [])
+        if f.get("file_path") != file_path
+    ]
+    return JSONResponse({"status": "discarded"})
+
+
+# ===========================================================================
 # CAPTCHA ENDPOINTS
 # ===========================================================================
 
@@ -3609,6 +4407,23 @@ async def _build_stream_snapshot() -> Dict[str, Any]:
         "current_paper_title": sso.get("current_paper_title"),
         "last_message": sso.get("last_message", ""),
         "session_expired": bool(sso.get("session_expired")),
+    }
+
+    # Manual Orchestration Mode — drop-folder watcher progress
+    mm = app_state.get("manual_mode") or {}
+    payload["manual_mode"] = {
+        "enabled": bool(mm.get("enabled")),
+        "drop_folder": mm.get("drop_folder", ""),
+        "watcher_running": bool(mm.get("watcher_running")),
+        "last_scan_at": mm.get("last_scan_at"),
+        "last_file_seen": mm.get("last_file_seen"),
+        "last_file_seen_at": mm.get("last_file_seen_at"),
+        "last_message": mm.get("last_message", ""),
+        "matched_and_validated": mm.get("matched_and_validated", 0),
+        "validation_failed": mm.get("validation_failed", 0),
+        "unmatched_count": mm.get("unmatched_count", 0),
+        "permanently_unavailable": mm.get("permanently_unavailable", 0),
+        "pending_disambiguation": bool(mm.get("pending_disambiguation")),
     }
     return payload
 

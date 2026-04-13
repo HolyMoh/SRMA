@@ -1090,6 +1090,86 @@
                 </div>
             </div>
 
+            <!-- ============================================================
+                 MANUAL ORCHESTRATION MODE — no browser, no credentials
+                 ============================================================ -->
+            <div class="card" id="manualModeCard" style="border-left: 3px solid var(--accent); background:#f0f9ff">
+                <div class="card-header">
+                    <h3>&#128193; Manual Mode</h3>
+                    <span class="badge" id="manualModeBadge">Off</span>
+                </div>
+                <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.6">
+                    <strong>Maximum privacy: no browser opens, no credentials ever touch the system.</strong><br>
+                    Download paywalled PDFs yourself through your own browser and drop them into a folder.
+                    The system watches the folder, matches each PDF to a paper in your queue, runs the
+                    same 7-check validation as automatic retrieval, and files it.
+                </div>
+
+                <div class="form-group">
+                    <label>Drop folder</label>
+                    <input type="text" class="form-control" id="manualDropFolder"
+                           placeholder="e.g. ~/Downloads/SSO_PDFs"
+                           data-path-input="manual-drop"
+                           data-status-id="manualDropStatus">
+                    <div class="form-hint" id="manualDropStatus" style="margin-top:6px"></div>
+                </div>
+
+                <div class="btn-group" style="margin-top:12px">
+                    <button class="btn btn-success" id="btnManualStart">Enable Manual Mode</button>
+                    <button class="btn btn-outline" id="btnManualStop" disabled>Disable</button>
+                    <a href="/api/manual/queue.csv" class="btn btn-outline btn-sm"
+                       style="margin-left:auto">Export queue CSV</a>
+                </div>
+
+                <div id="manualModeMessage"
+                     style="margin-top:12px;font-size:12px;color:var(--text-secondary)"></div>
+
+                <!-- Live counters -->
+                <div class="card-grid" style="margin-top:16px" id="manualModeCounters">
+                    <div class="metric-card">
+                        <div class="metric-value score-high" id="manualCountMatched">0</div>
+                        <div class="metric-label">Matched + Validated</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value score-medium" id="manualCountFailed">0</div>
+                        <div class="metric-label">Validation Failed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="manualCountUnmatched">0</div>
+                        <div class="metric-label">Unmatched Files</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="manualCountUnavail">0</div>
+                        <div class="metric-label">Permanently Unavailable</div>
+                    </div>
+                </div>
+
+                <!-- Pending disambiguation — surfaces when watcher hits a narrow fuzzy gap -->
+                <div id="manualDisambig" style="display:none;margin-top:16px;padding:12px;background:#fffbeb;border:1px solid var(--warning);border-radius:var(--radius-sm)">
+                    <strong style="color:var(--warning)">&#9888; Ambiguous match — pick the correct paper</strong>
+                    <div id="manualDisambigFile" style="font-family:var(--mono);font-size:11px;margin-top:4px"></div>
+                    <div id="manualDisambigCandidates" style="margin-top:10px"></div>
+                </div>
+
+                <!-- Unmatched files — surfaces when no fuzzy match reaches threshold -->
+                <div id="manualUnmatchedWrap" style="margin-top:16px;display:none">
+                    <strong style="font-size:13px">Unmatched files</strong>
+                    <div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px">
+                        These PDFs didn't match any queued paper. Rename to include the DOI, or discard.
+                    </div>
+                    <div id="manualUnmatchedList" style="font-size:11px"></div>
+                </div>
+            </div>
+
+            <!-- Manual Mode Queue — augmented listing with Mark Unobtainable + suggested actions -->
+            <div class="card" id="manualQueueCard" style="display:none">
+                <div class="card-header">
+                    <h3>Manual Queue (<span id="manualQueueTotal">0</span> papers)</h3>
+                    <button class="btn btn-outline btn-sm" id="btnManualQueueRefresh">Refresh</button>
+                </div>
+                <div id="manualQueueList" style="max-height:420px;overflow-y:auto;font-size:12px"></div>
+            </div>
+
             <!-- STEP 1: QUEUE VISIBILITY -->
             <div class="card">
                 <div class="card-header">
@@ -1449,6 +1529,7 @@ function switchPanel(name) {
     if (name === 'sso') {
         loadSsoStatus();
         startSsoAuditPolling();   // 3s poll while panel visible
+        loadManualModeInitial();  // one-shot setup; live updates via SSE
     } else {
         stopSsoAuditPolling();
     }
@@ -2090,6 +2171,11 @@ function handleStreamEvent(m) {
     if (m.sso && typeof renderSsoFromStream === 'function') {
         renderSsoFromStream(m.sso);
     }
+
+    // --- Manual Mode: live counters + disambiguation surfacing ---
+    if (m.manual_mode && typeof renderManualModeFromStream === 'function') {
+        renderManualModeFromStream(m.manual_mode);
+    }
 }
 
 window.forceCooldownReset = async function(pub) {
@@ -2531,6 +2617,198 @@ document.addEventListener('toggle', function(e) {
         loadSsoAuditFunctions();
     }
 }, true);
+
+/* ------------------------------------------------------------------
+   MANUAL ORCHESTRATION MODE — no browser, no credentials
+   ------------------------------------------------------------------
+   Live counters and messages come from payload.manual_mode in the
+   unified SSE stream (see renderManualModeFromStream).
+   Queue list + disambiguation are fetched on demand.
+*/
+
+async function loadManualModeInitial() {
+    // One-shot load when SSO panel is first shown
+    try {
+        const s = await GET('/api/manual/status');
+        document.getElementById('manualDropFolder').value = s.drop_folder || '';
+        validatePathInput(document.getElementById('manualDropFolder'));
+        renderManualModeFromStream(s);
+    } catch (e) {}
+    loadManualQueue();
+}
+
+async function loadManualQueue() {
+    try {
+        const q = await GET('/api/manual/queue');
+        const card = document.getElementById('manualQueueCard');
+        card.style.display = 'block';
+        document.getElementById('manualQueueTotal').textContent = q.total || 0;
+        if (!q.papers || q.papers.length === 0) {
+            document.getElementById('manualQueueList').innerHTML =
+                '<div style="color:var(--success);padding:8px">&#10003; Queue is empty.</div>';
+            return;
+        }
+        document.getElementById('manualQueueList').innerHTML = q.papers.map(function(p) {
+            const unavail = p.permanently_unavailable;
+            const unavailBadge = unavail
+                ? '<span class="badge badge-danger" style="margin-left:6px">Permanently Unavailable</span>' : '';
+            const failureBadge = p.last_failure_code
+                ? '<span class="badge badge-warning" style="margin-left:6px">' + escHtml(p.last_failure_code) + '</span>' : '';
+            return '<div style="padding:10px;border-bottom:1px solid var(--border);' +
+                (unavail ? 'opacity:0.6;' : '') + '">' +
+                '<div style="font-weight:500">' + escHtml(p.title || '(no title)') + unavailBadge + failureBadge + '</div>' +
+                '<div style="color:var(--text-secondary);font-size:11px;margin-top:2px">' +
+                    escHtml(p.first_author || '') + ' ' + (p.year || '') +
+                    (p.journal ? ' &middot; ' + escHtml(p.journal) : '') +
+                    ' &middot; <span class="badge badge-neutral">' + escHtml(p.publisher || '') + '</span>' +
+                '</div>' +
+                (p.doi ? '<div style="font-family:var(--mono);font-size:11px;margin-top:4px">DOI: <a href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">' + escHtml(p.doi) + '</a></div>' : '') +
+                (p.ezproxy_url ? '<div style="font-family:var(--mono);font-size:11px"><a href="' + escAttr(p.ezproxy_url) + '" target="_blank" rel="noopener">Open via EZproxy &rarr;</a></div>' : '') +
+                '<div style="font-size:11px;color:var(--text-secondary);margin-top:4px;font-style:italic">' + escHtml(p.suggested_action || '') + '</div>' +
+                (!unavail ? '<button class="btn btn-sm btn-outline" style="margin-top:6px" onclick="manualMarkUnobtainable(\'' + escAttr(p.canonical_id) + '\')">Mark as Unobtainable</button>' : '') +
+                '</div>';
+        }).join('');
+    } catch (e) {
+        document.getElementById('manualQueueList').innerHTML =
+            '<div style="color:var(--danger)">Failed to load queue: ' + escHtml(e.message) + '</div>';
+    }
+}
+
+window.manualMarkUnobtainable = async function(canonicalId) {
+    const note = prompt('Why is this paper unobtainable? (optional note)') || '';
+    try {
+        await POST('/api/manual/paper/' + encodeURIComponent(canonicalId) + '/mark-unobtainable?note=' + encodeURIComponent(note));
+        toast('Marked as permanently unavailable', 'success');
+        loadManualQueue();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+window.manualAssignFile = async function(filePath, canonicalId) {
+    try {
+        const r = await POST('/api/manual/assign?file_path=' + encodeURIComponent(filePath) + '&canonical_id=' + encodeURIComponent(canonicalId));
+        toast('Assigned — outcome: ' + (r.outcome || 'ok'), r.outcome === 'complete' ? 'success' : 'warning');
+        document.getElementById('manualDisambig').style.display = 'none';
+        loadManualQueue();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+window.manualDiscardUnmatched = async function(filePath) {
+    if (!confirm('Delete this unmatched file from the drop folder?')) return;
+    try {
+        await POST('/api/manual/discard-unmatched?file_path=' + encodeURIComponent(filePath));
+        toast('Discarded', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+function renderManualModeFromStream(mm) {
+    if (!mm) return;
+    const badge = document.getElementById('manualModeBadge');
+    if (mm.enabled && mm.watcher_running) {
+        badge.textContent = 'Watching'; badge.className = 'badge badge-success';
+    } else if (mm.enabled) {
+        badge.textContent = 'Enabled (not scanning)'; badge.className = 'badge badge-warning';
+    } else {
+        badge.textContent = 'Off'; badge.className = 'badge badge-neutral';
+    }
+
+    document.getElementById('btnManualStart').disabled = !!mm.enabled;
+    document.getElementById('btnManualStop').disabled = !mm.enabled;
+
+    document.getElementById('manualCountMatched').textContent = mm.matched_and_validated || 0;
+    document.getElementById('manualCountFailed').textContent = mm.validation_failed || 0;
+    document.getElementById('manualCountUnmatched').textContent = mm.unmatched_count || 0;
+    document.getElementById('manualCountUnavail').textContent = mm.permanently_unavailable || 0;
+
+    if (mm.last_message) {
+        document.getElementById('manualModeMessage').textContent = mm.last_message;
+    }
+
+    // Pending disambiguation indicator — only shown if the SSE slice signaled it.
+    // Details fetched via /api/manual/status to keep SSE payload small.
+    if (mm.pending_disambiguation) {
+        // Lazy-fetch the full disambiguation details
+        fetchAndRenderDisambiguation();
+    } else {
+        document.getElementById('manualDisambig').style.display = 'none';
+    }
+
+    // Refresh unmatched list from full status periodically — not in SSE
+    if ((mm.unmatched_count || 0) > 0) {
+        fetchAndRenderUnmatched();
+    } else {
+        document.getElementById('manualUnmatchedWrap').style.display = 'none';
+    }
+}
+
+let _lastDisambigFile = null;
+async function fetchAndRenderDisambiguation() {
+    try {
+        const s = await GET('/api/manual/status');
+        const pd = s.pending_disambiguation;
+        if (!pd) {
+            document.getElementById('manualDisambig').style.display = 'none';
+            _lastDisambigFile = null;
+            return;
+        }
+        // Avoid redundant re-render if same file
+        if (pd.file_path === _lastDisambigFile) return;
+        _lastDisambigFile = pd.file_path;
+
+        document.getElementById('manualDisambig').style.display = 'block';
+        document.getElementById('manualDisambigFile').textContent = pd.file_name || pd.file_path;
+        document.getElementById('manualDisambigCandidates').innerHTML = (pd.candidates || []).map(function(c) {
+            return '<div style="padding:8px;margin-top:6px;background:white;border-radius:var(--radius-sm);display:flex;align-items:center;gap:10px">' +
+                '<div style="flex:1">' +
+                    '<div style="font-weight:500;font-size:12px">' + escHtml(c.title) + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary)">' + escHtml(c.first_author || '') + ' ' + (c.year || '') +
+                        (c.doi ? ' &middot; ' + escHtml(c.doi) : '') +
+                        ' &middot; score <strong>' + c.score + '</strong></div>' +
+                '</div>' +
+                '<button class="btn btn-sm btn-primary" onclick="manualAssignFile(\'' + escAttr(pd.file_path) + '\',\'' + escAttr(c.canonical_id) + '\')">Assign</button>' +
+                '</div>';
+        }).join('');
+    } catch (e) {}
+}
+
+async function fetchAndRenderUnmatched() {
+    try {
+        const s = await GET('/api/manual/status');
+        const unmatched = s.unmatched_files || [];
+        const wrap = document.getElementById('manualUnmatchedWrap');
+        const list = document.getElementById('manualUnmatchedList');
+        if (unmatched.length === 0) {
+            wrap.style.display = 'none'; return;
+        }
+        wrap.style.display = 'block';
+        list.innerHTML = unmatched.slice(-20).reverse().map(function(f) {
+            return '<div style="padding:6px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">' +
+                '<span style="font-family:var(--mono);flex:1">' + escHtml(f.file_name) + '</span>' +
+                '<span style="color:var(--text-secondary)">' + escHtml((f.reason || '').substring(0, 40)) + '</span>' +
+                '<button class="btn btn-sm btn-outline" onclick="manualDiscardUnmatched(\'' + escAttr(f.file_path) + '\')">Discard</button>' +
+                '</div>';
+        }).join('');
+    } catch (e) {}
+}
+
+document.getElementById('btnManualStart').addEventListener('click', async function() {
+    const folder = document.getElementById('manualDropFolder').value.trim();
+    if (!folder) { toast('Set a drop folder first', 'warning'); return; }
+    // Save the folder to config + enable
+    try {
+        await PUT('/api/settings', { manual_drop_folder: folder, manual_mode_enabled: true });
+        const r = await POST('/api/manual/start');
+        toast('Manual Mode: watching ' + r.drop_folder, 'success');
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnManualStop').addEventListener('click', async function() {
+    try {
+        await POST('/api/manual/stop');
+        toast('Manual Mode stopped', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnManualQueueRefresh').addEventListener('click', loadManualQueue);
 
 window.ssoMarkRetrieved = async function(canonicalId) {
     const note = prompt('Optional note (e.g. how you got it):') || '';

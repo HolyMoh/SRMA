@@ -268,6 +268,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "institutional_resolver_url": "",
     "scholar_min_delay_s": SCHOLAR_MIN_DELAY_S,
     "scholar_max_queries_per_paper": SCHOLAR_MAX_QUERIES_PER_PAPER,
+    # Manual Orchestration Mode — user controls downloads entirely.
+    # When enabled, the system never opens a browser or touches
+    # credentials; instead it watches manual_drop_folder for PDFs
+    # the user downloads themselves.
+    "manual_mode_enabled": False,
+    "manual_drop_folder": "",
 }
 
 
@@ -356,6 +362,8 @@ class FailureCode(str, enum.Enum):
     REUSED = "REUSED"
     PUBLISHER_COOLDOWN_ACTIVE = "PUBLISHER_COOLDOWN_ACTIVE"
     COOLDOWN_EXTENDED = "COOLDOWN_EXTENDED"
+    PERMANENTLY_UNAVAILABLE = "PERMANENTLY_UNAVAILABLE"
+    MANUAL_VALIDATION_FAILED = "MANUAL_VALIDATION_FAILED"
 
 
 class ValidationStatus(str, enum.Enum):
@@ -944,6 +952,8 @@ class SettingsUpdate(BaseModel):
     output_directory: Optional[str] = None
     scholar_min_delay_s: Optional[float] = None
     scholar_max_queries_per_paper: Optional[int] = None
+    manual_mode_enabled: Optional[bool] = None
+    manual_drop_folder: Optional[str] = None
 
     @field_validator("retrieval_concurrency")
     @classmethod
