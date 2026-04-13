@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -51,6 +51,8 @@ from full_text_acquisition.models import (
     DEFAULT_BACKPRESSURE_THRESHOLD,
     DEFAULT_CACHE_TTL_DAYS,
     DEFAULT_CONFIG,
+    ProjectCreate,
+    ProjectResponse,
     AuditLogEntry,
     ColumnMapping,
     ConfigSnapshot,
@@ -130,6 +132,294 @@ def setup_logging(log_dir: str = ".") -> None:
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = "config.json"
+
+# ---------------------------------------------------------------------------
+# Per-project isolation — filesystem layout
+# ---------------------------------------------------------------------------
+PROJECTS_ROOT = "./projects"
+PROJECTS_MANIFEST_PATH = os.path.join(PROJECTS_ROOT, "projects.json")
+PROJECTS_MIGRATION_MARKER = os.path.join(PROJECTS_ROOT, ".migrated")
+DEFAULT_PROJECT_SLUG = "default"   # the one migration target with a stable name
+DEFAULT_PROJECT_DISPLAY = "Default"
+
+
+def _slugify_project_name(name: str, existing_slugs: Set[str]) -> str:
+    """Sanitize a user-supplied project name into a filesystem-safe slug.
+
+    Rules:
+      - Lowercase
+      - Strip diacritics via NFKD decomposition
+      - Replace anything not in [a-z0-9] with '-'
+      - Collapse multiple hyphens, strip leading/trailing
+      - Truncate to 50 chars
+      - Append an 8-char UUID suffix to GUARANTEE uniqueness and to
+        side-step Windows reserved names (CON, PRN, NUL, etc.)
+
+    Returns a slug that matches ^[a-z0-9][a-z0-9-]*-[a-f0-9]{8}$ so
+    path-traversal is structurally impossible.
+    """
+    import re as _re
+    import unicodedata as _unicodedata
+
+    normalized = _unicodedata.normalize("NFKD", name or "")
+    ascii_only = "".join(c for c in normalized if not _unicodedata.combining(c))
+    lower = ascii_only.lower()
+    # Replace any run of non-alphanumeric with single hyphen
+    base = _re.sub(r'[^a-z0-9]+', '-', lower).strip('-')
+    base = base[:50].strip('-') or "project"
+    # Append uniqueness suffix
+    suffix = uuid.uuid4().hex[:8]
+    slug = f"{base}-{suffix}"
+    # Guard against the (astronomically unlikely) collision
+    while slug in existing_slugs:
+        slug = f"{base}-{uuid.uuid4().hex[:8]}"
+    return slug
+
+
+def _project_dir(slug: str) -> str:
+    return os.path.join(PROJECTS_ROOT, slug)
+
+
+def _project_db_path(slug: str) -> str:
+    return os.path.join(_project_dir(slug), "acquisition.db")
+
+
+def _project_config_path(slug: str) -> str:
+    return os.path.join(_project_dir(slug), "config.json")
+
+
+def _project_output_dir(slug: str) -> str:
+    return os.path.join(_project_dir(slug), "downloads")
+
+
+def _project_supplement_dir(slug: str) -> str:
+    return os.path.join(_project_output_dir(slug), "Supplements")
+
+
+def _load_projects_manifest() -> Dict[str, Any]:
+    """Load ./projects/projects.json, returning an empty manifest if absent."""
+    if not os.path.isfile(PROJECTS_MANIFEST_PATH):
+        return {"version": 1, "current_project_slug": None, "projects": []}
+    try:
+        with open(PROJECTS_MANIFEST_PATH, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to read projects manifest: %s", exc)
+        return {"version": 1, "current_project_slug": None, "projects": []}
+
+
+def _save_projects_manifest(manifest: Dict[str, Any]) -> None:
+    """Atomically persist the manifest."""
+    os.makedirs(PROJECTS_ROOT, exist_ok=True)
+    tmp = PROJECTS_MANIFEST_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, PROJECTS_MANIFEST_PATH)
+
+
+def _find_project(manifest: Dict[str, Any], slug: str) -> Optional[Dict[str, Any]]:
+    for p in manifest.get("projects", []):
+        if p.get("project_slug") == slug:
+            return p
+    return None
+
+
+def _load_project_config_overlay(slug: str) -> Dict[str, Any]:
+    """Read the per-project config.json overlay. Empty dict if absent."""
+    path = _project_config_path(slug)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_project_config_overlay(slug: str, overlay: Dict[str, Any]) -> None:
+    """Persist the per-project config overlay."""
+    os.makedirs(_project_dir(slug), exist_ok=True)
+    path = _project_config_path(slug)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(overlay, f, indent=2)
+    os.replace(tmp, path)
+
+
+# Fields the user is allowed to override per-project. Other global
+# fields (config_version, database_path) are never project-scoped.
+_PROJECT_OVERRIDABLE_KEYS: Set[str] = {
+    "output_directory", "supplement_directory",
+    "sso_proxy_url", "openathens_url", "institutional_resolver_url",
+    "unpaywall_email",
+    "manual_drop_folder", "manual_mode_enabled",
+    "cooldown_minutes", "cooldown_failure_threshold", "cooldown_window_size",
+    "retrieval_concurrency", "validation_concurrency",
+    "backpressure_threshold",
+    "api_timeout_s", "pdf_download_timeout_s",
+    "page_load_timeout_s", "selector_timeout_s",
+    "pdf_validation_timeout_s", "ocr_per_page_timeout_s",
+    "max_retries", "max_total_attempts",
+    "min_disk_space_bytes",
+    "cache_ttl_days",
+    "scholar_min_delay_s", "scholar_max_queries_per_paper",
+}
+
+
+def _merge_project_config(
+    slug: str,
+    global_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compose the effective runtime config for a project.
+
+    Precedence: DEFAULT_CONFIG (implicit via global) ← global config.json
+    ← project config.json overlay. Plus project-specific path defaults
+    for output/supplement dirs if not overridden.
+    """
+    effective = dict(global_config)
+    effective["database_path"] = _project_db_path(slug)
+
+    # Sensible per-project defaults
+    if not effective.get("output_directory"):
+        effective["output_directory"] = _project_output_dir(slug)
+    if not effective.get("supplement_directory"):
+        effective["supplement_directory"] = _project_supplement_dir(slug)
+
+    # Apply overlay (only whitelisted keys)
+    overlay = _load_project_config_overlay(slug)
+    for k, v in overlay.items():
+        if k in _PROJECT_OVERRIDABLE_KEYS:
+            effective[k] = v
+
+    # If overlay omitted output_directory but the user had previously
+    # set a global one, we should still honor the project default.
+    # Use project-path if the current value is the global default.
+    if "output_directory" not in overlay:
+        effective["output_directory"] = _project_output_dir(slug)
+    if "supplement_directory" not in overlay:
+        effective["supplement_directory"] = _project_supplement_dir(slug)
+
+    return effective
+
+
+def _ensure_default_project(
+    manifest: Dict[str, Any],
+    global_config: Dict[str, Any],
+) -> str:
+    """Ensure the Default project entry exists + its directories exist.
+
+    Returns the Default project's slug (always 'default').
+    """
+    default = _find_project(manifest, DEFAULT_PROJECT_SLUG)
+    if default is None:
+        default = {
+            "project_id": str(uuid.uuid4()),
+            "project_name": DEFAULT_PROJECT_DISPLAY,
+            "project_slug": DEFAULT_PROJECT_SLUG,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        manifest.setdefault("projects", []).append(default)
+
+    # Ensure directories exist
+    os.makedirs(_project_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+    os.makedirs(_project_output_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+    os.makedirs(_project_supplement_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+
+    # Ensure overlay file exists (empty means "inherit everything")
+    if not os.path.isfile(_project_config_path(DEFAULT_PROJECT_SLUG)):
+        _save_project_config_overlay(DEFAULT_PROJECT_SLUG, {})
+
+    # Seed current_project_slug if absent
+    if not manifest.get("current_project_slug"):
+        manifest["current_project_slug"] = DEFAULT_PROJECT_SLUG
+
+    _save_projects_manifest(manifest)
+    return DEFAULT_PROJECT_SLUG
+
+
+def _migrate_legacy_to_default(global_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Idempotent copy of legacy ./acquisition.db + ./downloads/ into
+    ./projects/default/. Never overwrites existing default data.
+
+    Returns a dict summarizing what happened.
+    """
+    import shutil as _shutil
+    result: Dict[str, Any] = {
+        "migrated": False, "skipped": True, "reason": "",
+        "db_copied": False, "downloads_copied": False,
+    }
+
+    os.makedirs(PROJECTS_ROOT, exist_ok=True)
+    if os.path.isfile(PROJECTS_MIGRATION_MARKER):
+        result["reason"] = "Migration marker already present"
+        return result
+
+    legacy_db = global_config.get("database_path", "./acquisition.db")
+    legacy_downloads = global_config.get("output_directory", "./downloads")
+    default_db = _project_db_path(DEFAULT_PROJECT_SLUG)
+    default_downloads = _project_output_dir(DEFAULT_PROJECT_SLUG)
+
+    # If the default project directory already has content, refuse to touch it.
+    if os.path.isdir(_project_dir(DEFAULT_PROJECT_SLUG)) and (
+        os.path.isfile(default_db)
+        or (os.path.isdir(default_downloads) and os.listdir(default_downloads))
+    ):
+        # Mark migration as done (to avoid re-checking) but note the skip.
+        with open(PROJECTS_MIGRATION_MARKER, "w") as f:
+            f.write(f"skipped-existing-default at "
+                    f"{datetime.now(timezone.utc).isoformat()}\n")
+        result["reason"] = (
+            "Default project directory already has data — not touched"
+        )
+        logger.warning("Skipping legacy migration: %s", result["reason"])
+        return result
+
+    os.makedirs(_project_dir(DEFAULT_PROJECT_SLUG), exist_ok=True)
+
+    # COPY (not move) the legacy DB
+    try:
+        if os.path.isfile(legacy_db):
+            _shutil.copy2(legacy_db, default_db)
+            # Also copy WAL/SHM sidecars if present
+            for sidecar in ("-wal", "-shm"):
+                src = legacy_db + sidecar
+                if os.path.isfile(src):
+                    _shutil.copy2(src, default_db + sidecar)
+            result["db_copied"] = True
+            logger.info("Migration copy: %s -> %s", legacy_db, default_db)
+    except OSError as exc:
+        logger.error("Failed to copy legacy DB: %s", exc)
+
+    # COPY the legacy downloads tree
+    try:
+        if os.path.isdir(legacy_downloads):
+            _shutil.copytree(legacy_downloads, default_downloads, dirs_exist_ok=True)
+            result["downloads_copied"] = True
+            logger.info(
+                "Migration copy: %s -> %s", legacy_downloads, default_downloads
+            )
+        else:
+            os.makedirs(default_downloads, exist_ok=True)
+    except OSError as exc:
+        logger.error("Failed to copy legacy downloads: %s", exc)
+
+    # Write marker so this never runs again
+    with open(PROJECTS_MIGRATION_MARKER, "w") as f:
+        f.write(
+            f"migrated at {datetime.now(timezone.utc).isoformat()}\n"
+            f"legacy_db={legacy_db}\n"
+            f"legacy_downloads={legacy_downloads}\n"
+            f"db_copied={result['db_copied']}\n"
+            f"downloads_copied={result['downloads_copied']}\n"
+            "Original files LEFT IN PLACE as backup. Delete manually "
+            "once you're confident Default project is working.\n"
+        )
+    result["migrated"] = True
+    result["skipped"] = False
+    result["reason"] = "Legacy data copied to Default project"
+    return result
+
+
 
 
 def load_config() -> Dict[str, Any]:
@@ -338,6 +628,158 @@ def _check_binary(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Project switching: activity check + rebind
+# ---------------------------------------------------------------------------
+
+def _check_busy_reasons() -> List[str]:
+    """Return a list of human reasons why project-switching is not safe.
+
+    Used by activate_project to refuse the switch rather than corrupt
+    data by swapping the DB + output dir out from under live workers.
+    """
+    reasons: List[str] = []
+    wp = app_state.get("worker_pool")
+    if wp is not None:
+        try:
+            if wp.is_running:
+                reasons.append("a retrieval run is active")
+        except Exception:
+            pass
+
+    mm = app_state.get("manual_mode") or {}
+    if mm.get("watcher_running") or mm.get("enabled"):
+        reasons.append("Manual Mode watcher is running")
+
+    sso = app_state.get("sso_session") or {}
+    if sso.get("active"):
+        reasons.append("an SSO session is active")
+
+    enr = app_state.get("enrichment_status") or {}
+    if enr.get("in_progress"):
+        reasons.append("enrichment is still in progress")
+    return reasons
+
+
+async def _rebind_to_project(slug: str) -> Dict[str, Any]:
+    """Tear down current DB + engine + worker pool, rebind to a project.
+
+    CRITICAL: callers MUST have verified _check_busy_reasons() is
+    empty first. This function does NOT protect against live tasks.
+
+    Returns the new project's manifest record.
+    """
+    manifest = _load_projects_manifest()
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+
+    # 1. Close current DB (flush write queue first)
+    current_db = app_state.get("db")
+    if current_db is not None:
+        try:
+            await current_db.flush_write_queue()
+            await current_db.close()
+        except Exception as exc:
+            logger.warning("Error closing current DB during rebind: %s", exc)
+
+    # 2. Close current engine's HTTP client
+    current_engine = app_state.get("engine")
+    if current_engine is not None:
+        try:
+            await current_engine.close()
+        except Exception as exc:
+            logger.debug("Error closing engine during rebind: %s", exc)
+
+    # 3. Compose effective config for the new project
+    global_config = load_config()  # reads ./config.json
+    effective_config = _merge_project_config(slug, global_config)
+
+    # 4. Open new DB + run schema migration + interrupted/filesystem reset
+    new_db_path = _project_db_path(slug)
+    os.makedirs(os.path.dirname(new_db_path), exist_ok=True)
+    new_db = Database(new_db_path)
+    await new_db.initialize()
+    effective_config = await new_db.run_config_migration(effective_config)
+    # Persist migrated overlay if keys changed
+    overlay = _load_project_config_overlay(slug)
+    _save_project_config_overlay(slug, overlay)  # no-op touch keeps file present
+    await new_db.reset_interrupted_states()
+    await new_db.reconcile_filesystem()
+
+    # 5. Create new engine bound to this project's paths
+    output_dir = effective_config.get("output_directory") or _project_output_dir(slug)
+    supp_dir = effective_config.get("supplement_directory") or _project_supplement_dir(slug)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(supp_dir, exist_ok=True)
+
+    wizard = app_state.get("wizard_result")
+    browser_mgr = app_state.get("browser_manager")
+    new_engine = RetrievalEngine(
+        db=new_db, browser_manager=browser_mgr,
+        config=effective_config,
+        output_directory=output_dir,
+        supplement_directory=supp_dir,
+    )
+    if wizard is not None:
+        new_engine.tesseract_available = wizard.tesseract_available
+        new_engine.ghostscript_available = wizard.ghostscript_available
+
+    # 6. Create new worker pool bound to new engine + DB
+    new_pool = WorkerPool(
+        db=new_db, engine=new_engine,
+        config=effective_config, output_dir=output_dir,
+    )
+
+    # 7. Atomic swap of app_state references
+    app_state["db"] = new_db
+    app_state["engine"] = new_engine
+    app_state["worker_pool"] = new_pool
+    app_state["config"] = effective_config
+    app_state["current_project"] = dict(project)
+
+    # 8. Reset per-project live state (enrichment progress, manual mode).
+    # These are project-local; a new project starts fresh.
+    app_state["enrichment_status"] = {
+        "in_progress": False, "run_id": None, "total": 0, "completed": 0,
+        "enriched_count": 0, "failed_count": 0,
+        "started_at": None, "completed_at": None,
+    }
+    app_state["enrichment_task"] = None
+    app_state["manual_mode"] = {
+        "enabled": bool(effective_config.get("manual_mode_enabled")),
+        "drop_folder": effective_config.get("manual_drop_folder", ""),
+        "watcher_running": False, "last_scan_at": None,
+        "last_file_seen": None, "last_file_seen_at": None,
+        "last_message": "",
+        "matched_and_validated": 0, "validation_failed": 0,
+        "unmatched_count": 0, "unmatched_files": [],
+        "pending_disambiguation": None, "permanently_unavailable": 0,
+    }
+    app_state["manual_task"] = None
+    app_state["manual_cancel_event"] = None
+    app_state["sso_session"] = {
+        "active": False, "phase": "idle", "proxy_url": "",
+        "login_url": "", "started_at": None, "login_detected_at": None,
+        "ended_at": None, "queue_total": 0, "queue_processed": 0,
+        "queue_succeeded": 0, "queue_manual": 0,
+        "current_paper_id": None, "current_paper_title": None,
+        "last_message": "", "session_expired": False,
+    }
+    app_state["sso_task"] = None
+    app_state["sso_cancel_event"] = None
+
+    # 9. Persist the switch in the manifest
+    manifest["current_project_slug"] = slug
+    _save_projects_manifest(manifest)
+
+    logger.info(
+        "Project rebound: %s (slug=%s, db=%s)",
+        project["project_name"], slug, new_db_path,
+    )
+    return project
+
+
+# ---------------------------------------------------------------------------
 # FastAPI lifespan (startup + shutdown)
 # ---------------------------------------------------------------------------
 
@@ -373,18 +815,44 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     logger.info("Full-Text Acquisition System starting...")
     logger.info("=" * 60)
 
-    # Load config
+    # Load global config (defaults; projects can override)
     config = load_config()
 
-    # Initialize database (steps 1, 6: WAL, FK, schema, write queue)
-    db_path = config.get("database_path", "./acquisition.db")
+    # --- Projects setup (runs BEFORE DB init so we know which DB to open) ---
+    os.makedirs(PROJECTS_ROOT, exist_ok=True)
+    # Idempotent migration of legacy ./acquisition.db + ./downloads/ into
+    # ./projects/default/. Copy-not-move; leaves originals in place.
+    migration_result = _migrate_legacy_to_default(config)
+    if migration_result.get("migrated"):
+        logger.info("Legacy data migrated to Default project: %s",
+                    migration_result.get("reason"))
+    manifest = _load_projects_manifest()
+    _ensure_default_project(manifest, config)
+    # Re-read manifest (ensure_default persisted it)
+    manifest = _load_projects_manifest()
+    current_slug = manifest.get("current_project_slug") or DEFAULT_PROJECT_SLUG
+    if _find_project(manifest, current_slug) is None:
+        # Manifest references a project that no longer exists — fall back
+        current_slug = DEFAULT_PROJECT_SLUG
+        manifest["current_project_slug"] = current_slug
+        _save_projects_manifest(manifest)
+    current_project = _find_project(manifest, current_slug)
+    app_state["current_project"] = dict(current_project) if current_project else None
+    app_state["migration_notice"] = migration_result
+
+    # Compose effective config for the current project (global ← overlay)
+    config = _merge_project_config(current_slug, config)
+
+    # Initialize database for the current project
+    db_path = config["database_path"]  # set by _merge_project_config
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     db = Database(db_path)
     await db.initialize()
 
-    # Step 2: Config migration
+    # Step 2: Config migration (schema additive)
     try:
         config = await db.run_config_migration(config)
-        save_config(config)
+        save_config(config)  # persist global
     except ValueError as exc:
         logger.critical("Config version error: %s — exiting", exc)
         await db.close()
@@ -407,9 +875,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Initialize browser manager
     browser_mgr = BrowserManager.get_instance()
 
-    # Step 7: Initialize RetrievalEngine
-    output_dir = config.get("output_directory", "./downloads")
-    supplement_dir = config.get("supplement_directory", "./downloads/Supplements")
+    # Step 7: Initialize RetrievalEngine for current project
+    output_dir = config.get("output_directory") or _project_output_dir(current_slug)
+    supplement_dir = config.get("supplement_directory") or _project_supplement_dir(current_slug)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(supplement_dir, exist_ok=True)
 
@@ -473,6 +941,27 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     app_state["sso_task"] = None
     app_state["sso_cancel_event"] = None
 
+    # Manual Orchestration Mode — system watches a drop folder for
+    # user-downloaded PDFs and matches them to the MANUAL_REQUIRED queue.
+    # Never opens a browser, never touches credentials.
+    app_state["manual_mode"] = {
+        "enabled": False,
+        "drop_folder": "",
+        "watcher_running": False,
+        "last_scan_at": None,
+        "last_file_seen": None,
+        "last_file_seen_at": None,
+        "last_message": "",
+        "matched_and_validated": 0,
+        "validation_failed": 0,
+        "unmatched_count": 0,
+        "unmatched_files": [],
+        "pending_disambiguation": None,
+        "permanently_unavailable": 0,
+    }
+    app_state["manual_task"] = None
+    app_state["manual_cancel_event"] = None
+
     logger.info(
         "Startup complete: %d interrupted resets, %d missing files reconciled",
         len(resets), len(missing),
@@ -492,6 +981,19 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Step 1-2: Signal shutdown
     shutdown_event: asyncio.Event = app_state.get("shutdown_event", asyncio.Event())
     shutdown_event.set()
+
+    # Stop the Manual Mode watcher if running
+    mm_cancel: Optional[asyncio.Event] = app_state.get("manual_cancel_event")
+    mm_task: Optional[asyncio.Task] = app_state.get("manual_task")
+    if mm_cancel:
+        mm_cancel.set()
+    if mm_task and not mm_task.done():
+        try:
+            await asyncio.wait_for(mm_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            mm_task.cancel()
+            try: await mm_task
+            except (asyncio.CancelledError, Exception): pass
 
     # Step 3-4: Drain workers
     wp: Optional[WorkerPool] = app_state.get("worker_pool")
@@ -596,7 +1098,10 @@ def _get_config() -> Dict[str, Any]:
 
 
 @app.post("/api/upload", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
+async def upload_file(
+    file: UploadFile = File(...),
+    output_directory_override: Optional[str] = Form(default=None),
+) -> UploadResponse:
     """Upload a CSV or Excel file for ingestion.
 
     Performs:
@@ -607,6 +1112,11 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
         5. Canonical ID assignment
         6. ALREADY_RETRIEVED detection
         7. Create run record and paper_runs linkage
+
+    output_directory_override: optional per-batch override. If valid,
+    is recorded in the run's config_snapshot JSON and used (instead
+    of the global default) when this run is Started. Must pass the
+    same validation as /api/fs/check-path.
     """
     db = _get_db()
     config = _get_config()
@@ -626,9 +1136,25 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
     # Auto-detect columns
     detected = auto_detect_columns(headers)
 
-    # Create run
+    # Resolve the output directory for THIS run.
+    # Order: per-batch override > global config setting > project default.
+    effective_output_dir = config.get("output_directory", "./downloads")
+    override_validation: Optional[Dict[str, Any]] = None
+    if output_directory_override and output_directory_override.strip():
+        override_validation = _validate_output_path(output_directory_override)
+        if not override_validation["ok"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid output_directory_override: "
+                       f"{override_validation.get('error') or 'unknown error'}",
+            )
+        effective_output_dir = override_validation["abs_path"]
+
+    # Create run with snapshot reflecting the effective output_dir
     run_id = f"run-{uuid.uuid4().hex[:12]}"
-    config_snap = ConfigSnapshot.from_dict(config)
+    snapshot_config = dict(config)
+    snapshot_config["output_directory"] = effective_output_dir
+    config_snap = ConfigSnapshot.from_dict(snapshot_config)
     run_record = RunRecord(
         run_id=run_id,
         total_submitted=len(rows),
@@ -810,6 +1336,7 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
         enrichment_result=enrichment,
         already_retrieved_count=already_retrieved_count,
         ready_for_retrieval_count=inserted,
+        output_directory=os.path.abspath(effective_output_dir),
     )
 
 
@@ -1268,6 +1795,42 @@ async def start_run(
             status_code=400,
             detail="No papers are ready for retrieval or validation.",
         )
+
+    # Auto-backup before workers touch data. Runs only when we've just
+    # passed the busy-check (wp.is_running was false at the top), so
+    # the DB is quiescent. 5-file rotation keeps disk use bounded.
+    current_slug = _current_project_slug_or_404()
+    try:
+        await _create_backup(current_slug, kind=BACKUP_KIND_AUTO)
+        _rotate_auto_backups(current_slug, keep=_AUTO_BACKUP_KEEP)
+    except Exception as exc:
+        # Do NOT abort the run if backup fails — just log and continue.
+        # The user explicitly clicked Start; a flaky disk on the backup
+        # folder shouldn't block their work.
+        logger.warning("Auto-backup failed (run will proceed): %s", exc)
+
+    # Apply per-run output_directory override (if any).
+    # The override is stored in the run's config_snapshot at upload time.
+    # Limitation: only one active run at a time, so retargeting the
+    # engine's _output_dir on Start is safe. Concurrent runs are not
+    # supported and would race; the WorkerPool already enforces single-run
+    # semantics via wp.is_running.
+    engine = _get_engine()
+    try:
+        snap = json.loads(run_record.config_snapshot or "{}")
+        run_output_dir = snap.get("output_directory") or ""
+        if run_output_dir:
+            run_output_abs = os.path.abspath(os.path.expanduser(run_output_dir))
+            os.makedirs(run_output_abs, exist_ok=True)
+            engine._output_dir = run_output_abs
+            engine._supplement_dir = os.path.join(run_output_abs, "Supplements")
+            os.makedirs(engine._supplement_dir, exist_ok=True)
+            logger.info(
+                "Run %s: output directory set to %s (per-run override)",
+                run_id, run_output_abs,
+            )
+    except Exception as exc:
+        logger.warning("Failed to apply per-run output dir for %s: %s", run_id, exc)
 
     # Start workers
     await wp.start(run_id)
@@ -1974,6 +2537,207 @@ async def sso_mark_retrieved(
     })
 
 
+# ---------------------------------------------------------------------------
+# Privacy Audit endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/sso/audit")
+async def sso_audit_snapshot() -> JSONResponse:
+    """Snapshot of SSO browser activity counters and navigation log.
+
+    Counters are computed from REAL operations instrumented in
+    BrowserManager — never hardcoded. If form_fields_read or
+    screenshots_taken ever become non-zero, the UI will show the
+    truth (we have not added any code path that does either).
+    """
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    if bm is None:
+        return JSONResponse({
+            "pages_navigated": 0,
+            "form_fields_read": 0,
+            "screenshots_taken": 0,
+            "files_downloaded": 0,
+            "nav_log": [],
+            "session_audit_dir": None,
+            "session_started_at": None,
+            "has_persistent_context": False,
+        })
+    return JSONResponse(bm.audit_snapshot())
+
+
+@app.get("/api/sso/audit/cookies")
+async def sso_audit_cookies() -> JSONResponse:
+    """List cookies in the SSO context — names + domains only.
+
+    SECURITY: cookie values are NEVER returned. Only metadata that
+    lets the user identify what is set (domain, name, path, expires,
+    httpOnly/secure/sameSite flags).
+    """
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    if bm is None:
+        return JSONResponse({"cookies": [], "count": 0})
+    cookies = await bm.list_persistent_cookies()
+    return JSONResponse({"cookies": cookies, "count": len(cookies)})
+
+
+@app.get("/api/sso/audit/folder-listing")
+async def sso_audit_folder_listing() -> JSONResponse:
+    """List contents of the per-session audit folder.
+
+    Powers the 'Verify now' button. If the folder contains exactly
+    one file (SESSION_INFO.txt), the user has visual proof that no
+    other session data is being persisted by the system.
+    """
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    if bm is None:
+        return JSONResponse({
+            "session_dir": None, "exists": False,
+            "contents": [], "is_empty_except_marker": True,
+        })
+
+    session_dir = bm.audit_snapshot().get("session_audit_dir")
+    if not session_dir:
+        return JSONResponse({
+            "session_dir": None, "exists": False,
+            "contents": [], "is_empty_except_marker": True,
+        })
+
+    if not os.path.isdir(session_dir):
+        return JSONResponse({
+            "session_dir": session_dir, "exists": False,
+            "contents": [], "is_empty_except_marker": True,
+        })
+
+    contents: List[Dict[str, Any]] = []
+    try:
+        for name in sorted(os.listdir(session_dir)):
+            full = os.path.join(session_dir, name)
+            try:
+                st = os.stat(full)
+                contents.append({
+                    "name": name,
+                    "size_bytes": st.st_size,
+                    "is_dir": os.path.isdir(full),
+                    "modified": datetime.fromtimestamp(
+                        st.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                })
+            except OSError as exc:
+                contents.append({
+                    "name": name, "size_bytes": 0,
+                    "is_dir": False, "modified": "",
+                    "error": str(exc),
+                })
+    except OSError as exc:
+        return JSONResponse({
+            "session_dir": session_dir, "exists": True,
+            "contents": [], "error": str(exc),
+            "is_empty_except_marker": False,
+        })
+
+    only_marker = (
+        len(contents) == 1
+        and contents[0]["name"] == "SESSION_INFO.txt"
+    )
+    return JSONResponse({
+        "session_dir": session_dir,
+        "exists": True,
+        "contents": contents,
+        "is_empty_except_marker": only_marker,
+    })
+
+
+# Trust-boundary functions: the ENTIRE surface where the system
+# touches the SSO browser. Scanned at request time so reported line
+# numbers always match the running code, never drift on refactor.
+SSO_TRUST_BOUNDARY_FUNCTIONS: List[Dict[str, str]] = [
+    {"function": "initiate_sso_login",      "module": "browser_manager"},
+    {"function": "probe_sso_login",         "module": "browser_manager"},
+    {"function": "get_sso_page",            "module": "browser_manager"},
+    {"function": "tier3_institutional_sso", "module": "retrieval_engine"},
+]
+
+
+@app.get("/api/sso/audit/source-functions")
+async def sso_audit_source_functions() -> JSONResponse:
+    """Locate the 4 functions that interact with the SSO browser.
+
+    Reads the source files of the running modules and returns the
+    current line number of each function definition. Line numbers
+    are recomputed on every request so they are always accurate
+    for the version actually running.
+    """
+    import full_text_acquisition.browser_manager as _bm_mod
+    import full_text_acquisition.retrieval_engine as _re_mod
+
+    module_paths = {
+        "browser_manager":   _bm_mod.__file__,
+        "retrieval_engine":  _re_mod.__file__,
+    }
+
+    results: List[Dict[str, Any]] = []
+    for entry in SSO_TRUST_BOUNDARY_FUNCTIONS:
+        fn = entry["function"]
+        mod = entry["module"]
+        path = module_paths.get(mod)
+        out: Dict[str, Any] = {
+            "function": fn,
+            "module": mod,
+            "file": os.path.basename(path) if path else None,
+            "line": None,
+            "exists": False,
+        }
+        if not path or not os.path.isfile(path):
+            out["error"] = "Source file not readable"
+            results.append(out)
+            continue
+        try:
+            with open(path, "r") as fh:
+                lines = fh.readlines()
+            for i, line in enumerate(lines):
+                stripped = line.lstrip()
+                if (stripped.startswith(f"async def {fn}(")
+                        or stripped.startswith(f"def {fn}(")):
+                    out["line"] = i + 1
+                    out["exists"] = True
+                    break
+        except OSError as exc:
+            out["error"] = str(exc)
+        results.append(out)
+
+    return JSONResponse({"functions": results})
+
+
+@app.get("/api/sso/audit/nav-log.csv")
+async def sso_audit_nav_log_csv() -> FileResponse:
+    """CSV export of the SSO navigation log (timestamp, url, reason)."""
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    nav: List[Dict[str, Any]] = []
+    if bm is not None:
+        nav = bm.audit_snapshot().get("nav_log", [])
+
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"sso_nav_log_{timestamp}.csv"
+    fpath = os.path.join(export_dir, fname)
+
+    with open(fpath, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["timestamp", "url", "reason"])
+        for entry in nav:
+            w.writerow([
+                entry.get("timestamp", ""),
+                entry.get("url", ""),
+                entry.get("reason", ""),
+            ])
+
+    return FileResponse(fpath, media_type="text/csv", filename=fname)
+
+
 @app.get("/api/sso/manual-fallback")
 async def sso_manual_fallback() -> JSONResponse:
     """List of papers still needing manual retrieval after SSO session ends."""
@@ -2244,6 +3008,770 @@ async def _sso_queue_processor(cancel_event: asyncio.Event) -> None:
 
 
 # ===========================================================================
+# MANUAL ORCHESTRATION MODE — watch-folder, match, validate, install
+# ===========================================================================
+#
+# Philosophy: in Manual Mode, the system NEVER opens a browser or
+# touches credentials. The user downloads PDFs themselves through
+# their own browser and drops them into a configured folder. The
+# system watches that folder, matches dropped files to papers in
+# the MANUAL_REQUIRED queue, runs the same validation pipeline as
+# automatic retrieval, and marks matches as COMPLETE.
+
+MANUAL_WATCHER_POLL_INTERVAL_S = 5.0
+MANUAL_FILE_STABLE_POLLS = 2        # file size unchanged across 2 polls = ~10s
+MANUAL_FUZZY_THRESHOLD = 85.0       # 0-100 scale (rapidfuzz token_set_ratio)
+MANUAL_FUZZY_GAP_REQUIRED = 15.0    # best vs second-best gap for auto-match
+
+
+def _publisher_suggested_action(paper: Paper) -> str:
+    """Human hint for where the user should get this paper."""
+    pub = (paper.publisher or "").upper()
+    last = paper.last_failure_code or ""
+    hints = {
+        "ELSEVIER":        "Available via ScienceDirect — use the EZproxy link.",
+        "SPRINGER":        "Available via SpringerLink — use the EZproxy link.",
+        "WILEY":           "Available via Wiley Online Library — use the EZproxy link.",
+        "NATURE":          "Available via Nature.com — use the EZproxy link.",
+        "BMJ":             "Available via BMJ Journals — use the EZproxy link.",
+        "LANCET":          "Available via TheLancet.com — use the EZproxy link.",
+        "TAYLOR_FRANCIS":  "Available via Taylor & Francis Online — use the EZproxy link.",
+        "SAGE":            "Available via SAGE Journals — use the EZproxy link.",
+    }
+    base = hints.get(pub, "Use the DOI link or EZproxy-wrapped link above.")
+    if last == FailureCode.PAYWALL_DETECTED.value:
+        return base + " (Paywall detected earlier — institutional access required.)"
+    if last == FailureCode.NO_OA_SOURCE.value:
+        return base + " (No open-access copy available.)"
+    return base
+
+
+async def _read_pdf_text_first_pages(pdf_path: str, max_pages: int = 3) -> str:
+    """Best-effort first-N-pages text extraction for matching.
+
+    Returns empty string on failure. Used only for matching —
+    never logged or persisted.
+    """
+    try:
+        try:
+            import fitz
+            doc = fitz.open(pdf_path)
+            text = ""
+            for i in range(min(max_pages, len(doc))):
+                text += doc[i].get_text() + "\n"
+            doc.close()
+            return text
+        except ImportError:
+            from pypdf import PdfReader
+            reader = PdfReader(pdf_path)
+            text = ""
+            for i in range(min(max_pages, len(reader.pages))):
+                text += (reader.pages[i].extract_text() or "") + "\n"
+            return text
+    except Exception as exc:
+        logger.debug("Text extraction failed for %s: %s", pdf_path, exc)
+        return ""
+
+
+async def _match_dropped_file(pdf_path: str) -> Dict[str, Any]:
+    """Match a dropped PDF to a paper in the MANUAL_REQUIRED queue.
+
+    Strategy:
+        1. DOI in text → exact match
+        2. Fuzzy title via rapidfuzz.token_set_ratio, BUT only
+           auto-match when the top score >= 85 AND the gap to the
+           second-best score is >= 15 points (Concern 1 guard).
+        3. Narrow-gap or weak scores → return candidates for user
+           disambiguation.
+
+    Returns:
+        {
+            "matched": Paper | None,
+            "confidence": float (0-100),
+            "match_type": "doi" | "fuzzy" | "ambiguous" | "none",
+            "candidates": [{"canonical_id", "title", "first_author",
+                           "year", "score"}],
+            "reason": str  # human explanation
+        }
+    """
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+    if not papers:
+        return {"matched": None, "confidence": 0.0, "match_type": "none",
+                "candidates": [], "reason": "No papers in MANUAL_REQUIRED queue"}
+
+    text = await _read_pdf_text_first_pages(pdf_path, max_pages=3)
+    if not text:
+        return {"matched": None, "confidence": 0.0, "match_type": "none",
+                "candidates": [], "reason": "Could not extract text from PDF"}
+    text_lower = text.lower()
+
+    # 1. DOI match
+    for p in papers:
+        if p.doi and p.doi.lower() in text_lower:
+            return {"matched": p, "confidence": 100.0, "match_type": "doi",
+                    "candidates": [], "reason": "DOI matched in PDF text"}
+
+    # 2. Fuzzy title match
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return {"matched": None, "confidence": 0.0, "match_type": "none",
+                "candidates": [], "reason": "rapidfuzz not available"}
+
+    scores: List[tuple] = []
+    for p in papers:
+        title_norm = normalize_title(p.title or "")
+        if len(title_norm) < 10:
+            continue
+        s = float(fuzz.token_set_ratio(title_norm, text_lower))
+        scores.append((p, s))
+    scores.sort(key=lambda x: x[1], reverse=True)
+
+    if not scores or scores[0][1] < MANUAL_FUZZY_THRESHOLD:
+        return {"matched": None, "confidence": scores[0][1] if scores else 0.0,
+                "match_type": "none", "candidates": [],
+                "reason": f"No fuzzy match ≥ {MANUAL_FUZZY_THRESHOLD}"}
+
+    top_paper, top_score = scores[0]
+    second_score = scores[1][1] if len(scores) > 1 else 0.0
+    gap = top_score - second_score
+
+    if gap < MANUAL_FUZZY_GAP_REQUIRED:
+        # Ambiguous — surface candidates for user to pick
+        candidates = []
+        for p, s in scores[:5]:
+            if s < MANUAL_FUZZY_THRESHOLD:
+                break
+            candidates.append({
+                "canonical_id": p.canonical_id,
+                "title": p.title,
+                "first_author": p.first_author_lastname,
+                "year": p.year,
+                "doi": p.doi,
+                "score": round(s, 1),
+            })
+        return {"matched": None, "confidence": top_score,
+                "match_type": "ambiguous", "candidates": candidates,
+                "reason": (f"Top candidate scored {top_score:.1f}, "
+                           f"second {second_score:.1f} "
+                           f"(gap {gap:.1f} < {MANUAL_FUZZY_GAP_REQUIRED}) — "
+                           "please pick manually")}
+
+    # Clear winner
+    return {"matched": top_paper, "confidence": top_score,
+            "match_type": "fuzzy", "candidates": [],
+            "reason": f"Fuzzy title match: {top_score:.1f} (gap {gap:.1f})"}
+
+
+async def _install_and_validate_dropped(
+    paper: Paper,
+    dropped_path: str,
+    match_type: str,
+) -> Dict[str, Any]:
+    """Install a matched dropped file as the paper's PDF and validate.
+
+    Steps:
+        1. Atomic copy into output_directory with canonical filename
+        2. Update paper.pdf_path / sha256 / size
+        3. Walk the state machine MANUAL_REQUIRED → READY → RETRIEVING
+           → RETRIEVED → VALIDATING via the normal claim methods
+        4. Run engine.run_validation_pipeline (same 7 checks as
+           automatic retrieval — including FIX 3's page-location-
+           aware fuzzy check)
+        5. On VALID + un-flagged identity: transition VALIDATED →
+           COMPLETE, delete the dropped file
+        6. On INVALID or flagged identity: leave at VALIDATED (user
+           can override in Results) or FAILED; do NOT delete dropped
+           file so user can inspect
+
+    Returns a result dict for the watcher's status update.
+    """
+    import hashlib as _hashlib
+    import shutil as _shutil
+
+    db = _get_db()
+    engine = _get_engine()
+    config = _get_config()
+
+    # 1. Atomic copy
+    output_dir = os.path.abspath(
+        getattr(engine, "_output_dir", None) or
+        config.get("output_directory", "./downloads")
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    from full_text_acquisition.models import generate_filename as _gen_fn
+    filename = _gen_fn(paper.first_author_lastname, paper.year, paper.title or "manual")
+    final_path = os.path.join(output_dir, filename)
+
+    # Handle collisions — append _v{N}
+    if os.path.isfile(final_path):
+        base, ext = os.path.splitext(final_path)
+        v = 2
+        while os.path.isfile(f"{base}_v{v}{ext}"):
+            v += 1
+        final_path = f"{base}_v{v}{ext}"
+        filename = os.path.basename(final_path)
+
+    tmp_path = final_path + ".tmp"
+    try:
+        _shutil.copy2(dropped_path, tmp_path)
+        os.replace(tmp_path, final_path)
+    except OSError as exc:
+        if os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except OSError: pass
+        return {"outcome": "install_failed", "error": str(exc),
+                "paper": paper.canonical_id, "filename": None}
+
+    # Compute hash + size
+    with open(final_path, "rb") as fh:
+        content = fh.read()
+    sha = _hashlib.sha256(content).hexdigest()
+
+    await db.update_paper_fields(
+        paper.canonical_id,
+        pdf_path=final_path,
+        pdf_filename=filename,
+        sha256_checksum=sha,
+        pdf_size_bytes=len(content),
+        retrieval_tier="MANUAL",
+        retrieval_method=f"user_dropped_file_{match_type}",
+        retrieval_url=f"file://{os.path.abspath(dropped_path)}",
+    )
+
+    # 2. Walk state machine
+    run_id = f"manual-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    worker_id = "manual-watcher"
+
+    # MANUAL_REQUIRED → READY_FOR_RETRIEVAL
+    await db.reset_paper_for_retry(paper.canonical_id)
+    # READY → RETRIEVING
+    claimed = await db.claim_retrieval_task(paper.canonical_id, worker_id)
+    if not claimed:
+        return {"outcome": "claim_failed", "paper": paper.canonical_id,
+                "filename": filename}
+    # RETRIEVING → RETRIEVED
+    await db.transition_state(paper.canonical_id, PaperState.RETRIEVED.value,
+                              run_id=run_id)
+    # RETRIEVED → VALIDATING
+    await db.claim_validation_task(paper.canonical_id, worker_id)
+
+    # 3. Run validation pipeline
+    refreshed = await db.get_paper(paper.canonical_id)
+    if refreshed is None:
+        return {"outcome": "paper_vanished", "paper": paper.canonical_id,
+                "filename": filename}
+    try:
+        vstatus, istatus, score = await engine.run_validation_pipeline(
+            refreshed, run_id
+        )
+    except Exception as exc:
+        logger.error("Manual validation error: %s", exc)
+        vstatus, istatus, score = "INVALID", "CONTENT_UNVERIFIED", 0
+
+    # 4. Transition to terminal state
+    flagged = istatus in ("VERSION_MISMATCH", "CONTENT_UNVERIFIED",
+                          "TITLE_VERIFIED_WEAK")
+    if vstatus == "INVALID":
+        # VALIDATING → FAILED (terminal for this check, user can retry)
+        await db.transition_state(
+            paper.canonical_id, PaperState.FAILED.value,
+            failure_code=FailureCode.MANUAL_VALIDATION_FAILED.value,
+            run_id=run_id,
+        )
+        return {"outcome": "validation_failed",
+                "paper": paper.canonical_id, "filename": filename,
+                "validation_status": vstatus, "identity_status": istatus}
+
+    # VALIDATING → VALIDATED
+    await db.transition_state(paper.canonical_id, PaperState.VALIDATED.value,
+                              run_id=run_id)
+
+    if flagged:
+        # Leave at VALIDATED — user will resolve via Confirm/Re-retrieve
+        return {"outcome": "flagged",
+                "paper": paper.canonical_id, "filename": filename,
+                "validation_status": vstatus, "identity_status": istatus,
+                "score": score}
+
+    # COMPLETE
+    await db.transition_state(paper.canonical_id, PaperState.COMPLETE.value,
+                              run_id=run_id)
+
+    # Delete the dropped source file — we have it now under the canonical name
+    try:
+        if os.path.abspath(dropped_path) != os.path.abspath(final_path):
+            os.unlink(dropped_path)
+    except OSError as exc:
+        logger.debug("Could not remove dropped file %s: %s", dropped_path, exc)
+
+    return {"outcome": "complete",
+            "paper": paper.canonical_id, "filename": filename,
+            "validation_status": vstatus, "identity_status": istatus,
+            "score": score}
+
+
+async def _manual_mode_watcher(cancel_event: asyncio.Event) -> None:
+    """Background task: poll drop folder every 5s with stable-size
+    check, match to queue, install, validate.
+
+    File is only processed when its size has been unchanged across
+    MANUAL_FILE_STABLE_POLLS consecutive polls (~10s). This avoids
+    race conditions where the OS is still writing a large PDF.
+    """
+    status = app_state["manual_mode"]
+    observed: Dict[str, Dict[str, Any]] = {}  # path -> {size, mtime, stable_count}
+    processed_recently: Set[str] = set()      # paths we've already attempted
+    status["watcher_running"] = True
+
+    try:
+        while not cancel_event.is_set():
+            folder = (_get_config().get("manual_drop_folder") or "").strip()
+            status["drop_folder"] = folder
+            status["last_scan_at"] = datetime.now(timezone.utc).isoformat()
+
+            if folder and os.path.isdir(folder):
+                try:
+                    entries = os.listdir(folder)
+                except OSError:
+                    entries = []
+
+                current_paths = set()
+                for name in entries:
+                    if name.startswith(".") or not name.lower().endswith(".pdf"):
+                        continue
+                    full = os.path.join(folder, name)
+                    if not os.path.isfile(full):
+                        continue
+                    current_paths.add(full)
+
+                    if full in processed_recently:
+                        continue
+
+                    try:
+                        st = os.stat(full)
+                        key = (st.st_size, int(st.st_mtime))
+                    except OSError:
+                        continue
+
+                    prev = observed.get(full)
+                    if prev and prev["key"] == key:
+                        prev["stable_count"] += 1
+                        if prev["stable_count"] >= MANUAL_FILE_STABLE_POLLS:
+                            # File is stable — process it
+                            try:
+                                await _process_dropped_file(full)
+                            except Exception as exc:
+                                logger.error(
+                                    "Watcher error on %s: %s\n%s",
+                                    full, exc, traceback.format_exc(),
+                                )
+                            processed_recently.add(full)
+                    else:
+                        observed[full] = {"key": key, "stable_count": 0}
+
+                # Forget files that disappeared from the folder
+                stale = set(observed.keys()) - current_paths
+                for path in stale:
+                    observed.pop(path, None)
+                    processed_recently.discard(path)
+
+            try:
+                await asyncio.wait_for(
+                    cancel_event.wait(),
+                    timeout=MANUAL_WATCHER_POLL_INTERVAL_S,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        status["watcher_running"] = False
+        logger.info("Manual mode watcher stopped")
+
+
+async def _process_dropped_file(pdf_path: str) -> None:
+    """Match + (install+validate) a single dropped PDF."""
+    status = app_state["manual_mode"]
+    status["last_file_seen"] = os.path.basename(pdf_path)
+    status["last_file_seen_at"] = datetime.now(timezone.utc).isoformat()
+    db = _get_db()
+
+    match = await _match_dropped_file(pdf_path)
+
+    if match["match_type"] == "ambiguous":
+        status["pending_disambiguation"] = {
+            "file_path": pdf_path,
+            "file_name": os.path.basename(pdf_path),
+            "candidates": match["candidates"],
+        }
+        status["last_message"] = (
+            f"⚠ Ambiguous: {os.path.basename(pdf_path)} matches "
+            f"{len(match['candidates'])} candidates — pick one in the UI"
+        )
+        try:
+            await db.log_audit(AuditLogEntry(
+                outcome="MANUAL_DROP_AMBIGUOUS",
+                details=json.dumps({
+                    "file": os.path.basename(pdf_path),
+                    "candidates": match["candidates"],
+                }),
+            ))
+        except Exception: pass
+        return
+
+    if match["matched"] is None:
+        status["unmatched_count"] += 1
+        entry = {
+            "file_name": os.path.basename(pdf_path),
+            "file_path": pdf_path,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "reason": match.get("reason", "No match"),
+        }
+        status["unmatched_files"].append(entry)
+        # Keep list bounded
+        if len(status["unmatched_files"]) > 200:
+            status["unmatched_files"] = status["unmatched_files"][-200:]
+        status["last_message"] = (
+            f"⚠ No match: {os.path.basename(pdf_path)} — "
+            "please rename to include the DOI"
+        )
+        try:
+            await db.log_audit(AuditLogEntry(
+                outcome="MANUAL_DROP_UNMATCHED",
+                details=json.dumps(entry),
+            ))
+        except Exception: pass
+        return
+
+    # Matched — install + validate
+    paper = match["matched"]
+    result = await _install_and_validate_dropped(
+        paper, pdf_path, match["match_type"]
+    )
+    outcome = result.get("outcome")
+
+    try:
+        await db.log_audit(AuditLogEntry(
+            canonical_id=paper.canonical_id,
+            outcome=f"MANUAL_DROP_{outcome.upper()}",
+            details=json.dumps({
+                "file": os.path.basename(pdf_path),
+                "match_type": match["match_type"],
+                "confidence": match["confidence"],
+                **{k: v for k, v in result.items() if k not in ("paper",)},
+            }),
+        ))
+    except Exception: pass
+
+    if outcome == "complete":
+        status["matched_and_validated"] += 1
+        status["last_message"] = (
+            f"✓ {result.get('filename') or os.path.basename(pdf_path)} "
+            f"→ {paper.title[:50]} (VALID)"
+        )
+    elif outcome == "flagged":
+        status["matched_and_validated"] += 1
+        status["last_message"] = (
+            f"⚠ {os.path.basename(pdf_path)} → {paper.title[:50]} "
+            f"(flagged {result.get('identity_status')} — review in Results)"
+        )
+    else:
+        status["validation_failed"] += 1
+        reason = result.get("validation_status") or outcome
+        status["last_message"] = (
+            f"✗ {os.path.basename(pdf_path)} → {paper.title[:50]} "
+            f"failed: {reason}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/manual/start")
+async def manual_mode_start() -> JSONResponse:
+    """Start the drop-folder watcher.
+
+    Requires a configured manual_drop_folder. Idempotent — calling
+    twice is a no-op.
+    """
+    config = _get_config()
+    folder = (config.get("manual_drop_folder") or "").strip()
+    if not folder:
+        raise HTTPException(
+            status_code=400,
+            detail="manual_drop_folder is not set. Configure it in Settings.",
+        )
+
+    validation = _validate_output_path(folder)
+    if not validation["ok"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Drop folder invalid: {validation.get('error') or 'unknown'}",
+        )
+
+    status = app_state["manual_mode"]
+    if status.get("watcher_running"):
+        return JSONResponse({"status": "already_running",
+                             "drop_folder": status["drop_folder"]})
+
+    # Reset counters for a fresh session
+    status.update({
+        "enabled": True,
+        "drop_folder": validation["abs_path"],
+        "last_message": "Watcher started",
+        "matched_and_validated": 0,
+        "validation_failed": 0,
+        "unmatched_count": 0,
+        "unmatched_files": [],
+        "pending_disambiguation": None,
+    })
+
+    cancel = asyncio.Event()
+    task = asyncio.create_task(
+        _manual_mode_watcher(cancel),
+        name="manual-mode-watcher",
+    )
+    app_state["manual_cancel_event"] = cancel
+    app_state["manual_task"] = task
+
+    # Persist enabled state
+    config["manual_mode_enabled"] = True
+    save_config(config)
+
+    await _get_db().log_audit(AuditLogEntry(
+        outcome="MANUAL_MODE_STARTED",
+        details=json.dumps({"drop_folder": validation["abs_path"]}),
+    ))
+
+    return JSONResponse({"status": "started",
+                         "drop_folder": validation["abs_path"]})
+
+
+@app.post("/api/manual/stop")
+async def manual_mode_stop() -> JSONResponse:
+    """Stop the drop-folder watcher."""
+    status = app_state["manual_mode"]
+    cancel: Optional[asyncio.Event] = app_state.get("manual_cancel_event")
+    task: Optional[asyncio.Task] = app_state.get("manual_task")
+
+    if cancel:
+        cancel.set()
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try: await task
+            except (asyncio.CancelledError, Exception): pass
+
+    status["enabled"] = False
+    status["watcher_running"] = False
+    status["last_message"] = "Watcher stopped"
+    app_state["manual_task"] = None
+    app_state["manual_cancel_event"] = None
+
+    config = _get_config()
+    config["manual_mode_enabled"] = False
+    save_config(config)
+
+    await _get_db().log_audit(AuditLogEntry(
+        outcome="MANUAL_MODE_STOPPED",
+        details=json.dumps({
+            "matched": status.get("matched_and_validated", 0),
+            "failed": status.get("validation_failed", 0),
+            "unmatched": status.get("unmatched_count", 0),
+        }),
+    ))
+
+    return JSONResponse({"status": "stopped"})
+
+
+@app.get("/api/manual/status")
+async def manual_mode_status() -> JSONResponse:
+    """Full snapshot of Manual Mode state (heavier than the SSE slice)."""
+    status = dict(app_state.get("manual_mode") or {})
+    return JSONResponse(status)
+
+
+@app.get("/api/manual/queue")
+async def manual_mode_queue() -> JSONResponse:
+    """Enriched queue listing with publisher-aware suggested action."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+    prefix = _ezproxy_prefix()
+    items: List[Dict[str, Any]] = []
+    permanently = 0
+    for p in papers:
+        doi_url = f"https://doi.org/{p.doi}" if p.doi else None
+        ezproxy_url = f"{prefix}{doi_url}" if doi_url else None
+        is_unavail = p.user_override == "PERMANENTLY_UNAVAILABLE"
+        if is_unavail:
+            permanently += 1
+        items.append({
+            "canonical_id": p.canonical_id,
+            "title": p.title,
+            "first_author": p.first_author_lastname,
+            "year": p.year,
+            "journal": p.journal,
+            "doi": p.doi,
+            "doi_url": doi_url,
+            "ezproxy_url": ezproxy_url,
+            "publisher": p.publisher,
+            "last_failure_code": p.last_failure_code,
+            "suggested_action": _publisher_suggested_action(p),
+            "user_override": p.user_override,
+            "permanently_unavailable": is_unavail,
+        })
+    # Update gauge
+    app_state["manual_mode"]["permanently_unavailable"] = permanently
+    return JSONResponse({
+        "total": len(items),
+        "permanently_unavailable": permanently,
+        "proxy_prefix": prefix,
+        "papers": items,
+    })
+
+
+@app.get("/api/manual/queue.csv")
+async def manual_mode_queue_csv() -> FileResponse:
+    """CSV of the manual queue with EZproxy URLs for offline work."""
+    db = _get_db()
+    papers = await db.get_manual_required_papers()
+    prefix = _ezproxy_prefix()
+
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"manual_queue_{ts}.csv"
+    fpath = os.path.join(export_dir, fname)
+
+    with open(fpath, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow([
+            "canonical_id", "title", "first_author", "year", "journal",
+            "publisher", "doi", "doi_url", "ezproxy_url",
+            "last_failure_code", "suggested_action", "user_override",
+        ])
+        for p in papers:
+            doi_url = f"https://doi.org/{p.doi}" if p.doi else ""
+            w.writerow([
+                p.canonical_id, p.title, p.first_author_lastname,
+                p.year or "", p.journal or "", p.publisher,
+                p.doi or "", doi_url,
+                f"{prefix}{doi_url}" if doi_url else "",
+                p.last_failure_code or "",
+                _publisher_suggested_action(p),
+                p.user_override or "",
+            ])
+
+    return FileResponse(fpath, media_type="text/csv", filename=fname)
+
+
+@app.post("/api/manual/paper/{canonical_id}/mark-unobtainable")
+async def manual_mark_unobtainable(
+    canonical_id: str,
+    note: str = Query(default=""),
+) -> JSONResponse:
+    """Tag a paper as PERMANENTLY_UNAVAILABLE.
+
+    Keeps the paper in MANUAL_REQUIRED (so reviewers can still see
+    it in the queue and in PRISMA reports) but marks it so it's
+    visually distinguished and excluded from retry loops.
+    """
+    db = _get_db()
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.update_paper_fields(
+        canonical_id,
+        user_override="PERMANENTLY_UNAVAILABLE",
+        override_reason=note or "Marked as permanently unavailable",
+        override_timestamp=now_iso,
+        last_failure_code=FailureCode.PERMANENTLY_UNAVAILABLE.value,
+    )
+    await db.log_audit(AuditLogEntry(
+        canonical_id=canonical_id,
+        outcome="PERMANENTLY_UNAVAILABLE",
+        failure_code=FailureCode.PERMANENTLY_UNAVAILABLE.value,
+        details=json.dumps({"note": note or ""}),
+    ))
+    return JSONResponse({"status": "marked", "canonical_id": canonical_id})
+
+
+@app.post("/api/manual/assign")
+async def manual_mode_assign(
+    file_path: str = Query(...),
+    canonical_id: str = Query(...),
+) -> JSONResponse:
+    """User resolves an ambiguous match by picking a specific paper.
+
+    Takes a dropped file that the auto-matcher couldn't confidently
+    assign (narrow gap in fuzzy scores) and assigns it to the
+    specified paper, then runs install + validation.
+    """
+    status = app_state["manual_mode"]
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File no longer exists")
+
+    db = _get_db()
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if paper.state != PaperState.MANUAL_REQUIRED.value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Paper is in state {paper.state}, not MANUAL_REQUIRED",
+        )
+
+    result = await _install_and_validate_dropped(
+        paper, file_path, match_type="user_assigned"
+    )
+    # Clear pending disambiguation if this was the candidate
+    pd = status.get("pending_disambiguation") or {}
+    if pd.get("file_path") == file_path:
+        status["pending_disambiguation"] = None
+
+    outcome = result.get("outcome")
+    if outcome == "complete":
+        status["matched_and_validated"] += 1
+        status["last_message"] = f"✓ User-assigned: {os.path.basename(file_path)} → {paper.title[:40]}"
+    elif outcome == "flagged":
+        status["matched_and_validated"] += 1
+        status["last_message"] = f"⚠ User-assigned (flagged): {paper.title[:40]}"
+    else:
+        status["validation_failed"] += 1
+        status["last_message"] = f"✗ User-assigned failed: {outcome}"
+
+    return JSONResponse({"status": "processed", "outcome": outcome, **result})
+
+
+@app.post("/api/manual/discard-unmatched")
+async def manual_mode_discard_unmatched(
+    file_path: str = Query(...),
+) -> JSONResponse:
+    """Remove an unmatched file from the drop folder + the unmatched list."""
+    status = app_state["manual_mode"]
+    try:
+        if os.path.isfile(file_path):
+            os.unlink(file_path)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    status["unmatched_files"] = [
+        f for f in status.get("unmatched_files", [])
+        if f.get("file_path") != file_path
+    ]
+    return JSONResponse({"status": "discarded"})
+
+
+# ===========================================================================
 # CAPTCHA ENDPOINTS
 # ===========================================================================
 
@@ -2297,6 +3825,63 @@ async def get_papers(
         "limit": limit,
         "offset": offset,
     })
+
+
+@app.get("/api/pdf/{canonical_id}")
+async def serve_paper_pdf(canonical_id: str) -> FileResponse:
+    """Stream a paper's PDF inline so the browser renders it in a tab.
+
+    SECURITY: validates that the resolved file path is inside the
+    configured output_directory (path-traversal guard). If the database
+    ever held a path like /etc/passwd (e.g. via a future bug), this
+    endpoint refuses to serve it.
+
+    Returns 404 if the paper is unknown or has no PDF on disk.
+    Returns 403 if pdf_path resolves outside output_directory.
+    """
+    db = _get_db()
+    config = _get_config()
+
+    paper = await db.get_paper(canonical_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if not paper.pdf_path:
+        raise HTTPException(status_code=404, detail="No PDF for this paper")
+
+    # Path-traversal guard
+    output_dir = os.path.abspath(
+        config.get("output_directory", "./downloads")
+    )
+    pdf_abs = os.path.abspath(paper.pdf_path)
+
+    try:
+        common = os.path.commonpath([output_dir, pdf_abs])
+    except ValueError:
+        # Different drives on Windows etc.
+        common = ""
+    if common != output_dir:
+        logger.warning(
+            "Refusing to serve PDF outside output_directory: "
+            "canonical_id=%s pdf_path=%s output_dir=%s",
+            canonical_id, paper.pdf_path, output_dir,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="PDF path is outside the configured output directory",
+        )
+
+    if not os.path.isfile(pdf_abs):
+        raise HTTPException(status_code=404, detail="PDF file missing on disk")
+
+    # FileResponse streams the file; inline disposition makes the browser
+    # render it in the tab rather than offering download
+    filename = paper.pdf_filename or os.path.basename(pdf_abs)
+    return FileResponse(
+        pdf_abs,
+        media_type="application/pdf",
+        filename=filename,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
 
 
 @app.get("/api/paper/{canonical_id}")
@@ -2596,7 +4181,11 @@ async def export_bundle(
     )
     os.makedirs(export_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    bundle_filename = f"submission_bundle_{run_id}_{timestamp}.zip"
+    # Include project slug so bundles from different projects are
+    # immediately distinguishable when collected in a drop folder.
+    current_proj = app_state.get("current_project") or {}
+    proj_slug = current_proj.get("project_slug") or "project"
+    bundle_filename = f"{proj_slug}_submission_bundle_{run_id}_{timestamp}.zip"
     bundle_path = os.path.join(export_dir, bundle_filename)
 
     # Gather data
@@ -2856,6 +4445,168 @@ def _build_bundle_readme(
         "",
     ]
     return "\n".join(lines)
+
+
+# ===========================================================================
+# FILESYSTEM VALIDATION
+# ===========================================================================
+
+# Belt-and-suspenders blocklist. The REAL test is the probe-write below;
+# this just labels system-y paths so the UI can warn even if the path
+# happens to be writable as root.
+SYSTEM_PATH_PREFIXES_POSIX: List[str] = [
+    "/etc", "/usr", "/bin", "/sbin", "/sys", "/proc", "/dev",
+    "/var", "/opt", "/boot", "/root",
+    "/Library", "/System", "/Applications", "/private",
+]
+
+SYSTEM_PATH_PREFIXES_WINDOWS: List[str] = [
+    r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)",
+    r"C:\ProgramData", r"C:\Users\Default",
+]
+
+
+def _is_system_path(real_path: str) -> bool:
+    """Return True if real_path is inside a known OS-managed directory.
+
+    Uses path-prefix matching after realpath resolution. Case-insensitive
+    on Windows-style paths.
+    """
+    if not real_path:
+        return False
+
+    # POSIX
+    norm = os.path.normpath(real_path)
+    for prefix in SYSTEM_PATH_PREFIXES_POSIX:
+        if norm == prefix or norm.startswith(prefix + os.sep):
+            return True
+
+    # Windows
+    norm_lower = norm.lower()
+    for prefix in SYSTEM_PATH_PREFIXES_WINDOWS:
+        p_lower = prefix.lower()
+        if norm_lower == p_lower or norm_lower.startswith(p_lower + os.sep) \
+                or norm_lower.startswith(p_lower + "/"):
+            return True
+    return False
+
+
+def _human_bytes(b: int) -> str:
+    """Pretty-print byte counts."""
+    if not b or b <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024.0:
+            return f"{b:.1f} {unit}"
+        b /= 1024.0
+    return f"{b:.1f} PB"
+
+
+def _validate_output_path(raw_path: str) -> Dict[str, Any]:
+    """Validate a candidate output_directory.
+
+    Steps:
+      1. Expand ~ and resolve to absolute path
+      2. Resolve symlinks via os.path.realpath
+      3. Check against system-path blocklist (warn, but do not auto-fail —
+         labelled in the response so UI can decide)
+      4. If path doesn't exist, check that the closest existing ancestor
+         is writable (so we can mkdir)
+      5. If path exists, attempt a probe-write of a tiny file and delete
+         it immediately
+      6. Compute free disk space at the resolved location
+      7. Return structured result
+
+    Returns a dict with at minimum:
+        ok           bool   — overall verdict (writable AND not system)
+        abs_path     str    — input expanded + made absolute
+        real_path    str    — symlinks resolved
+        exists       bool
+        writable     bool   — actually verified by probe-write
+        system_path  bool   — labelled by blocklist
+        free_bytes   int
+        free_human   str
+        error        str | None — human-readable explanation if !ok
+    """
+    result: Dict[str, Any] = {
+        "ok": False, "abs_path": "", "real_path": "",
+        "exists": False, "writable": False, "system_path": False,
+        "free_bytes": 0, "free_human": "0 B", "error": None,
+    }
+    if not raw_path or not raw_path.strip():
+        result["error"] = "Path is empty"
+        return result
+
+    try:
+        expanded = os.path.expanduser(raw_path.strip())
+        abs_path = os.path.abspath(expanded)
+        real_path = os.path.realpath(abs_path)
+    except (OSError, ValueError) as exc:
+        result["error"] = f"Cannot resolve path: {exc}"
+        return result
+
+    result["abs_path"] = abs_path
+    result["real_path"] = real_path
+    result["system_path"] = _is_system_path(real_path)
+
+    if result["system_path"]:
+        result["error"] = "Path is inside a system-managed directory"
+        return result
+
+    # Find the deepest existing ancestor — that's where mkdir-ability matters
+    exists = os.path.exists(real_path)
+    result["exists"] = exists
+    probe_dir = real_path if exists else os.path.dirname(real_path)
+    while probe_dir and not os.path.exists(probe_dir):
+        parent = os.path.dirname(probe_dir)
+        if parent == probe_dir:
+            break
+        probe_dir = parent
+
+    if not probe_dir or not os.path.exists(probe_dir):
+        result["error"] = "No writable ancestor directory exists"
+        return result
+
+    # Probe-write — the only authoritative writability test
+    probe_name = f".permcheck_{uuid.uuid4().hex[:12]}"
+    probe_path = os.path.join(probe_dir, probe_name)
+    try:
+        with open(probe_path, "w") as fh:
+            fh.write("ok")
+        result["writable"] = True
+    except (OSError, PermissionError) as exc:
+        result["error"] = f"Probe write failed: {exc}"
+        result["writable"] = False
+    finally:
+        try:
+            if os.path.exists(probe_path):
+                os.unlink(probe_path)
+        except OSError:
+            pass
+
+    # Free disk space at the deepest existing ancestor
+    try:
+        usage = shutil.disk_usage(probe_dir)
+        result["free_bytes"] = usage.free
+        result["free_human"] = _human_bytes(usage.free)
+    except (OSError, AttributeError):
+        pass
+
+    result["ok"] = result["writable"] and not result["system_path"]
+    return result
+
+
+@app.post("/api/fs/check-path")
+async def check_output_path(
+    path: str = Query(..., description="Candidate output directory path"),
+) -> JSONResponse:
+    """Validate an output_directory candidate.
+
+    Used by the live validator next to the path inputs in Settings and
+    the per-batch override on Upload. Cheap (write+delete a single
+    byte) but synchronous — clients should debounce calls.
+    """
+    return JSONResponse(_validate_output_path(path))
 
 
 # ===========================================================================
@@ -3142,6 +4893,31 @@ async def _build_stream_snapshot() -> Dict[str, Any]:
         "last_message": sso.get("last_message", ""),
         "session_expired": bool(sso.get("session_expired")),
     }
+
+    # Current project (per-project isolation)
+    cp = app_state.get("current_project") or {}
+    payload["current_project"] = {
+        "project_id": cp.get("project_id"),
+        "project_name": cp.get("project_name"),
+        "project_slug": cp.get("project_slug"),
+    }
+
+    # Manual Orchestration Mode — drop-folder watcher progress
+    mm = app_state.get("manual_mode") or {}
+    payload["manual_mode"] = {
+        "enabled": bool(mm.get("enabled")),
+        "drop_folder": mm.get("drop_folder", ""),
+        "watcher_running": bool(mm.get("watcher_running")),
+        "last_scan_at": mm.get("last_scan_at"),
+        "last_file_seen": mm.get("last_file_seen"),
+        "last_file_seen_at": mm.get("last_file_seen_at"),
+        "last_message": mm.get("last_message", ""),
+        "matched_and_validated": mm.get("matched_and_validated", 0),
+        "validation_failed": mm.get("validation_failed", 0),
+        "unmatched_count": mm.get("unmatched_count", 0),
+        "permanently_unavailable": mm.get("permanently_unavailable", 0),
+        "pending_disambiguation": bool(mm.get("pending_disambiguation")),
+    }
     return payload
 
 
@@ -3224,6 +5000,629 @@ async def health_snapshot() -> JSONResponse:
 
 
 # ===========================================================================
+# BACKUP & RESTORE — per-project, SQLite backup API
+# ===========================================================================
+#
+# Uses stdlib sqlite3.Connection.backup() (NOT file copy) so manual
+# backups are consistent even while writers are active. Restore is a
+# teardown + overwrite + rebuild operation analogous to project switch;
+# requires quiescent state.
+
+BACKUP_KIND_MANUAL = "manual"
+BACKUP_KIND_AUTO = "auto"
+BACKUP_KIND_SAFETY = "safety"
+_AUTO_BACKUP_KEEP = 5
+_BACKUP_STALE_DAYS = 7
+
+
+def _project_backups_dir(slug: str, kind: str) -> str:
+    return os.path.join(_project_dir(slug), "backups", kind)
+
+
+def _ensure_backup_dirs(slug: str) -> None:
+    for kind in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        os.makedirs(_project_backups_dir(slug, kind), exist_ok=True)
+
+
+def _sqlite_backup_sync(source_path: str, target_path: str) -> None:
+    """Blocking SQLite backup — run in executor.
+
+    Opens a SEPARATE sqlite3 connection to the source file so we don't
+    interfere with the aiosqlite write queue. In WAL mode, the backup
+    API proceeds without blocking the writer.
+    """
+    import sqlite3 as _sqlite3
+    src = _sqlite3.connect(source_path)
+    try:
+        dst = _sqlite3.connect(target_path)
+        try:
+            # pages=500 keeps each lock window short under heavy write load
+            src.backup(dst, pages=500)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+def _sqlite_read_counts_sync(db_path: str) -> Dict[str, int]:
+    """Synchronously read paper/run/complete counts from an arbitrary DB."""
+    import sqlite3 as _sqlite3
+    counts = {"paper_count": 0, "run_count": 0, "complete_count": 0}
+    try:
+        conn = _sqlite3.connect(db_path)
+        try:
+            try:
+                counts["paper_count"] = conn.execute(
+                    "SELECT COUNT(*) FROM papers"
+                ).fetchone()[0]
+            except _sqlite3.OperationalError: pass
+            try:
+                counts["run_count"] = conn.execute(
+                    "SELECT COUNT(*) FROM runs"
+                ).fetchone()[0]
+            except _sqlite3.OperationalError: pass
+            try:
+                counts["complete_count"] = conn.execute(
+                    "SELECT COUNT(*) FROM papers WHERE state = 'COMPLETE'"
+                ).fetchone()[0]
+            except _sqlite3.OperationalError: pass
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Read counts failed for %s: %s", db_path, exc)
+    return counts
+
+
+async def _create_backup(
+    slug: str,
+    kind: str = BACKUP_KIND_MANUAL,
+) -> Dict[str, Any]:
+    """Create a backup + write metadata sidecar. Safe during active workers."""
+    if kind not in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        raise ValueError(f"Invalid backup kind: {kind}")
+
+    _ensure_backup_dirs(slug)
+    src_db = _project_db_path(slug)
+    if not os.path.isfile(src_db):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Project DB does not exist yet: {src_db}",
+        )
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    fname = f"acquisition_backup_{ts}_{suffix}.db"
+    target = os.path.join(_project_backups_dir(slug, kind), fname)
+
+    # Flush live write queue so recent ops are on disk before backup
+    db = app_state.get("db")
+    cp = app_state.get("current_project") or {}
+    if db is not None and cp.get("project_slug") == slug:
+        try:
+            await db.flush_write_queue()
+        except Exception: pass
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, _sqlite_backup_sync, src_db, target)
+    except Exception as exc:
+        try:
+            if os.path.exists(target): os.unlink(target)
+        except OSError: pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"SQLite backup failed: {exc}",
+        )
+
+    counts = await loop.run_in_executor(None, _sqlite_read_counts_sync, target)
+    size_bytes = os.path.getsize(target)
+    meta = {
+        "kind": kind,
+        "filename": fname,
+        "path": target,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "size_bytes": size_bytes,
+        "size_human": _human_bytes(size_bytes),
+        **counts,
+    }
+    with open(target + ".meta.json", "w") as fh:
+        json.dump(meta, fh, indent=2)
+
+    try:
+        if db is not None:
+            await db.log_audit(AuditLogEntry(
+                outcome=f"BACKUP_{kind.upper()}",
+                details=json.dumps({
+                    "filename": fname,
+                    "size_bytes": size_bytes,
+                    **counts,
+                }),
+            ))
+    except Exception: pass
+
+    logger.info(
+        "Created %s backup for project %s: %s (%d bytes)",
+        kind, slug, fname, size_bytes,
+    )
+    return meta
+
+
+def _read_backup_meta(backup_path: str) -> Dict[str, Any]:
+    """Read sidecar metadata; fall back to os.stat if absent."""
+    meta_path = backup_path + ".meta.json"
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r") as fh:
+                data = json.load(fh)
+            try: data["size_bytes"] = os.path.getsize(backup_path)
+            except OSError: pass
+            data["size_human"] = _human_bytes(data.get("size_bytes", 0))
+            return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    try:
+        st = os.stat(backup_path)
+        return {
+            "kind": "unknown",
+            "filename": os.path.basename(backup_path),
+            "path": backup_path,
+            "created_at": datetime.fromtimestamp(
+                st.st_mtime, tz=timezone.utc
+            ).isoformat(),
+            "size_bytes": st.st_size,
+            "size_human": _human_bytes(st.st_size),
+            "paper_count": None, "run_count": None, "complete_count": None,
+        }
+    except OSError:
+        return {}
+
+
+def _list_backups_for_project(slug: str) -> Dict[str, List[Dict[str, Any]]]:
+    """List backups by kind via sidecar metadata only — no DB opens."""
+    _ensure_backup_dirs(slug)
+    out: Dict[str, List[Dict[str, Any]]] = {
+        BACKUP_KIND_MANUAL: [], BACKUP_KIND_AUTO: [], BACKUP_KIND_SAFETY: [],
+    }
+    for kind in out.keys():
+        d = _project_backups_dir(slug, kind)
+        if not os.path.isdir(d): continue
+        for name in os.listdir(d):
+            if not name.endswith(".db"): continue
+            meta = _read_backup_meta(os.path.join(d, name))
+            if meta: out[kind].append(meta)
+        out[kind].sort(key=lambda m: m.get("created_at", ""), reverse=True)
+    return out
+
+
+def _rotate_auto_backups(slug: str, keep: int = _AUTO_BACKUP_KEEP) -> int:
+    """Delete oldest auto backups beyond the keep limit."""
+    d = _project_backups_dir(slug, BACKUP_KIND_AUTO)
+    if not os.path.isdir(d): return 0
+    entries: List[tuple] = []
+    for name in os.listdir(d):
+        if not name.endswith(".db"): continue
+        full = os.path.join(d, name)
+        try: entries.append((os.path.getmtime(full), full))
+        except OSError: continue
+    entries.sort(reverse=True)  # newest first
+
+    deleted = 0
+    for _mtime, full in entries[keep:]:
+        try: os.unlink(full); deleted += 1
+        except OSError: continue
+        meta_path = full + ".meta.json"
+        try:
+            if os.path.isfile(meta_path): os.unlink(meta_path)
+        except OSError: pass
+    if deleted:
+        logger.info("Rotated %d old auto backups for project %s", deleted, slug)
+    return deleted
+
+
+def _last_backup_info(slug: str) -> Dict[str, Any]:
+    """Summary for UI: last backup + stale flag."""
+    groups = _list_backups_for_project(slug)
+    candidates: List[Dict[str, Any]] = []
+    for k in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO):
+        candidates.extend(groups[k])
+    if not candidates:
+        return {
+            "any_backup_exists": False, "stale": True,
+            "last_backup_at": None, "last_backup_age_days": None,
+            "last_backup_size_bytes": 0,
+            "last_backup_filename": None, "last_backup_kind": None,
+        }
+    candidates.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+    latest = candidates[0]
+    try:
+        created = datetime.fromisoformat(latest["created_at"])
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - created).total_seconds() / 86400.0
+    except (ValueError, TypeError):
+        age_days = None
+    return {
+        "any_backup_exists": True,
+        "stale": age_days is None or age_days > _BACKUP_STALE_DAYS,
+        "last_backup_at": latest.get("created_at"),
+        "last_backup_age_days": round(age_days, 2) if age_days is not None else None,
+        "last_backup_size_bytes": latest.get("size_bytes", 0),
+        "last_backup_filename": latest.get("filename"),
+        "last_backup_kind": latest.get("kind"),
+    }
+
+
+async def _restore_database_from_backup(
+    slug: str, filename: str,
+) -> Dict[str, Any]:
+    """Restore the project's DB from a backup file.
+
+    CALLERS MUST have verified _check_busy_reasons() == [].
+    Sequence:
+      1. Locate backup + verify path stays inside project backups/
+      2. Flush + close current DB
+      3. Safety backup of current DB (kind=safety)
+      4. Delete -wal and -shm sidecars (CRITICAL)
+      5. Copy backup -> acquisition.db
+      6. Rebind project (reopens DB, migrations, reconciliation)
+    """
+    import shutil as _shutil
+
+    project_backup_root = os.path.abspath(
+        os.path.join(_project_dir(slug), "backups")
+    )
+    candidate: Optional[str] = None
+    for kind in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        p = os.path.join(_project_backups_dir(slug, kind), filename)
+        if os.path.isfile(p):
+            candidate = p
+            break
+    if candidate is None:
+        raise HTTPException(
+            status_code=404, detail=f"Backup not found: {filename}",
+        )
+    # Defense in depth: ensure candidate stays inside project_backup_root
+    if os.path.commonpath([
+        os.path.abspath(candidate), project_backup_root,
+    ]) != project_backup_root:
+        raise HTTPException(
+            status_code=403, detail="Backup path escapes project directory",
+        )
+
+    current_db = app_state.get("db")
+    if current_db is not None:
+        try:
+            await current_db.flush_write_queue()
+            await current_db.close()
+        except Exception as exc:
+            logger.warning("Error closing DB before restore: %s", exc)
+
+    src_db = _project_db_path(slug)
+    safety_info: Optional[Dict[str, Any]] = None
+    if os.path.isfile(src_db):
+        try:
+            safety_info = await _create_backup(slug, kind=BACKUP_KIND_SAFETY)
+        except Exception as exc:
+            logger.error("Safety backup failed: %s — aborting restore", exc)
+            # Try to restore app to a working state
+            try: await _rebind_to_project(slug)
+            except Exception: pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"Safety backup failed, restore aborted: {exc}",
+            )
+
+    # CRITICAL: delete WAL/SHM sidecars before overwriting
+    for sidecar in (src_db + "-wal", src_db + "-shm"):
+        try:
+            if os.path.isfile(sidecar):
+                os.unlink(sidecar)
+                logger.info("Removed stale sidecar: %s", sidecar)
+        except OSError as exc:
+            logger.warning("Could not remove sidecar %s: %s", sidecar, exc)
+
+    tmp_path = src_db + ".restoring"
+    try:
+        _shutil.copy2(candidate, tmp_path)
+        os.replace(tmp_path, src_db)
+    except OSError as exc:
+        # Attempt rollback from safety
+        if safety_info and os.path.isfile(safety_info["path"]):
+            try:
+                _shutil.copy2(safety_info["path"], src_db)
+            except OSError: pass
+        try:
+            if os.path.exists(tmp_path): os.unlink(tmp_path)
+        except OSError: pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Restore copy failed: {exc}",
+        )
+
+    try:
+        await _rebind_to_project(slug)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"DB restored but rebind failed: {exc}",
+        )
+
+    return {
+        "status": "restored",
+        "restored_from": filename,
+        "backup_meta": _read_backup_meta(candidate),
+        "safety_backup_filename": (safety_info or {}).get("filename"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+def _current_project_slug_or_404() -> str:
+    cp = app_state.get("current_project") or {}
+    slug = cp.get("project_slug")
+    if not slug:
+        raise HTTPException(status_code=503, detail="No active project")
+    return slug
+
+
+@app.post("/api/backup")
+async def backup_create() -> JSONResponse:
+    """Manual backup of the current project's DB.
+
+    Safe during active workers (SQLite backup API on a separate
+    connection). Writes a sidecar .meta.json for cheap listing.
+    """
+    slug = _current_project_slug_or_404()
+    meta = await _create_backup(slug, kind=BACKUP_KIND_MANUAL)
+    return JSONResponse({"status": "created", **meta})
+
+
+@app.get("/api/backup/list")
+async def backup_list() -> JSONResponse:
+    """List backups grouped by kind. Reads sidecar metadata only."""
+    slug = _current_project_slug_or_404()
+    groups = _list_backups_for_project(slug)
+    return JSONResponse({
+        "manual": groups[BACKUP_KIND_MANUAL],
+        "auto": groups[BACKUP_KIND_AUTO],
+        "safety": groups[BACKUP_KIND_SAFETY],
+        "last_backup": _last_backup_info(slug),
+        "auto_keep_limit": _AUTO_BACKUP_KEEP,
+        "stale_after_days": _BACKUP_STALE_DAYS,
+    })
+
+
+@app.post("/api/backup/restore")
+async def backup_restore(filename: str = Query(...)) -> JSONResponse:
+    """Restore current project's DB from a backup. Refuses while busy."""
+    slug = _current_project_slug_or_404()
+    busy = _check_busy_reasons()
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Cannot restore while tasks are active",
+                "active": busy,
+                "guidance": "Stop running tasks, then retry restore.",
+            },
+        )
+    return JSONResponse(await _restore_database_from_backup(slug, filename))
+
+
+@app.delete("/api/backup/{filename}")
+async def backup_delete(filename: str) -> JSONResponse:
+    """Delete a specific backup + its metadata sidecar."""
+    slug = _current_project_slug_or_404()
+    project_backup_root = os.path.abspath(
+        os.path.join(_project_dir(slug), "backups")
+    )
+    target: Optional[str] = None
+    for kind in (BACKUP_KIND_MANUAL, BACKUP_KIND_AUTO, BACKUP_KIND_SAFETY):
+        p = os.path.join(_project_backups_dir(slug, kind), filename)
+        if os.path.isfile(p):
+            if os.path.commonpath([
+                os.path.abspath(p), project_backup_root,
+            ]) != project_backup_root:
+                raise HTTPException(403, "Path escapes project directory")
+            target = p
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    try:
+        os.unlink(target)
+        mp = target + ".meta.json"
+        if os.path.isfile(mp): os.unlink(mp)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return JSONResponse({"status": "deleted", "filename": filename})
+
+
+# ===========================================================================
+# PROJECTS ENDPOINTS — per-project isolation
+# ===========================================================================
+
+
+@app.get("/api/projects")
+async def list_projects() -> JSONResponse:
+    """List every project + which one is current."""
+    manifest = _load_projects_manifest()
+    current = manifest.get("current_project_slug")
+    items: List[Dict[str, Any]] = []
+    for p in manifest.get("projects", []):
+        items.append({
+            **p,
+            "is_current": p.get("project_slug") == current,
+            "db_path": _project_db_path(p["project_slug"]),
+            "output_dir": _project_output_dir(p["project_slug"]),
+        })
+    # Sort: current first, then by created_at
+    items.sort(key=lambda x: (not x["is_current"], x.get("created_at", "")))
+    return JSONResponse({
+        "projects": items,
+        "current_slug": current,
+        "migration_notice": app_state.get("migration_notice") or {},
+    })
+
+
+@app.post("/api/projects")
+async def create_project(body: "ProjectCreate") -> JSONResponse:
+    """Create a new project: fresh slug, directory tree, empty DB with schema."""
+    from full_text_acquisition.models import ProjectCreate as _PC
+    # Validate via Pydantic (body already enforced by FastAPI, but be defensive)
+    name = (body.project_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="project_name is required")
+
+    manifest = _load_projects_manifest()
+    existing_slugs = {p.get("project_slug") for p in manifest.get("projects", [])}
+    slug = _slugify_project_name(name, existing_slugs)
+
+    # Create directory tree
+    os.makedirs(_project_dir(slug), exist_ok=True)
+    os.makedirs(_project_output_dir(slug), exist_ok=True)
+    os.makedirs(_project_supplement_dir(slug), exist_ok=True)
+    _save_project_config_overlay(slug, {})  # empty overlay — inherits all
+
+    # Initialize empty SQLite DB with full schema
+    try:
+        new_db = Database(_project_db_path(slug))
+        await new_db.initialize()
+        await new_db.close()
+    except Exception as exc:
+        # Roll back directory creation on DB init failure
+        import shutil as _shutil
+        try: _shutil.rmtree(_project_dir(slug))
+        except OSError: pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initialize project DB: {exc}",
+        )
+
+    project = {
+        "project_id": str(uuid.uuid4()),
+        "project_name": name,
+        "project_slug": slug,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    manifest.setdefault("projects", []).append(project)
+    _save_projects_manifest(manifest)
+
+    return JSONResponse({
+        **project,
+        "is_current": False,
+        "db_path": _project_db_path(slug),
+        "output_dir": _project_output_dir(slug),
+    })
+
+
+@app.post("/api/projects/activate")
+async def activate_project(slug: str = Query(...)) -> JSONResponse:
+    """Switch to a different project.
+
+    Refuses with 409 if any background task is active (retrieval run,
+    enrichment, SSO session, or Manual Mode watcher) — user must stop
+    those first to avoid data corruption.
+    """
+    manifest = _load_projects_manifest()
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+
+    if slug == manifest.get("current_project_slug"):
+        return JSONResponse({
+            "status": "already_current",
+            "current": dict(project),
+        })
+
+    busy = _check_busy_reasons()
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Cannot switch projects while any of these are running",
+                "active": busy,
+                "guidance": "Stop each task from its own panel, then try again.",
+            },
+        )
+
+    new_project = await _rebind_to_project(slug)
+    return JSONResponse({
+        "status": "switched",
+        "current": new_project,
+    })
+
+
+@app.put("/api/projects/{slug}")
+async def rename_project(
+    slug: str,
+    body: "ProjectCreate",
+) -> JSONResponse:
+    """Rename a project's DISPLAY NAME. Slug never changes (immutable path)."""
+    name = (body.project_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="project_name is required")
+
+    manifest = _load_projects_manifest()
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project["project_name"] = name
+    _save_projects_manifest(manifest)
+
+    if slug == manifest.get("current_project_slug"):
+        app_state["current_project"] = dict(project)
+
+    return JSONResponse({
+        **project,
+        "is_current": slug == manifest.get("current_project_slug"),
+    })
+
+
+@app.delete("/api/projects/{slug}")
+async def delete_project(slug: str) -> JSONResponse:
+    """Delete a project (directory + DB). Refuses on current project.
+
+    DESTRUCTIVE: this wipes the project's entire data. Frontend must
+    confirm before calling this.
+    """
+    manifest = _load_projects_manifest()
+    current = manifest.get("current_project_slug")
+    project = _find_project(manifest, slug)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if slug == current:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete the current project — switch to another first.",
+        )
+    if slug == DEFAULT_PROJECT_SLUG:
+        raise HTTPException(
+            status_code=409,
+            detail="The Default project cannot be deleted.",
+        )
+
+    pdir = _project_dir(slug)
+    import shutil as _shutil
+    if os.path.isdir(pdir):
+        try:
+            _shutil.rmtree(pdir)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"rmtree failed: {exc}")
+
+    manifest["projects"] = [
+        p for p in manifest.get("projects", [])
+        if p.get("project_slug") != slug
+    ]
+    _save_projects_manifest(manifest)
+
+    return JSONResponse({"status": "deleted", "slug": slug})
+
+
+# ===========================================================================
 # STATIC FILE SERVING & UI
 # ===========================================================================
 
@@ -3250,6 +5649,32 @@ async def system_status() -> JSONResponse:
     """Overall system status for the UI to check on load."""
     wp = app_state.get("worker_pool")
     wizard: Optional[WizardResult] = app_state.get("wizard_result")
+    config = _get_config()
+    engine = app_state.get("engine")
+
+    # Resolve the currently-active output directory:
+    # - If a run is in progress with an override, the engine's
+    #   _output_dir reflects it.
+    # - Otherwise, fall back to the configured default.
+    if engine is not None and getattr(engine, "_output_dir", None):
+        active_output = os.path.abspath(engine._output_dir)
+    else:
+        active_output = os.path.abspath(
+            config.get("output_directory", "./downloads")
+        )
+
+    free_bytes = 0
+    try:
+        # Probe the deepest existing ancestor for free-space figure
+        probe = active_output
+        while probe and not os.path.exists(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe: break
+            probe = parent
+        if probe and os.path.exists(probe):
+            free_bytes = shutil.disk_usage(probe).free
+    except (OSError, AttributeError):
+        pass
 
     return JSONResponse({
         "initialized": app_state.get("db") is not None,
@@ -3263,7 +5688,28 @@ async def system_status() -> JSONResponse:
         "wizard_errors": wizard.errors if wizard else [],
         "ocr_mode": wizard.ocr_mode if wizard else "disabled",
         "platform": platform.system(),
+        "output_directory": active_output,
+        "output_directory_free_bytes": free_bytes,
+        "backup": _safe_backup_summary(),
     })
+
+
+def _safe_backup_summary() -> Dict[str, Any]:
+    """Helper: last-backup info for the current project, tolerating no-project."""
+    cp = app_state.get("current_project") or {}
+    slug = cp.get("project_slug")
+    if not slug:
+        return {"any_backup_exists": False, "stale": True,
+                "last_backup_at": None, "last_backup_age_days": None,
+                "last_backup_size_bytes": 0,
+                "last_backup_filename": None, "last_backup_kind": None}
+    try:
+        return _last_backup_info(slug)
+    except Exception:
+        return {"any_backup_exists": False, "stale": True,
+                "last_backup_at": None, "last_backup_age_days": None,
+                "last_backup_size_bytes": 0,
+                "last_backup_filename": None, "last_backup_kind": None}
 
 
 # ===========================================================================

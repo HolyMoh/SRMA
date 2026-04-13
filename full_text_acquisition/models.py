@@ -268,6 +268,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "institutional_resolver_url": "",
     "scholar_min_delay_s": SCHOLAR_MIN_DELAY_S,
     "scholar_max_queries_per_paper": SCHOLAR_MAX_QUERIES_PER_PAPER,
+    # Manual Orchestration Mode — user controls downloads entirely.
+    # When enabled, the system never opens a browser or touches
+    # credentials; instead it watches manual_drop_folder for PDFs
+    # the user downloads themselves.
+    "manual_mode_enabled": False,
+    "manual_drop_folder": "",
 }
 
 
@@ -356,6 +362,8 @@ class FailureCode(str, enum.Enum):
     REUSED = "REUSED"
     PUBLISHER_COOLDOWN_ACTIVE = "PUBLISHER_COOLDOWN_ACTIVE"
     COOLDOWN_EXTENDED = "COOLDOWN_EXTENDED"
+    PERMANENTLY_UNAVAILABLE = "PERMANENTLY_UNAVAILABLE"
+    MANUAL_VALIDATION_FAILED = "MANUAL_VALIDATION_FAILED"
 
 
 class ValidationStatus(str, enum.Enum):
@@ -654,6 +662,25 @@ class ApiCacheEntry:
 
 
 @dataclass
+class ProjectRecord:
+    """Per-project isolation record (filesystem-backed, not in SQLite).
+
+    Each project has its own SQLite database, output directory, and
+    config overlay. project_slug is the filesystem-safe identifier;
+    project_name is the user-facing display name (may contain spaces,
+    unicode, punctuation). project_id is a stable UUID.
+    """
+
+    project_id: str
+    project_name: str
+    project_slug: str
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class SupplementFile:
     """Metadata for a downloaded supplement file."""
 
@@ -808,6 +835,33 @@ class UploadResponse(BaseModel):
     enrichment_result: Optional[EnrichmentResult] = None
     already_retrieved_count: int = 0
     ready_for_retrieval_count: int = 0
+    output_directory: str = Field(
+        default="",
+        description="Resolved absolute output directory used for THIS run "
+                    "(reflects per-batch override if one was supplied)",
+    )
+
+
+class ProjectCreate(BaseModel):
+    """Request body for creating or renaming a project.
+
+    project_name is user-supplied display text; the filesystem slug
+    is derived server-side by sanitization + UUID suffix.
+    """
+
+    project_name: str = Field(..., min_length=1, max_length=200)
+
+
+class ProjectResponse(BaseModel):
+    """Project metadata returned to the UI."""
+
+    project_id: str
+    project_name: str
+    project_slug: str
+    created_at: str
+    is_current: bool = False
+    db_path: str = ""
+    output_dir: str = ""
 
 
 class RetryRequest(BaseModel):
@@ -939,6 +993,8 @@ class SettingsUpdate(BaseModel):
     output_directory: Optional[str] = None
     scholar_min_delay_s: Optional[float] = None
     scholar_max_queries_per_paper: Optional[int] = None
+    manual_mode_enabled: Optional[bool] = None
+    manual_drop_folder: Optional[str] = None
 
     @field_validator("retrieval_concurrency")
     @classmethod

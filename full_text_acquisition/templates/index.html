@@ -571,6 +571,16 @@
          ============================================================ -->
     <aside class="sidebar">
         <h1>FT Acquisition</h1>
+
+        <!-- Project selector — per-project isolation -->
+        <div style="padding:10px 14px;margin:10px 12px;background:rgba(255,255,255,0.05);border-radius:var(--radius-sm);cursor:pointer"
+             id="projectSelectorBlock" title="Click to switch or create projects">
+            <div style="font-size:10px;color:rgba(255,255,255,0.5);letter-spacing:0.5px;text-transform:uppercase">Project</div>
+            <div style="font-size:13px;font-weight:600;color:var(--text-light);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+                 id="projectSelectorName">—</div>
+            <div style="font-size:10px;color:rgba(255,255,255,0.4);margin-top:2px" id="projectSelectorSlug"></div>
+        </div>
+
         <nav>
             <div class="nav-item active" data-panel="upload">
                 <span class="nav-icon">&#128194;</span> Upload
@@ -607,6 +617,16 @@
             </div>
 
             <div class="card">
+                <div class="form-group" style="margin-bottom:16px">
+                    <label>Output folder for this batch (optional)</label>
+                    <input type="text" class="form-control" id="uploadOutputOverride"
+                           placeholder="Leave blank to use default from Settings"
+                           data-path-input="upload"
+                           data-status-id="uploadOverrideStatus"
+                           autocomplete="off">
+                    <div class="form-hint" id="uploadOverrideStatus"
+                         style="margin-top:6px"></div>
+                </div>
                 <div class="drop-zone" id="dropZone">
                     <div class="drop-zone-icon">&#128196;</div>
                     <div class="drop-zone-text">
@@ -651,6 +671,14 @@
                         <div class="metric-value" id="uploadReady">0</div>
                         <div class="metric-label">Ready for Retrieval</div>
                     </div>
+                </div>
+
+                <!-- Output directory used for THIS run -->
+                <div style="margin-bottom:16px;padding:10px;background:var(--bg-primary);border-radius:var(--radius-sm);font-size:13px">
+                    <strong>Output folder for this run:</strong>
+                    <span id="uploadOutputResolved" style="font-family:var(--mono);font-size:12px;margin-left:8px">—</span>
+                    <button class="btn btn-outline btn-sm" id="btnCopyUploadOutput"
+                            style="margin-left:8px;padding:2px 8px;font-size:11px">Copy</button>
                 </div>
 
                 <!-- Column mapping -->
@@ -839,6 +867,18 @@
             </div>
 
             <div class="card">
+                <div class="card-header"><h3>Output Directory</h3></div>
+                <div class="form-group">
+                    <label>Where downloaded PDFs and supplements are saved</label>
+                    <input type="text" class="form-control" id="cfgOutputDir"
+                           placeholder="./downloads"
+                           data-path-input="settings"
+                           autocomplete="off">
+                    <div class="form-hint" id="cfgOutputDirStatus" style="margin-top:6px"></div>
+                </div>
+            </div>
+
+            <div class="card">
                 <div class="card-header"><h3>Institutional Access</h3></div>
                 <div class="form-row">
                     <div class="form-group">
@@ -885,6 +925,49 @@
                 <div id="wizardResults" style="font-size:13px; color:var(--text-secondary)">
                     Click "Re-run Wizard" to check system dependencies.
                 </div>
+            </div>
+
+            <!-- Backup & Restore — per-project isolation -->
+            <div class="card" id="backupCard">
+                <div class="card-header">
+                    <h3>&#128190; Backup &amp; Restore</h3>
+                    <div class="btn-group">
+                        <button class="btn btn-primary btn-sm" id="btnBackupNow">Backup Now</button>
+                        <button class="btn btn-outline btn-sm" id="btnBackupListRefresh">Refresh</button>
+                    </div>
+                </div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">
+                    Backups use the SQLite <strong>backup API</strong> (not file copy) — safe during active
+                    retrieval runs. Auto-backup runs at the start of every new retrieval; the 5 most
+                    recent are kept. Restore requires that <em>nothing is running</em> and creates a
+                    safety backup first.
+                </div>
+
+                <!-- Last backup summary -->
+                <div id="backupLastInfo"
+                     style="padding:10px;background:var(--bg-primary);border-radius:var(--radius-sm);font-size:13px;margin-bottom:12px">
+                    Loading...
+                </div>
+
+                <!-- Backup lists -->
+                <details style="margin-top:12px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        Manual backups (<span id="backupCountManual">0</span>)
+                    </summary>
+                    <div id="backupListManual" style="margin-top:8px"></div>
+                </details>
+                <details style="margin-top:8px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        Auto backups (<span id="backupCountAuto">0</span> / 5 kept)
+                    </summary>
+                    <div id="backupListAuto" style="margin-top:8px"></div>
+                </details>
+                <details style="margin-top:8px">
+                    <summary style="cursor:pointer;font-size:12px;color:var(--text-secondary)">
+                        Safety backups (pre-restore, <span id="backupCountSafety">0</span>)
+                    </summary>
+                    <div id="backupListSafety" style="margin-top:8px;font-size:11px"></div>
+                </details>
             </div>
         </div>
 
@@ -1060,6 +1143,86 @@
                 </div>
             </div>
 
+            <!-- ============================================================
+                 MANUAL ORCHESTRATION MODE — no browser, no credentials
+                 ============================================================ -->
+            <div class="card" id="manualModeCard" style="border-left: 3px solid var(--accent); background:#f0f9ff">
+                <div class="card-header">
+                    <h3>&#128193; Manual Mode</h3>
+                    <span class="badge" id="manualModeBadge">Off</span>
+                </div>
+                <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.6">
+                    <strong>Maximum privacy: no browser opens, no credentials ever touch the system.</strong><br>
+                    Download paywalled PDFs yourself through your own browser and drop them into a folder.
+                    The system watches the folder, matches each PDF to a paper in your queue, runs the
+                    same 7-check validation as automatic retrieval, and files it.
+                </div>
+
+                <div class="form-group">
+                    <label>Drop folder</label>
+                    <input type="text" class="form-control" id="manualDropFolder"
+                           placeholder="e.g. ~/Downloads/SSO_PDFs"
+                           data-path-input="manual-drop"
+                           data-status-id="manualDropStatus">
+                    <div class="form-hint" id="manualDropStatus" style="margin-top:6px"></div>
+                </div>
+
+                <div class="btn-group" style="margin-top:12px">
+                    <button class="btn btn-success" id="btnManualStart">Enable Manual Mode</button>
+                    <button class="btn btn-outline" id="btnManualStop" disabled>Disable</button>
+                    <a href="/api/manual/queue.csv" class="btn btn-outline btn-sm"
+                       style="margin-left:auto">Export queue CSV</a>
+                </div>
+
+                <div id="manualModeMessage"
+                     style="margin-top:12px;font-size:12px;color:var(--text-secondary)"></div>
+
+                <!-- Live counters -->
+                <div class="card-grid" style="margin-top:16px" id="manualModeCounters">
+                    <div class="metric-card">
+                        <div class="metric-value score-high" id="manualCountMatched">0</div>
+                        <div class="metric-label">Matched + Validated</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value score-medium" id="manualCountFailed">0</div>
+                        <div class="metric-label">Validation Failed</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="manualCountUnmatched">0</div>
+                        <div class="metric-label">Unmatched Files</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="manualCountUnavail">0</div>
+                        <div class="metric-label">Permanently Unavailable</div>
+                    </div>
+                </div>
+
+                <!-- Pending disambiguation — surfaces when watcher hits a narrow fuzzy gap -->
+                <div id="manualDisambig" style="display:none;margin-top:16px;padding:12px;background:#fffbeb;border:1px solid var(--warning);border-radius:var(--radius-sm)">
+                    <strong style="color:var(--warning)">&#9888; Ambiguous match — pick the correct paper</strong>
+                    <div id="manualDisambigFile" style="font-family:var(--mono);font-size:11px;margin-top:4px"></div>
+                    <div id="manualDisambigCandidates" style="margin-top:10px"></div>
+                </div>
+
+                <!-- Unmatched files — surfaces when no fuzzy match reaches threshold -->
+                <div id="manualUnmatchedWrap" style="margin-top:16px;display:none">
+                    <strong style="font-size:13px">Unmatched files</strong>
+                    <div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px">
+                        These PDFs didn't match any queued paper. Rename to include the DOI, or discard.
+                    </div>
+                    <div id="manualUnmatchedList" style="font-size:11px"></div>
+                </div>
+            </div>
+
+            <!-- Manual Mode Queue — augmented listing with Mark Unobtainable + suggested actions -->
+            <div class="card" id="manualQueueCard" style="display:none">
+                <div class="card-header">
+                    <h3>Manual Queue (<span id="manualQueueTotal">0</span> papers)</h3>
+                    <button class="btn btn-outline btn-sm" id="btnManualQueueRefresh">Refresh</button>
+                </div>
+                <div id="manualQueueList" style="max-height:420px;overflow-y:auto;font-size:12px"></div>
+            </div>
+
             <!-- STEP 1: QUEUE VISIBILITY -->
             <div class="card">
                 <div class="card-header">
@@ -1129,6 +1292,83 @@
                     Loading...
                 </div>
             </div>
+
+            <!-- ============================================================
+                 PRIVACY AUDIT — verifiable trust UX
+                 ============================================================ -->
+            <div class="card" style="border-left: 3px solid var(--accent); background:#f0f9ff">
+                <div class="card-header">
+                    <h3>&#128270; Privacy Audit</h3>
+                    <button class="btn btn-outline btn-sm" id="btnSsoAuditRefresh">Refresh</button>
+                </div>
+
+                <!-- Activity counters (real, computed from instrumented operations) -->
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">
+                    Counts below are computed from <strong>real operations</strong> instrumented in
+                    <code>BrowserManager</code> — never hardcoded. If any non-zero value
+                    appears for "Form fields read" or "Screenshots taken", that means the
+                    code actually performed those operations. They have no path to do so today.
+                </div>
+                <div class="card-grid" style="margin-bottom:12px">
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditPages">0</div><div class="metric-label">Pages navigated</div></div>
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditForms">0</div><div class="metric-label">Form fields read</div></div>
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditShots">0</div><div class="metric-label">Screenshots taken</div></div>
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditFiles">0</div><div class="metric-label">Files downloaded</div></div>
+                </div>
+
+                <!-- Navigation log -->
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;margin-bottom:6px">
+                    <strong style="font-size:13px">Navigation log</strong>
+                    <a href="/api/sso/audit/nav-log.csv" class="btn btn-outline btn-sm"
+                       style="padding:2px 10px;font-size:11px">Download CSV</a>
+                </div>
+                <div id="ssoAuditNavLog" style="max-height:200px;overflow-y:auto;font-size:11px;font-family:var(--mono);background:white;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px">
+                    No navigations yet.
+                </div>
+
+                <!-- Cookies -->
+                <details style="margin-top:16px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        Cookies in the SSO browser
+                        (<span id="ssoAuditCookiesCount">0</span>)
+                    </summary>
+                    <div style="font-size:11px;color:var(--text-secondary);margin-top:6px;margin-bottom:8px">
+                        Names + domains only. Cookie <strong>values are never shown or stored
+                        outside the Playwright browser context</strong>.
+                        These cookies stay in memory and are deleted when you End Session.
+                    </div>
+                    <div id="ssoAuditCookiesList" style="font-family:var(--mono);font-size:11px"></div>
+                </details>
+
+                <!-- Session isolation folder -->
+                <div style="margin-top:16px;padding:12px;background:white;border:1px solid var(--border);border-radius:var(--radius-sm)">
+                    <div style="font-weight:600;font-size:13px;margin-bottom:6px">Session isolation folder</div>
+                    <div style="font-family:var(--mono);font-size:11px;color:var(--text-secondary);word-break:break-all" id="ssoAuditSessionDir">
+                        (No active session)
+                    </div>
+                    <div style="font-size:11px;color:var(--text-secondary);margin-top:6px">
+                        The Playwright context is in-memory — nothing else should appear in this folder.
+                        Click <strong>Verify now</strong> to list its contents and confirm.
+                    </div>
+                    <button class="btn btn-outline btn-sm" id="btnSsoAuditVerify"
+                            style="margin-top:8px;padding:4px 10px">Verify now</button>
+                    <div id="ssoAuditFolderListing" style="margin-top:8px;font-size:11px;font-family:var(--mono)"></div>
+                </div>
+
+                <!-- Trust boundary -->
+                <details style="margin-top:16px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        How this works &middot; Trust boundary functions
+                    </summary>
+                    <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;margin-bottom:8px">
+                        Exactly four functions in the source code interact with the SSO browser.
+                        Anyone can audit those four functions to verify the system's claims.
+                        Line numbers are computed from the source files at request time, so they
+                        always match the version you are running.
+                    </div>
+                    <div id="ssoAuditFunctionList" style="font-family:var(--mono);font-size:11px"></div>
+                </details>
+            </div>
         </div>
 
         <!-- ============================================================
@@ -1148,6 +1388,23 @@
                     <button class="btn btn-primary btn-sm" id="btnExportBundle"
                             title="Submission bundle: config, audit log, PRISMA, PDFs, supplements, SHA-256 manifest">Download Submission Bundle</button>
                 </div>
+            </div>
+
+            <!-- Where the files live -->
+            <div class="card" style="padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+                <span style="font-size:13px;color:var(--text-secondary)">Files saved to:</span>
+                <span id="resultsOutputPath"
+                      style="font-family:var(--mono);font-size:12px;flex:1;word-break:break-all">—</span>
+                <span id="resultsOutputFree"
+                      style="font-size:12px;color:var(--text-secondary)">—</span>
+                <button class="btn btn-outline btn-sm" id="btnCopyResultsPath"
+                        title="Copy the absolute path to your clipboard"
+                        style="padding:4px 10px">Copy path</button>
+                <span style="font-size:11px;color:var(--text-secondary)">
+                    Then paste in: <strong>macOS</strong> &#8984;&#8679;G &middot;
+                    <strong>Windows</strong> Win+R &middot;
+                    <strong>Linux</strong> Files &rarr; Ctrl+L
+                </span>
             </div>
 
             <!-- Filter tabs -->
@@ -1179,6 +1436,7 @@
                                 <th data-sort="attempt_count">Att.</th>
                                 <th>Failure</th>
                                 <th>Override</th>
+                                <th>Links</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -1234,6 +1492,80 @@
     </div>
 </div>
 
+<!-- PDF preview modal — flagged-paper review only =========================
+     Shows the local PDF inline so reviewers can decide between
+     Confirm-Correct and Re-retrieve without leaving the Results page.
+     The iframe uses the browser's NATIVE PDF renderer (no PDF.js); the
+     "Open in new tab" link is a fallback for browsers that don't inline
+     render PDFs (mostly mobile).
+     ========================================================================= -->
+<div class="modal-backdrop" id="previewModal" style="z-index:950">
+    <div class="modal" style="max-width:80vw;width:80vw;max-height:80vh;height:80vh;display:flex;flex-direction:column;padding:0">
+
+        <!-- Header row: metadata + action buttons -->
+        <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;gap:16px;align-items:flex-start">
+            <div style="flex:1;min-width:0">
+                <div id="previewTitle"
+                     style="font-weight:600;font-size:14px;line-height:1.3;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis">
+                    Loading...
+                </div>
+                <div id="previewMeta"
+                     style="font-size:12px;color:var(--text-secondary);margin-bottom:4px"></div>
+                <div id="previewFlags" style="font-size:11px"></div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+                <button class="btn btn-sm btn-success" id="btnPreviewConfirm"
+                        title="Mark as correct (reason required)">Confirm Correct</button>
+                <button class="btn btn-sm btn-warning" id="btnPreviewReretrieve"
+                        title="Reset to READY_FOR_RETRIEVAL">Re-retrieve</button>
+                <a class="btn btn-sm btn-outline" id="previewOpenNewTab"
+                   target="_blank" rel="noopener"
+                   title="Open in a new tab if this viewer doesn't render PDFs">Open in new tab</a>
+                <button class="btn btn-sm btn-outline" id="btnClosePreview"
+                        title="Close preview (Esc)">Close</button>
+            </div>
+        </div>
+
+        <!-- PDF area: browser's native renderer via iframe -->
+        <div style="flex:1;background:#222;overflow:hidden">
+            <iframe id="previewIframe" src="about:blank"
+                    style="width:100%;height:100%;border:0;background:white"
+                    title="PDF preview"></iframe>
+        </div>
+
+    </div>
+</div>
+
+<!-- Project picker modal ================================================== -->
+<div class="modal-backdrop" id="projectModal">
+    <div class="modal" style="max-width:640px">
+        <h3>Projects</h3>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">
+            Each project has its own database, downloads folder, and settings overlay.
+            Switching requires that no background task is running.
+        </div>
+
+        <div id="projectList" style="max-height:300px;overflow-y:auto;margin-bottom:16px"></div>
+
+        <div style="padding:12px;background:var(--bg-primary);border-radius:var(--radius-sm);margin-bottom:16px">
+            <strong style="font-size:13px">Create a new project</strong>
+            <div class="form-group" style="margin-top:8px;margin-bottom:8px">
+                <input type="text" class="form-control" id="newProjectName"
+                       placeholder="e.g. COVID-19 Systematic Review"
+                       maxlength="200">
+                <div class="form-hint" id="newProjectSlugPreview" style="margin-top:4px"></div>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btnCreateProject">Create &amp; Switch</button>
+        </div>
+
+        <div id="projectMigrationNotice" style="margin-bottom:12px;font-size:12px"></div>
+
+        <div class="btn-group" style="justify-content:flex-end">
+            <button class="btn btn-outline" id="btnCloseProjectModal">Close</button>
+        </div>
+    </div>
+</div>
+
 <script>
 /* ==================================================================
    Full-Text Acquisition System — Frontend
@@ -1258,6 +1590,7 @@ const state = {
     lastCountersSnap: null,
     enrichmentSseSource: null,
     enrichmentInProgress: false,
+    proxyPrefix: '',  // EZproxy URL prefix, fetched once on load
 };
 
 /* ------------------------------------------------------------------
@@ -1317,10 +1650,16 @@ function switchPanel(name) {
         p.classList.toggle('active', p.id === 'panel' + name.charAt(0).toUpperCase() + name.slice(1));
     });
     // Unified SSE is always on; individual panels only trigger one-shot loads
-    if (name === 'results') loadResults();
-    if (name === 'settings') loadSettings();
+    if (name === 'results') { loadResults(); loadResultsOutputHeader(); }
+    if (name === 'settings') { loadSettings(); loadBackupPanel(); }
     if (name === 'run') loadRuns();
-    if (name === 'sso') loadSsoStatus();
+    if (name === 'sso') {
+        loadSsoStatus();
+        startSsoAuditPolling();   // 3s poll while panel visible
+        loadManualModeInitial();  // one-shot setup; live updates via SSE
+    } else {
+        stopSsoAuditPolling();
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -1350,6 +1689,17 @@ async function handleUpload(file) {
     try {
         const fd = new FormData();
         fd.append('file', file);
+        // Per-batch output dir override (only if validated OK)
+        const overrideEl = document.getElementById('uploadOutputOverride');
+        const overrideVal = (overrideEl.value || '').trim();
+        if (overrideVal) {
+            if (overrideEl.dataset.pathOk !== 'true') {
+                document.getElementById('uploadProgress').style.display = 'none';
+                toast('Output folder override is invalid — fix or clear it', 'error');
+                return;
+            }
+            fd.append('output_directory_override', overrideVal);
+        }
         const data = await POST('/api/upload', fd);
 
         document.getElementById('uploadProgressBar').style.width = '100%';
@@ -1360,6 +1710,9 @@ async function handleUpload(file) {
         document.getElementById('uploadTotal').textContent = data.total_submitted;
         document.getElementById('uploadDedup').textContent = data.deduplication_report.duplicates_removed;
         document.getElementById('uploadAlready').textContent = data.already_retrieved_count;
+        if (data.output_directory) {
+            document.getElementById('uploadOutputResolved').textContent = data.output_directory;
+        }
         document.getElementById('uploadReady').textContent = data.ready_for_retrieval_count;
 
         // Column mapping
@@ -1598,6 +1951,91 @@ document.getElementById('btnStartAfterUpload').addEventListener('click', async f
 /* ------------------------------------------------------------------
    Settings
    ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+   Path validator — debounced, shared by Settings + Upload override
+   ------------------------------------------------------------------ */
+const _pathValidationTimers = new WeakMap();
+const _pathValidationLatest = new WeakMap();  // for race protection
+
+async function validatePathInput(inputEl) {
+    if (!inputEl) return;
+    const statusEl = inputEl.parentElement.querySelector('[data-path-status], #cfgOutputDirStatus, #uploadOverrideStatus')
+        || document.getElementById(inputEl.dataset.statusId || '');
+    if (!statusEl) return;
+
+    const raw = (inputEl.value || '').trim();
+    if (!raw) {
+        statusEl.innerHTML = '<span style="color:var(--text-secondary)">Empty (will use default)</span>';
+        inputEl.dataset.pathOk = 'empty';
+        return;
+    }
+
+    statusEl.innerHTML = '<span style="color:var(--text-secondary)">Checking...</span>';
+
+    // Race-protection token
+    const token = Symbol();
+    _pathValidationLatest.set(inputEl, token);
+
+    try {
+        const r = await fetch('/api/fs/check-path?path=' + encodeURIComponent(raw),
+            { method: 'POST' });
+        if (_pathValidationLatest.get(inputEl) !== token) return;  // stale
+        if (!r.ok) {
+            statusEl.innerHTML = '<span style="color:var(--danger)">&#9888; check failed (' + r.status + ')</span>';
+            inputEl.dataset.pathOk = 'false';
+            return;
+        }
+        const data = await r.json();
+        if (_pathValidationLatest.get(inputEl) !== token) return;
+        renderPathStatus(statusEl, inputEl, data);
+    } catch (e) {
+        if (_pathValidationLatest.get(inputEl) !== token) return;
+        statusEl.innerHTML = '<span style="color:var(--danger)">&#9888; ' + escHtml(e.message) + '</span>';
+        inputEl.dataset.pathOk = 'false';
+    }
+}
+
+function renderPathStatus(statusEl, inputEl, data) {
+    if (data.ok) {
+        const existsLabel = data.exists ? 'exists' : 'will be created';
+        statusEl.innerHTML =
+            '<span style="color:var(--success)">&#10003; ' + escHtml(data.real_path) + '</span> ' +
+            '<span style="color:var(--text-secondary)">(' + existsLabel +
+            ', ' + escHtml(data.free_human) + ' free)</span>';
+        inputEl.dataset.pathOk = 'true';
+    } else {
+        statusEl.innerHTML =
+            '<span style="color:var(--danger)">&#9888; ' +
+            escHtml(data.error || 'invalid path') + '</span> ' +
+            (data.real_path ? '<span style="color:var(--text-secondary);font-family:var(--mono);font-size:11px">' + escHtml(data.real_path) + '</span>' : '');
+        inputEl.dataset.pathOk = 'false';
+    }
+}
+
+// Debounce on input
+function attachPathValidator(input) {
+    if (!input || input.dataset.validatorAttached) return;
+    input.dataset.validatorAttached = '1';
+    input.addEventListener('input', function() {
+        clearTimeout(_pathValidationTimers.get(input));
+        _pathValidationTimers.set(input, setTimeout(function() {
+            validatePathInput(input);
+        }, 750));
+    });
+    // Also validate on blur (immediate)
+    input.addEventListener('blur', function() {
+        clearTimeout(_pathValidationTimers.get(input));
+        validatePathInput(input);
+    });
+}
+
+// Auto-attach to all path inputs on load
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('[data-path-input]').forEach(attachPathValidator);
+});
+// Also attach immediately in case DOM is already ready
+document.querySelectorAll('[data-path-input]').forEach(attachPathValidator);
+
 async function loadSettings() {
     try {
         const data = await GET('/api/settings');
@@ -1622,6 +2060,9 @@ async function loadSettings() {
         document.getElementById('cfgResolver').value = c.institutional_resolver_url || '';
         document.getElementById('cfgUnpaywallEmail').value = c.unpaywall_email || '';
         document.getElementById('cfgCacheTtl').value = c.cache_ttl_days || '';
+        document.getElementById('cfgOutputDir').value = c.output_directory || '';
+        // Trigger an initial validation of the loaded value
+        validatePathInput(document.getElementById('cfgOutputDir'));
 
         const ocrEl = document.getElementById('settingsOcrStatus');
         ocrEl.textContent = data.ocr_available ? (data.ghostscript_available ? 'Full OCR' : 'Tesseract Only') : 'Disabled';
@@ -1666,7 +2107,7 @@ document.getElementById('btnSaveSettings').addEventListener('click', async funct
         if (!isNaN(v)) body[f[0]] = v;
     });
     body.min_disk_space_bytes = diskMb * 1048576;
-    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail']];
+    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail'],['output_directory','cfgOutputDir']];
     strFields.forEach(function(f) { const v = document.getElementById(f[1]).value; if (v) body[f[0]] = v; });
 
     try {
@@ -1857,6 +2298,16 @@ function handleStreamEvent(m) {
     if (m.sso && typeof renderSsoFromStream === 'function') {
         renderSsoFromStream(m.sso);
     }
+
+    // --- Manual Mode: live counters + disambiguation surfacing ---
+    if (m.manual_mode && typeof renderManualModeFromStream === 'function') {
+        renderManualModeFromStream(m.manual_mode);
+    }
+
+    // --- Current project: keeps sidebar header in sync ---
+    if (m.current_project && typeof updateProjectHeader === 'function') {
+        updateProjectHeader(m.current_project);
+    }
 }
 
 window.forceCooldownReset = async function(pub) {
@@ -1983,6 +2434,9 @@ async function loadSsoStatus() {
 
 function renderSsoQueue(q) {
     const total = q.total || 0;
+    // Cache the prefix so the Results-table Links column can build
+    // EZproxy URLs without an extra round-trip per render
+    if (q.proxy_prefix) { state.proxyPrefix = q.proxy_prefix; }
     document.getElementById('ssoProxyPrefix').textContent = 'EZproxy prefix in use: ' + (q.proxy_prefix || '(none)');
     if (total === 0) {
         document.getElementById('ssoQueueSummary').innerHTML =
@@ -2134,6 +2588,643 @@ document.getElementById('btnSsoExportManualCsv').addEventListener('click', funct
     window.location.href = '/api/sso/manual-fallback/csv';
 });
 
+/* ------------------------------------------------------------------
+   Privacy Audit panel — verifiable trust UX
+   ------------------------------------------------------------------
+   Polls /api/sso/audit every 3s while the SSO panel is visible.
+   Cookie list and source-function list are loaded on demand
+   (collapsed details elements).
+*/
+let _ssoAuditPollTimer = null;
+
+async function loadSsoAudit() {
+    try {
+        const a = await GET('/api/sso/audit');
+        document.getElementById('ssoAuditPages').textContent = a.pages_navigated || 0;
+        document.getElementById('ssoAuditForms').textContent = a.form_fields_read || 0;
+        document.getElementById('ssoAuditShots').textContent = a.screenshots_taken || 0;
+        document.getElementById('ssoAuditFiles').textContent = a.files_downloaded || 0;
+
+        // Color the "Form fields read" and "Screenshots taken" red if non-zero.
+        // Today they are always 0 because no code path calls those operations,
+        // but the count is computed (not hardcoded), so non-zero would mean a
+        // real regression that the user MUST see.
+        document.getElementById('ssoAuditForms').className =
+            (a.form_fields_read || 0) > 0 ? 'metric-value score-low' : 'metric-value score-high';
+        document.getElementById('ssoAuditShots').className =
+            (a.screenshots_taken || 0) > 0 ? 'metric-value score-low' : 'metric-value score-high';
+
+        // Nav log (most recent first, capped at 100 in display)
+        const nav = (a.nav_log || []).slice().reverse().slice(0, 100);
+        const navEl = document.getElementById('ssoAuditNavLog');
+        if (nav.length === 0) {
+            navEl.innerHTML = '<span style="color:var(--text-secondary)">No navigations yet.</span>';
+        } else {
+            navEl.innerHTML = nav.map(function(e) {
+                const t = (e.timestamp || '').substring(11, 19);  // HH:MM:SS
+                return '<div style="padding:2px 0">' +
+                    '<span style="color:var(--text-secondary)">[' + escHtml(t) + ']</span> ' +
+                    '<span style="color:var(--accent)">[' + escHtml(e.reason || 'navigation') + ']</span> ' +
+                    escHtml(e.url || '') +
+                    '</div>';
+            }).join('');
+        }
+
+        // Session folder display
+        const sessDir = a.session_audit_dir;
+        document.getElementById('ssoAuditSessionDir').textContent =
+            sessDir || '(No active session — folder created when you Start SSO Session)';
+    } catch (e) {
+        // Silently ignore — panel is informational
+    }
+}
+
+async function loadSsoAuditCookies() {
+    try {
+        const c = await GET('/api/sso/audit/cookies');
+        document.getElementById('ssoAuditCookiesCount').textContent = c.count || 0;
+        const list = document.getElementById('ssoAuditCookiesList');
+        if (!c.cookies || c.cookies.length === 0) {
+            list.innerHTML = '<span style="color:var(--text-secondary)">No cookies (or no active SSO session)</span>';
+            return;
+        }
+        list.innerHTML = '<div style="display:grid;grid-template-columns:auto auto auto auto;gap:4px 12px;align-items:center">' +
+            '<strong>Domain</strong><strong>Name</strong><strong>Expires</strong><strong>Flags</strong>' +
+            c.cookies.map(function(ck) {
+                const expires = ck.expires === -1 || !ck.expires ? 'session'
+                    : new Date(ck.expires * 1000).toISOString().substring(0, 16).replace('T', ' ');
+                const flags = (ck.http_only ? 'HttpOnly ' : '') + (ck.secure ? 'Secure ' : '') + (ck.same_site || '');
+                return '<span>' + escHtml(ck.domain) + '</span>' +
+                    '<span>' + escHtml(ck.name) + '</span>' +
+                    '<span>' + escHtml(expires) + '</span>' +
+                    '<span style="color:var(--text-secondary);font-size:10px">' + escHtml(flags.trim()) + '</span>';
+            }).join('') + '</div>';
+    } catch (e) {
+        document.getElementById('ssoAuditCookiesList').innerHTML =
+            '<span style="color:var(--danger)">Failed to load: ' + escHtml(e.message) + '</span>';
+    }
+}
+
+async function verifyAuditFolder() {
+    const out = document.getElementById('ssoAuditFolderListing');
+    out.innerHTML = '<span style="color:var(--text-secondary)">Reading folder...</span>';
+    try {
+        const f = await GET('/api/sso/audit/folder-listing');
+        if (!f.session_dir) {
+            out.innerHTML = '<span style="color:var(--text-secondary)">No active session folder.</span>';
+            return;
+        }
+        if (!f.exists) {
+            out.innerHTML = '<span style="color:var(--success)">&#10003; Folder does not exist (cleaned up).</span>';
+            return;
+        }
+        const items = f.contents || [];
+        const header = '<div style="margin-bottom:6px">' +
+            '<strong>' + items.length + ' file(s)</strong> in ' +
+            '<span style="color:var(--text-secondary)">' + escHtml(f.session_dir) + '</span>' +
+            '</div>';
+        const verdict = f.is_empty_except_marker
+            ? '<div style="color:var(--success);margin-top:6px;padding:6px;background:#f0fdf4;border-radius:var(--radius-sm)">&#10003; Verified: only the SESSION_INFO.txt marker is present. Nothing else is being persisted by the system.</div>'
+            : '<div style="color:var(--warning);margin-top:6px;padding:6px;background:#fffbeb;border-radius:var(--radius-sm)">&#9888; Folder contains files other than the marker. Inspect them below.</div>';
+        const rows = items.map(function(it) {
+            return '<div style="padding:2px 0">' +
+                (it.is_dir ? '&#128193; ' : '&#128196; ') +
+                escHtml(it.name) +
+                ' <span style="color:var(--text-secondary)">(' + (it.size_bytes || 0) + ' bytes, modified ' +
+                escHtml((it.modified || '').substring(11, 19)) + ')</span>' +
+                '</div>';
+        }).join('');
+        out.innerHTML = header + rows + verdict;
+    } catch (e) {
+        out.innerHTML = '<span style="color:var(--danger)">Verify failed: ' + escHtml(e.message) + '</span>';
+    }
+}
+
+async function loadSsoAuditFunctions() {
+    try {
+        const r = await GET('/api/sso/audit/source-functions');
+        const fns = r.functions || [];
+        document.getElementById('ssoAuditFunctionList').innerHTML = fns.map(function(f) {
+            const ok = f.exists ? '&#10003;' : '&#10007;';
+            const where = f.line ? f.file + ':' + f.line : (f.error || 'not found');
+            return '<div style="padding:2px 0">' + ok + ' <strong>' +
+                escHtml(f.module) + '.' + escHtml(f.function) + '</strong>' +
+                ' <span style="color:var(--text-secondary)">' + escHtml(where) + '</span></div>';
+        }).join('');
+    } catch (e) {
+        document.getElementById('ssoAuditFunctionList').innerHTML =
+            '<span style="color:var(--danger)">Failed: ' + escHtml(e.message) + '</span>';
+    }
+}
+
+function startSsoAuditPolling() {
+    stopSsoAuditPolling();
+    loadSsoAudit();
+    _ssoAuditPollTimer = setInterval(loadSsoAudit, 3000);
+}
+function stopSsoAuditPolling() {
+    if (_ssoAuditPollTimer) {
+        clearInterval(_ssoAuditPollTimer);
+        _ssoAuditPollTimer = null;
+    }
+}
+
+// Wire buttons
+document.getElementById('btnSsoAuditRefresh').addEventListener('click', function() {
+    loadSsoAudit();
+    loadSsoAuditCookies();
+    loadSsoAuditFunctions();
+});
+document.getElementById('btnSsoAuditVerify').addEventListener('click', verifyAuditFolder);
+
+// Lazy-load cookies + functions when their <details> is opened
+document.addEventListener('toggle', function(e) {
+    if (e.target.tagName !== 'DETAILS') return;
+    const summary = e.target.querySelector('summary');
+    if (!summary) return;
+    const text = summary.textContent || '';
+    if (text.indexOf('Cookies in the SSO browser') >= 0 && e.target.open) {
+        loadSsoAuditCookies();
+    } else if (text.indexOf('Trust boundary functions') >= 0 && e.target.open) {
+        loadSsoAuditFunctions();
+    }
+}, true);
+
+/* ------------------------------------------------------------------
+   Backup & Restore — per-project SQLite backup API
+   ------------------------------------------------------------------
+   Loaded on demand when the Settings panel is switched to.
+*/
+function _relDate(iso) {
+    if (!iso) return '';
+    try {
+        const d = new Date(iso);
+        return d.toLocaleString();
+    } catch (e) { return iso; }
+}
+
+async function loadBackupPanel() {
+    try {
+        const data = await GET('/api/backup/list');
+        const last = data.last_backup || {};
+
+        // Summary line + stale warning
+        const lastEl = document.getElementById('backupLastInfo');
+        if (!last.any_backup_exists) {
+            lastEl.innerHTML =
+                '<div style="color:var(--warning)">&#9888; <strong>No backups yet.</strong> ' +
+                'Click Backup Now to create the first one. ' +
+                'The system will also auto-backup before every new run.</div>';
+        } else {
+            const staleTag = last.stale
+                ? '<div style="color:var(--warning);margin-top:6px">&#9888; Last backup is ' +
+                  last.last_backup_age_days + ' days old (stale threshold: 7 days)</div>'
+                : '';
+            lastEl.innerHTML =
+                '<div><strong>Last backup:</strong> ' + _relDate(last.last_backup_at) +
+                ' (<span style="text-transform:capitalize">' + escHtml(last.last_backup_kind || '') + '</span>, ' +
+                formatBytes(last.last_backup_size_bytes || 0) + ', ' +
+                (last.last_backup_age_days != null ? last.last_backup_age_days + 'd ago' : '') + ')</div>' +
+                '<div style="font-family:var(--mono);font-size:11px;color:var(--text-secondary);margin-top:2px">' +
+                escHtml(last.last_backup_filename || '') + '</div>' +
+                staleTag;
+        }
+
+        // Lists
+        document.getElementById('backupCountManual').textContent = (data.manual || []).length;
+        document.getElementById('backupCountAuto').textContent = (data.auto || []).length;
+        document.getElementById('backupCountSafety').textContent = (data.safety || []).length;
+
+        document.getElementById('backupListManual').innerHTML = renderBackupList(data.manual || [], true);
+        document.getElementById('backupListAuto').innerHTML = renderBackupList(data.auto || [], true);
+        document.getElementById('backupListSafety').innerHTML = renderBackupList(data.safety || [], true);
+    } catch (err) {
+        document.getElementById('backupLastInfo').innerHTML =
+            '<span style="color:var(--danger)">Failed to load: ' + escHtml(err.message) + '</span>';
+    }
+}
+
+function renderBackupList(items, showActions) {
+    if (items.length === 0) {
+        return '<div style="color:var(--text-secondary);font-size:12px;padding:6px">None.</div>';
+    }
+    return items.map(function(b) {
+        const papers = b.paper_count != null ? b.paper_count + ' papers' : '';
+        const runs = b.run_count != null ? b.run_count + ' runs' : '';
+        const complete = b.complete_count != null ? b.complete_count + ' complete' : '';
+        const meta = [papers, runs, complete].filter(function(x){return x;}).join(' &middot; ');
+        const actions = showActions ?
+            '<button class="btn btn-sm btn-primary" onclick="restoreBackup(\'' + escAttr(b.filename) + '\')">Restore</button> ' +
+            '<button class="btn btn-sm btn-danger" onclick="deleteBackup(\'' + escAttr(b.filename) + '\')">Delete</button>' : '';
+        return '<div style="padding:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">' +
+            '<div style="flex:1">' +
+                '<div style="font-family:var(--mono);font-size:11px">' + escHtml(b.filename) + '</div>' +
+                '<div style="color:var(--text-secondary);font-size:11px">' + _relDate(b.created_at) +
+                    ' &middot; ' + formatBytes(b.size_bytes || 0) +
+                    (meta ? ' &middot; ' + meta : '') + '</div>' +
+            '</div>' +
+            '<div>' + actions + '</div>' +
+            '</div>';
+    }).join('');
+}
+
+document.getElementById('btnBackupNow').addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true; btn.textContent = 'Backing up...';
+    try {
+        const r = await POST('/api/backup');
+        toast('Backup saved: ' + r.filename + ' (' + formatBytes(r.size_bytes) + ')', 'success');
+        loadBackupPanel();
+    } catch (err) {
+        toast(err.message, 'error');
+    } finally {
+        btn.disabled = false; btn.textContent = 'Backup Now';
+    }
+});
+
+document.getElementById('btnBackupListRefresh').addEventListener('click', loadBackupPanel);
+
+window.restoreBackup = async function(filename) {
+    // Check busy state first — backend will 409 but we want to tell the user up front
+    try {
+        const s = await GET('/api/status');
+        // (Server does the authoritative check — this is purely UX)
+    } catch (e) {}
+
+    if (!confirm(
+        'Restore from backup:\n\n' + filename + '\n\n' +
+        'This will replace your current database. ' +
+        'A safety backup of the current state will be created first.\n\n' +
+        'Any running retrieval, enrichment, SSO session, or manual watcher ' +
+        'will block this operation — stop them first.\n\n' +
+        'Continue?'
+    )) return;
+
+    try {
+        const r = await POST('/api/backup/restore?filename=' + encodeURIComponent(filename));
+        toast('Restored from ' + r.restored_from + ' (safety: ' + (r.safety_backup_filename || 'none') + ')', 'success');
+        setTimeout(function() { loadBackupPanel(); location.reload(); }, 800);
+    } catch (err) {
+        const msg = err.message || '';
+        if (msg.indexOf('active') >= 0 || msg.indexOf('Cannot restore') >= 0 || msg.indexOf('409') >= 0) {
+            alert('Restore blocked:\n\n' + msg +
+                '\n\nStop the running task (Run / Upload / SSO / Manual Mode) and try again.');
+        } else {
+            toast('Restore failed: ' + msg, 'error');
+        }
+    }
+};
+
+window.deleteBackup = async function(filename) {
+    if (!confirm('Delete backup "' + filename + '"? This cannot be undone.')) return;
+    try {
+        const resp = await fetch('/api/backup/' + encodeURIComponent(filename), { method: 'DELETE' });
+        if (!resp.ok) {
+            const j = await resp.json().catch(function() { return {detail: resp.statusText}; });
+            throw new Error(j.detail || resp.statusText);
+        }
+        toast('Deleted', 'success');
+        loadBackupPanel();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+/* ------------------------------------------------------------------
+   Projects — per-project isolation
+   ------------------------------------------------------------------
+   The current project name is rendered in the sidebar header.
+   Clicking it opens a modal with the full list + New Project form.
+*/
+
+function updateProjectHeader(cp) {
+    if (!cp) return;
+    document.getElementById('projectSelectorName').textContent = cp.project_name || '—';
+    document.getElementById('projectSelectorSlug').textContent = cp.project_slug ? '(' + cp.project_slug + ')' : '';
+}
+
+async function openProjectModal() {
+    document.getElementById('projectModal').classList.add('active');
+    await refreshProjectList();
+    document.getElementById('newProjectName').value = '';
+    document.getElementById('newProjectSlugPreview').textContent = '';
+}
+
+function closeProjectModal() {
+    document.getElementById('projectModal').classList.remove('active');
+}
+
+async function refreshProjectList() {
+    try {
+        const data = await GET('/api/projects');
+        const list = document.getElementById('projectList');
+        list.innerHTML = data.projects.map(function(p) {
+            const badge = p.is_current
+                ? '<span class="badge badge-success" style="margin-left:8px">Current</span>' : '';
+            const switchBtn = p.is_current ? '' :
+                '<button class="btn btn-sm btn-primary" onclick="switchToProject(\'' + escAttr(p.project_slug) + '\')">Switch</button>';
+            const renameBtn = '<button class="btn btn-sm btn-outline" onclick="renameProject(\'' + escAttr(p.project_slug) + '\',\'' + escAttr(p.project_name) + '\')">Rename</button>';
+            const deleteBtn = (p.is_current || p.project_slug === 'default') ? '' :
+                '<button class="btn btn-sm btn-danger" onclick="deleteProject(\'' + escAttr(p.project_slug) + '\',\'' + escAttr(p.project_name) + '\')">Delete</button>';
+            return '<div style="padding:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">' +
+                '<div style="flex:1">' +
+                    '<div style="font-weight:500">' + escHtml(p.project_name) + badge + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary);font-family:var(--mono)">slug: ' + escHtml(p.project_slug) + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary);font-family:var(--mono)">db: ' + escHtml(p.db_path) + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary);font-family:var(--mono)">out: ' + escHtml(p.output_dir) + '</div>' +
+                '</div>' +
+                '<div style="display:flex;gap:4px">' + switchBtn + ' ' + renameBtn + ' ' + deleteBtn + '</div>' +
+                '</div>';
+        }).join('');
+
+        // Migration notice (once, at top)
+        if (data.migration_notice && data.migration_notice.migrated) {
+            document.getElementById('projectMigrationNotice').innerHTML =
+                '<div style="padding:10px;background:#fffbeb;border:1px solid var(--warning);border-radius:var(--radius-sm)">' +
+                '<strong>&#9888; Legacy data migrated</strong><br>' +
+                escHtml(data.migration_notice.reason || '') +
+                '<div style="font-size:11px;margin-top:4px;color:var(--text-secondary)">' +
+                'Original <code>./acquisition.db</code> and <code>./downloads/</code> were COPIED (not moved). ' +
+                'They remain on disk as a backup. Delete them manually once you confirm the Default project is intact.' +
+                '</div></div>';
+        } else {
+            document.getElementById('projectMigrationNotice').innerHTML = '';
+        }
+    } catch (e) {
+        document.getElementById('projectList').innerHTML =
+            '<div style="color:var(--danger)">Failed to load: ' + escHtml(e.message) + '</div>';
+    }
+}
+
+document.getElementById('projectSelectorBlock').addEventListener('click', openProjectModal);
+document.getElementById('btnCloseProjectModal').addEventListener('click', closeProjectModal);
+
+// Live slug preview as user types a new project name
+document.getElementById('newProjectName').addEventListener('input', function() {
+    const v = (this.value || '').trim();
+    if (!v) {
+        document.getElementById('newProjectSlugPreview').textContent = '';
+        return;
+    }
+    // Client-side approximation of the server-side slugify (just the base part)
+    const base = v.toLowerCase()
+        .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+        .slice(0, 50).replace(/-+$/, '') || 'project';
+    document.getElementById('newProjectSlugPreview').innerHTML =
+        '<span style="color:var(--text-secondary)">Folder will be: </span>' +
+        '<span style="font-family:var(--mono)">./projects/' + escHtml(base) + '-xxxxxxxx/</span>';
+});
+
+document.getElementById('btnCreateProject').addEventListener('click', async function() {
+    const name = document.getElementById('newProjectName').value.trim();
+    if (!name) { toast('Project name is required', 'warning'); return; }
+    try {
+        const p = await POST('/api/projects', { project_name: name });
+        toast('Project created: ' + p.project_name, 'success');
+        // Now activate it (will fail if busy)
+        try {
+            await POST('/api/projects/activate?slug=' + encodeURIComponent(p.project_slug));
+            toast('Switched to ' + p.project_name, 'success');
+            // Reload everything — SSE will deliver the new project name shortly
+            setTimeout(function() { location.reload(); }, 500);
+        } catch (e) {
+            toast('Project created but switch failed: ' + e.message, 'warning');
+            refreshProjectList();
+        }
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+window.switchToProject = async function(slug) {
+    try {
+        await POST('/api/projects/activate?slug=' + encodeURIComponent(slug));
+        toast('Switching to ' + slug + '...', 'info');
+        setTimeout(function() { location.reload(); }, 500);
+    } catch (err) {
+        // 409 = busy. Show the list of active tasks from the server's response.
+        const msg = err.message || '';
+        if (msg.indexOf('Cannot switch') >= 0 || msg.indexOf('active') >= 0) {
+            alert('Cannot switch projects right now:\n\n' + msg +
+                '\n\nStop the active task (see Run / SSO / Manual Mode / Upload panels) and try again.');
+        } else {
+            toast(msg, 'error');
+        }
+    }
+};
+
+window.renameProject = async function(slug, currentName) {
+    const name = prompt('New project name:', currentName);
+    if (!name || name === currentName) return;
+    try {
+        await PUT('/api/projects/' + encodeURIComponent(slug), { project_name: name });
+        toast('Renamed', 'success');
+        refreshProjectList();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+window.deleteProject = async function(slug, name) {
+    if (!confirm('Delete project "' + name + '"?\n\nThis will permanently remove:\n' +
+        '  ./projects/' + slug + '/acquisition.db\n' +
+        '  ./projects/' + slug + '/downloads/\n\n' +
+        'This cannot be undone.')) return;
+    try {
+        await fetch('/api/projects/' + encodeURIComponent(slug), { method: 'DELETE' });
+        toast('Deleted: ' + name, 'success');
+        refreshProjectList();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+
+/* ------------------------------------------------------------------
+   MANUAL ORCHESTRATION MODE — no browser, no credentials
+   ------------------------------------------------------------------
+   Live counters and messages come from payload.manual_mode in the
+   unified SSE stream (see renderManualModeFromStream).
+   Queue list + disambiguation are fetched on demand.
+*/
+
+async function loadManualModeInitial() {
+    // One-shot load when SSO panel is first shown
+    try {
+        const s = await GET('/api/manual/status');
+        document.getElementById('manualDropFolder').value = s.drop_folder || '';
+        validatePathInput(document.getElementById('manualDropFolder'));
+        renderManualModeFromStream(s);
+    } catch (e) {}
+    loadManualQueue();
+}
+
+async function loadManualQueue() {
+    try {
+        const q = await GET('/api/manual/queue');
+        const card = document.getElementById('manualQueueCard');
+        card.style.display = 'block';
+        document.getElementById('manualQueueTotal').textContent = q.total || 0;
+        if (!q.papers || q.papers.length === 0) {
+            document.getElementById('manualQueueList').innerHTML =
+                '<div style="color:var(--success);padding:8px">&#10003; Queue is empty.</div>';
+            return;
+        }
+        document.getElementById('manualQueueList').innerHTML = q.papers.map(function(p) {
+            const unavail = p.permanently_unavailable;
+            const unavailBadge = unavail
+                ? '<span class="badge badge-danger" style="margin-left:6px">Permanently Unavailable</span>' : '';
+            const failureBadge = p.last_failure_code
+                ? '<span class="badge badge-warning" style="margin-left:6px">' + escHtml(p.last_failure_code) + '</span>' : '';
+            return '<div style="padding:10px;border-bottom:1px solid var(--border);' +
+                (unavail ? 'opacity:0.6;' : '') + '">' +
+                '<div style="font-weight:500">' + escHtml(p.title || '(no title)') + unavailBadge + failureBadge + '</div>' +
+                '<div style="color:var(--text-secondary);font-size:11px;margin-top:2px">' +
+                    escHtml(p.first_author || '') + ' ' + (p.year || '') +
+                    (p.journal ? ' &middot; ' + escHtml(p.journal) : '') +
+                    ' &middot; <span class="badge badge-neutral">' + escHtml(p.publisher || '') + '</span>' +
+                '</div>' +
+                (p.doi ? '<div style="font-family:var(--mono);font-size:11px;margin-top:4px">DOI: <a href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">' + escHtml(p.doi) + '</a></div>' : '') +
+                (p.ezproxy_url ? '<div style="font-family:var(--mono);font-size:11px"><a href="' + escAttr(p.ezproxy_url) + '" target="_blank" rel="noopener">Open via EZproxy &rarr;</a></div>' : '') +
+                '<div style="font-size:11px;color:var(--text-secondary);margin-top:4px;font-style:italic">' + escHtml(p.suggested_action || '') + '</div>' +
+                (!unavail ? '<button class="btn btn-sm btn-outline" style="margin-top:6px" onclick="manualMarkUnobtainable(\'' + escAttr(p.canonical_id) + '\')">Mark as Unobtainable</button>' : '') +
+                '</div>';
+        }).join('');
+    } catch (e) {
+        document.getElementById('manualQueueList').innerHTML =
+            '<div style="color:var(--danger)">Failed to load queue: ' + escHtml(e.message) + '</div>';
+    }
+}
+
+window.manualMarkUnobtainable = async function(canonicalId) {
+    const note = prompt('Why is this paper unobtainable? (optional note)') || '';
+    try {
+        await POST('/api/manual/paper/' + encodeURIComponent(canonicalId) + '/mark-unobtainable?note=' + encodeURIComponent(note));
+        toast('Marked as permanently unavailable', 'success');
+        loadManualQueue();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+window.manualAssignFile = async function(filePath, canonicalId) {
+    try {
+        const r = await POST('/api/manual/assign?file_path=' + encodeURIComponent(filePath) + '&canonical_id=' + encodeURIComponent(canonicalId));
+        toast('Assigned — outcome: ' + (r.outcome || 'ok'), r.outcome === 'complete' ? 'success' : 'warning');
+        document.getElementById('manualDisambig').style.display = 'none';
+        loadManualQueue();
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+window.manualDiscardUnmatched = async function(filePath) {
+    if (!confirm('Delete this unmatched file from the drop folder?')) return;
+    try {
+        await POST('/api/manual/discard-unmatched?file_path=' + encodeURIComponent(filePath));
+        toast('Discarded', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+};
+
+function renderManualModeFromStream(mm) {
+    if (!mm) return;
+    const badge = document.getElementById('manualModeBadge');
+    if (mm.enabled && mm.watcher_running) {
+        badge.textContent = 'Watching'; badge.className = 'badge badge-success';
+    } else if (mm.enabled) {
+        badge.textContent = 'Enabled (not scanning)'; badge.className = 'badge badge-warning';
+    } else {
+        badge.textContent = 'Off'; badge.className = 'badge badge-neutral';
+    }
+
+    document.getElementById('btnManualStart').disabled = !!mm.enabled;
+    document.getElementById('btnManualStop').disabled = !mm.enabled;
+
+    document.getElementById('manualCountMatched').textContent = mm.matched_and_validated || 0;
+    document.getElementById('manualCountFailed').textContent = mm.validation_failed || 0;
+    document.getElementById('manualCountUnmatched').textContent = mm.unmatched_count || 0;
+    document.getElementById('manualCountUnavail').textContent = mm.permanently_unavailable || 0;
+
+    if (mm.last_message) {
+        document.getElementById('manualModeMessage').textContent = mm.last_message;
+    }
+
+    // Pending disambiguation indicator — only shown if the SSE slice signaled it.
+    // Details fetched via /api/manual/status to keep SSE payload small.
+    if (mm.pending_disambiguation) {
+        // Lazy-fetch the full disambiguation details
+        fetchAndRenderDisambiguation();
+    } else {
+        document.getElementById('manualDisambig').style.display = 'none';
+    }
+
+    // Refresh unmatched list from full status periodically — not in SSE
+    if ((mm.unmatched_count || 0) > 0) {
+        fetchAndRenderUnmatched();
+    } else {
+        document.getElementById('manualUnmatchedWrap').style.display = 'none';
+    }
+}
+
+let _lastDisambigFile = null;
+async function fetchAndRenderDisambiguation() {
+    try {
+        const s = await GET('/api/manual/status');
+        const pd = s.pending_disambiguation;
+        if (!pd) {
+            document.getElementById('manualDisambig').style.display = 'none';
+            _lastDisambigFile = null;
+            return;
+        }
+        // Avoid redundant re-render if same file
+        if (pd.file_path === _lastDisambigFile) return;
+        _lastDisambigFile = pd.file_path;
+
+        document.getElementById('manualDisambig').style.display = 'block';
+        document.getElementById('manualDisambigFile').textContent = pd.file_name || pd.file_path;
+        document.getElementById('manualDisambigCandidates').innerHTML = (pd.candidates || []).map(function(c) {
+            return '<div style="padding:8px;margin-top:6px;background:white;border-radius:var(--radius-sm);display:flex;align-items:center;gap:10px">' +
+                '<div style="flex:1">' +
+                    '<div style="font-weight:500;font-size:12px">' + escHtml(c.title) + '</div>' +
+                    '<div style="font-size:11px;color:var(--text-secondary)">' + escHtml(c.first_author || '') + ' ' + (c.year || '') +
+                        (c.doi ? ' &middot; ' + escHtml(c.doi) : '') +
+                        ' &middot; score <strong>' + c.score + '</strong></div>' +
+                '</div>' +
+                '<button class="btn btn-sm btn-primary" onclick="manualAssignFile(\'' + escAttr(pd.file_path) + '\',\'' + escAttr(c.canonical_id) + '\')">Assign</button>' +
+                '</div>';
+        }).join('');
+    } catch (e) {}
+}
+
+async function fetchAndRenderUnmatched() {
+    try {
+        const s = await GET('/api/manual/status');
+        const unmatched = s.unmatched_files || [];
+        const wrap = document.getElementById('manualUnmatchedWrap');
+        const list = document.getElementById('manualUnmatchedList');
+        if (unmatched.length === 0) {
+            wrap.style.display = 'none'; return;
+        }
+        wrap.style.display = 'block';
+        list.innerHTML = unmatched.slice(-20).reverse().map(function(f) {
+            return '<div style="padding:6px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">' +
+                '<span style="font-family:var(--mono);flex:1">' + escHtml(f.file_name) + '</span>' +
+                '<span style="color:var(--text-secondary)">' + escHtml((f.reason || '').substring(0, 40)) + '</span>' +
+                '<button class="btn btn-sm btn-outline" onclick="manualDiscardUnmatched(\'' + escAttr(f.file_path) + '\')">Discard</button>' +
+                '</div>';
+        }).join('');
+    } catch (e) {}
+}
+
+document.getElementById('btnManualStart').addEventListener('click', async function() {
+    const folder = document.getElementById('manualDropFolder').value.trim();
+    if (!folder) { toast('Set a drop folder first', 'warning'); return; }
+    // Save the folder to config + enable
+    try {
+        await PUT('/api/settings', { manual_drop_folder: folder, manual_mode_enabled: true });
+        const r = await POST('/api/manual/start');
+        toast('Manual Mode: watching ' + r.drop_folder, 'success');
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnManualStop').addEventListener('click', async function() {
+    try {
+        await POST('/api/manual/stop');
+        toast('Manual Mode stopped', 'success');
+    } catch (err) { toast(err.message, 'error'); }
+});
+
+document.getElementById('btnManualQueueRefresh').addEventListener('click', loadManualQueue);
+
 window.ssoMarkRetrieved = async function(canonicalId) {
     const note = prompt('Optional note (e.g. how you got it):') || '';
     try {
@@ -2154,6 +3245,61 @@ document.getElementById('btnCaptchaResolved').addEventListener('click', async fu
 /* ------------------------------------------------------------------
    Results
    ------------------------------------------------------------------ */
+async function loadResultsOutputHeader() {
+    /* Populate the "Files saved to:" header at the top of Results.
+       Uses /api/status, which reflects the engine's current output dir
+       (per-run override if a run is active, otherwise the global default). */
+    try {
+        const s = await GET('/api/status');
+        document.getElementById('resultsOutputPath').textContent =
+            s.output_directory || '(not set)';
+        if (s.output_directory_free_bytes) {
+            document.getElementById('resultsOutputFree').textContent =
+                formatBytes(s.output_directory_free_bytes) + ' free';
+        } else {
+            document.getElementById('resultsOutputFree').textContent = '';
+        }
+    } catch (e) {
+        document.getElementById('resultsOutputPath').textContent = '(unavailable)';
+    }
+}
+
+async function copyTextToClipboard(text) {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (e) {}
+    // Fallback for non-secure contexts (http://localhost is fine in modern browsers,
+    // but we still keep this as a safety net)
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+        document.body.appendChild(ta); ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+    } catch (e) { return false; }
+}
+
+document.getElementById('btnCopyResultsPath').addEventListener('click', async function() {
+    const path = document.getElementById('resultsOutputPath').textContent;
+    if (!path || path === '—' || path === '(not set)' || path === '(unavailable)') {
+        toast('No output path to copy', 'warning'); return;
+    }
+    const ok = await copyTextToClipboard(path);
+    toast(ok ? 'Path copied: ' + path : 'Copy failed — select and copy manually',
+          ok ? 'success' : 'error');
+});
+
+document.getElementById('btnCopyUploadOutput').addEventListener('click', async function() {
+    const path = document.getElementById('uploadOutputResolved').textContent;
+    if (!path || path === '—') { toast('No output path yet', 'warning'); return; }
+    const ok = await copyTextToClipboard(path);
+    toast(ok ? 'Path copied' : 'Copy failed', ok ? 'success' : 'error');
+});
+
 async function loadResults() {
     try {
         const runFilter = document.getElementById('resultsRunFilter').value;
@@ -2165,7 +3311,7 @@ async function loadResults() {
         state.resultsTotalCount = data.total_count;
         const tbody = document.getElementById('resultsBody');
         if (!data.papers.length) {
-            tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--text-secondary);padding:32px">No papers found</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="16" style="text-align:center;color:var(--text-secondary);padding:32px">No papers found</td></tr>';
         } else {
             tbody.innerHTML = data.papers.map(renderPaperRow).join('');
         }
@@ -2178,23 +3324,139 @@ async function loadResults() {
     } catch (err) { toast('Failed to load results: ' + err.message, 'error'); }
 }
 
+function renderLinksCell(p) {
+    /* Per-paper links column. Only renders icons that have meaningful
+       URLs for this paper. Icons are unicode glyphs to avoid pulling in
+       an icon-font dependency. */
+    const links = [];
+
+    // 1. DOI — always when present
+    if (p.doi) {
+        const url = 'https://doi.org/' + encodeURIComponent(p.doi).replace(/%2F/gi, '/');
+        links.push(
+            '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" ' +
+            'title="DOI: ' + escAttr(p.doi) + '" ' +
+            'style="text-decoration:none;margin-right:6px">&#128279; DOI</a>'
+        );
+    }
+
+    // 2. Retrieval URL — only when retrieval succeeded (URL is recorded)
+    //    Note: PaperResponse exposes pdf_filename + retrieval_tier but
+    //    not retrieval_url directly. We surface what's available via
+    //    the paper-detail endpoint as a tooltip; the visible link goes
+    //    to the publisher's DOI landing page (which is what the system
+    //    navigated to anyway).
+    if (p.retrieval_tier && p.doi) {
+        const url = 'https://doi.org/' + encodeURIComponent(p.doi).replace(/%2F/gi, '/');
+        links.push(
+            '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" ' +
+            'title="Source the system used (' + escAttr(p.retrieval_tier) + ')" ' +
+            'style="text-decoration:none;margin-right:6px">&#128279; Source</a>'
+        );
+    }
+
+    // 3. EZproxy — only for MANUAL_REQUIRED papers with a DOI. Uses the
+    //    config-aware prefix cached from /api/sso/queue (defaults to
+    //    UofT if none configured).
+    if (p.state === 'MANUAL_REQUIRED' && p.doi && state.proxyPrefix) {
+        const articleUrl = 'https://doi.org/' + encodeURIComponent(p.doi).replace(/%2F/gi, '/');
+        const ezproxy = state.proxyPrefix + articleUrl;
+        links.push(
+            '<a href="' + escAttr(ezproxy) + '" target="_blank" rel="noopener" ' +
+            'title="Open via EZproxy (uses your institutional access)" ' +
+            'style="text-decoration:none;margin-right:6px;color:var(--accent)">&#128274; SSO</a>'
+        );
+    }
+
+    // 4. Local PDF — any paper that has a file on disk. The endpoint
+    //    enforces existence + path-traversal checks; if the file is
+    //    missing it returns 404 and the user gets a clean error.
+    if (p.pdf_filename) {
+        const url = '/api/pdf/' + encodeURIComponent(p.canonical_id);
+        const tooltip = (p.validation_status || '').startsWith('VALID')
+            ? 'Open local PDF (verified)'
+            : (p.validation_status === 'INVALID')
+                ? 'Open local PDF (failed validation)'
+                : 'Open local PDF (validation pending or flagged)';
+        links.push(
+            '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" ' +
+            'title="' + escAttr(tooltip) + '" ' +
+            'style="text-decoration:none;color:var(--success)">&#128196; PDF</a>'
+        );
+    }
+
+    // 5. "Try via SSO" — only when a paywall was hit. Switches the user
+    //    to the SSO panel (the queue already contains this paper).
+    if (p.state === 'MANUAL_REQUIRED' && p.last_failure_code === 'PAYWALL_DETECTED') {
+        links.push(
+            '<button class="btn btn-sm btn-outline" ' +
+            'onclick="trySsoForPaper(\'' + escAttr(p.canonical_id) + '\')" ' +
+            'title="Open the SSO panel and highlight this paper" ' +
+            'style="margin-left:6px;padding:1px 6px;font-size:11px">Try via SSO</button>'
+        );
+    }
+
+    return links.length ? links.join('') :
+        '<span style="color:var(--text-secondary);font-size:11px">—</span>';
+}
+
 function renderPaperRow(p) {
     const sc = p.confidence_level === 'HIGH' ? 'score-high' : p.confidence_level === 'MEDIUM' ? 'score-medium' : 'score-low';
     const flagged = p.identity_status === 'VERSION_MISMATCH' || p.identity_status === 'CONTENT_UNVERIFIED';
-    const actions = flagged && !p.user_override ?
+    // Preview is ONLY for rows that need human review — VERSION_MISMATCH,
+    // CONTENT_UNVERIFIED, or TITLE_VERIFIED_WEAK (added in FIX 3). Never
+    // shown on COMPLETE+VALID — those users open via the Links column.
+    const needsReview = (
+        p.identity_status === 'VERSION_MISMATCH' ||
+        p.identity_status === 'CONTENT_UNVERIFIED' ||
+        p.identity_status === 'TITLE_VERIFIED_WEAK'
+    );
+    const canPreview = needsReview && !!p.pdf_filename;
+    const previewBtn = canPreview ?
+        '<button class="btn btn-sm btn-outline" onclick="openPreview(\'' + escAttr(p.canonical_id) + '\')" title="Review PDF inline before deciding">Preview</button> ' : '';
+    const actions = (flagged && !p.user_override) ?
+        previewBtn +
         '<button class="btn btn-sm btn-success" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'confirm_correct\')">OK</button> ' +
-        '<button class="btn btn-sm btn-warning" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'re_retrieve\')">Redo</button>' : '';
+        '<button class="btn btn-sm btn-warning" onclick="showOverride(\'' + escAttr(p.canonical_id) + '\',\'re_retrieve\')">Redo</button>'
+        : previewBtn;
     const stBadge = '<span class="badge ' + ({COMPLETE:'badge-success',FAILED:'badge-danger',MANUAL_REQUIRED:'badge-warning',RETRIEVING:'badge-info',VALIDATING:'badge-info',RETRIEVED:'badge-info'}[p.state]||'badge-neutral') + '">' + escHtml(p.state||'') + '</span>';
     const vsBadge = p.validation_status ? '<span class="badge ' + (p.validation_status.startsWith('VALID')?'badge-success':p.validation_status==='INVALID'?'badge-danger':'badge-warning') + '">' + escHtml(p.validation_status) + '</span>' : '';
     const idBadge = p.identity_status ? '<span class="badge ' + (flagged?'badge-warning':'badge-success') + '">' + escHtml(p.identity_status) + '</span>' : '';
+    const linksCell = renderLinksCell(p);
     return '<tr><td title="' + escAttr(p.title||'') + '">' + escHtml((p.title||'').substring(0,50)) + (p.title && p.title.length>50?'...':'') + '</td>' +
         '<td>' + escHtml(p.authors ? p.authors.split(';')[0].trim().substring(0,25) : '') + '</td>' +
         '<td>' + (p.year||'') + '</td><td title="' + escAttr(p.doi||'') + '">' + escHtml((p.doi||'').substring(0,20)) + '</td>' +
         '<td>' + stBadge + '</td><td>' + vsBadge + '</td><td>' + idBadge + '</td>' +
         '<td>' + escHtml(p.version_type||'') + '</td><td class="' + sc + '">' + (p.integrity_score!=null?p.integrity_score:'') + '</td>' +
         '<td>' + escHtml(p.retrieval_tier||'') + '</td><td>' + (p.supplement_count||0) + '</td><td>' + p.attempt_count + '</td>' +
-        '<td>' + escHtml(p.last_failure_code||'') + '</td><td>' + escHtml(p.user_override||'') + '</td><td>' + actions + '</td></tr>';
+        '<td>' + escHtml(p.last_failure_code||'') + '</td><td>' + escHtml(p.user_override||'') + '</td>' +
+        '<td style="white-space:nowrap">' + linksCell + '</td>' +
+        '<td>' + actions + '</td></tr>';
 }
+
+/* "Try via SSO" handler — switch panels and scroll the SSO queue list
+   to the row matching this paper, if present. The SSO queue already
+   contains every MANUAL_REQUIRED paper (per FIX 7), so no enqueue is
+   needed; we just bring the user there. */
+window.trySsoForPaper = async function(canonicalId) {
+    switchPanel('sso');
+    toast('Start the SSO session to retrieve this paper', 'info');
+    // Wait for the panel's queue to populate, then scroll the
+    // matching paper into view.
+    setTimeout(function() {
+        const list = document.getElementById('ssoQueueList');
+        if (!list) return;
+        const target = Array.from(list.children).find(function(child) {
+            return child.innerHTML.indexOf(canonicalId) >= 0
+                || child.textContent.indexOf(canonicalId) >= 0;
+        });
+        if (target) {
+            target.scrollIntoView({behavior: 'smooth', block: 'center'});
+            target.style.outline = '2px solid var(--accent)';
+            setTimeout(function() { target.style.outline = ''; }, 3000);
+        }
+    }, 600);
+};
 
 document.querySelectorAll('#resultsTabBar .tab').forEach(function(tab) {
     tab.addEventListener('click', function() {
@@ -2212,6 +3474,110 @@ document.querySelectorAll('th[data-sort]').forEach(function(th) {
 document.getElementById('btnPrevPage').addEventListener('click', function() { if (state.resultsPage > 0) { state.resultsPage--; loadResults(); } });
 document.getElementById('btnNextPage').addEventListener('click', function() { state.resultsPage++; loadResults(); });
 document.getElementById('resultsRunFilter').addEventListener('change', function() { state.resultsPage = 0; loadResults(); });
+
+/* ------------------------------------------------------------------
+   Inline PDF preview — flagged-paper review only
+   ------------------------------------------------------------------
+   Uses the browser's NATIVE PDF renderer via <iframe>. No PDF.js
+   dependency. The /api/pdf/{cid} endpoint (FIX 1) handles streaming
+   with Content-Disposition: inline + path-traversal guards.
+*/
+let _previewCurrentCid = null;
+
+window.openPreview = async function(cid) {
+    _previewCurrentCid = cid;
+    const modal = document.getElementById('previewModal');
+
+    // Reset header + open link while we fetch metadata
+    const pdfUrl = '/api/pdf/' + encodeURIComponent(cid);
+    document.getElementById('previewTitle').textContent = 'Loading...';
+    document.getElementById('previewMeta').textContent = '';
+    document.getElementById('previewFlags').innerHTML = '';
+    document.getElementById('previewOpenNewTab').href = pdfUrl;
+
+    // Fetch paper metadata for the header (title, authors, DOI, flags)
+    try {
+        const d = await GET('/api/paper/' + encodeURIComponent(cid));
+        const p = d.paper || {};
+        document.getElementById('previewTitle').textContent = p.title || '(no title)';
+        const parts = [];
+        if (p.authors) parts.push(p.authors.split(';')[0].trim());
+        if (p.year) parts.push(String(p.year));
+        if (p.journal) parts.push(p.journal);
+        if (p.doi) parts.push('DOI: ' + p.doi);
+        document.getElementById('previewMeta').textContent = parts.join(' · ');
+
+        // Flag summary with relevant badge
+        const flagParts = [];
+        if (p.validation_status) {
+            const vc = p.validation_status.startsWith('VALID') ? 'badge-success' :
+                       p.validation_status === 'INVALID' ? 'badge-danger' : 'badge-warning';
+            flagParts.push('<span class="badge ' + vc + '">' + escHtml(p.validation_status) + '</span>');
+        }
+        if (p.identity_status) {
+            flagParts.push('<span class="badge badge-warning">' + escHtml(p.identity_status) + '</span>');
+        }
+        if (p.integrity_score != null) {
+            const sc = p.confidence_level === 'HIGH' ? 'score-high' :
+                       p.confidence_level === 'MEDIUM' ? 'score-medium' : 'score-low';
+            flagParts.push('<span class="' + sc + '" style="font-weight:700">Score ' + p.integrity_score + '</span>');
+        }
+        document.getElementById('previewFlags').innerHTML = flagParts.join(' ');
+    } catch (e) {
+        document.getElementById('previewTitle').textContent = 'Paper ' + cid;
+    }
+
+    // Point iframe at the PDF — browser's native renderer takes over
+    document.getElementById('previewIframe').src = pdfUrl;
+    modal.classList.add('active');
+};
+
+function closePreview() {
+    const modal = document.getElementById('previewModal');
+    // Critical: unset iframe src so the browser frees the PDF from memory
+    // and stops any ongoing render work. Otherwise cycling through 20
+    // flagged papers leaks 20 loaded PDFs.
+    try { document.getElementById('previewIframe').src = 'about:blank'; } catch (e) {}
+    modal.classList.remove('active');
+    _previewCurrentCid = null;
+}
+
+document.getElementById('btnClosePreview').addEventListener('click', closePreview);
+
+// Escape key closes the preview (standard modal UX)
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('previewModal').classList.contains('active')) {
+        closePreview();
+    }
+});
+
+// "Confirm Correct" — reuse the existing override-with-reason flow.
+// Clicking Confirm closes the preview and opens the reason modal on top.
+document.getElementById('btnPreviewConfirm').addEventListener('click', function() {
+    const cid = _previewCurrentCid;
+    if (!cid) return;
+    closePreview();
+    // Small delay so the preview close animation finishes before the
+    // override modal opens (prevents visual flash on some browsers)
+    setTimeout(function() { window.showOverride(cid, 'confirm_correct'); }, 50);
+});
+
+// "Re-retrieve" — no reason needed; post directly and refresh.
+document.getElementById('btnPreviewReretrieve').addEventListener('click', async function() {
+    const cid = _previewCurrentCid;
+    if (!cid) return;
+    if (!confirm('Reset this paper to READY_FOR_RETRIEVAL and re-attempt retrieval?')) return;
+    try {
+        await POST('/api/override', {
+            canonical_id: cid,
+            action: 're_retrieve',
+            reason: 'Reviewer re-retrieve from preview',
+        });
+        toast('Paper queued for re-retrieval', 'success');
+        closePreview();
+        if (typeof loadResults === 'function') loadResults();
+    } catch (err) { toast(err.message, 'error'); }
+});
 
 /* Override modal */
 window.showOverride = function(cid, action) {
@@ -2286,6 +3652,13 @@ function formatBytes(b) {
                 document.getElementById('uploadResults').style.display = 'block';
                 startEnrichmentSSE();
             }
+        } catch (e) {}
+
+        // Bootstrap the EZproxy prefix so Results-table Links column
+        // can build SSO URLs without requiring the user to visit SSO first.
+        try {
+            const q = await GET('/api/sso/queue');
+            if (q && q.proxy_prefix) state.proxyPrefix = q.proxy_prefix;
         } catch (e) {}
     } catch(e) { toast('Could not connect to server', 'error'); }
     updateRunButtons();
