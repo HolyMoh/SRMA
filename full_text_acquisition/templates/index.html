@@ -595,7 +595,7 @@
                 <span class="nav-icon">&#9654;</span> Run
             </div>
             <div class="nav-item" data-panel="sso">
-                <span class="nav-icon">&#128274;</span> SSO
+                <span class="nav-icon">&#128274;</span> Paywalled
             </div>
             <div class="nav-item" data-panel="results">
                 <span class="nav-icon">&#128203;</span> Results
@@ -900,6 +900,46 @@
                 </div>
             </div>
 
+            <div class="card" id="zoteroSettingsCard" style="border-left:3px solid #d62d20">
+                <div class="card-header">
+                    <h3>Zotero Integration</h3>
+                    <span class="badge" id="zoteroCredsBadge">Not configured</span>
+                </div>
+                <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.6">
+                    Push paywalled papers to a Zotero collection, then use the
+                    Zotero Connector in your own browser to save PDFs into that
+                    collection. The system polls Zotero and ingests the PDFs through
+                    the same 7-check validation as Manual Mode. Your Zotero
+                    credentials stay on this machine.
+                    <a href="https://www.zotero.org/settings/keys" target="_blank"
+                       rel="noopener noreferrer">Get an API key &rarr;</a>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Zotero API Key</label>
+                        <input type="password" class="form-control" id="cfgZoteroApiKey"
+                               placeholder="e.g. P9v...xYz" autocomplete="off">
+                        <div class="form-hint">Library-level read + write scope required.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Zotero User ID</label>
+                        <input type="text" class="form-control" id="cfgZoteroUserId"
+                               placeholder="e.g. 1234567" inputmode="numeric">
+                        <div class="form-hint">Find on <em>Settings &rarr; Feeds/API</em>.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Collection name</label>
+                        <input type="text" class="form-control" id="cfgZoteroCollectionName"
+                               placeholder="SRMA Queue: {project}">
+                        <div class="form-hint">Auto-created on first push. Leave blank for default.</div>
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-outline btn-sm" id="btnZoteroTest">Test Credentials</button>
+                </div>
+                <div id="zoteroTestResult" style="margin-top:10px;font-size:12px"></div>
+            </div>
+
             <div class="card">
                 <div class="card-header">
                     <h3>API Cache</h3>
@@ -1129,18 +1169,28 @@
              ============================================================ -->
         <div id="panelSso" class="panel">
             <div class="panel-header">
-                <h2>Institutional SSO Access</h2>
+                <h2>Paywalled Retrieval</h2>
                 <span class="badge" id="ssoPhaseBadge">idle</span>
             </div>
 
-            <!-- Security reminder — always visible -->
-            <div class="card" style="border-left: 3px solid var(--success); background: #f0fdf4">
+            <!-- Strategy chooser — the three recommended paths, in priority order.
+                 Playwright-driven SSO batch automation has been demoted to
+                 "Experimental Batch Mode" below, because single-tab bookmarklet
+                 + Zotero Connector + Manual Mode together beat it on reliability
+                 and privacy for every real-world session we've observed. -->
+            <div class="card" style="border-left:3px solid var(--success); background:#f0fdf4">
                 <div style="font-size:13px; line-height:1.6">
-                    <strong style="color:var(--success)">&#128274; Your credentials stay private</strong><br>
-                    The system opens a real browser window for you. <strong>You</strong> type your login.
-                    We never read, log, store, or screenshot anything in that browser. The browser
-                    context is destroyed when you end the session — no cookies are kept.
+                    <strong style="color:var(--success)">&#128274; Your credentials stay on your machine.</strong>
+                    Pick any of the three retrieval paths below. They all use
+                    <em>your</em> browser session (the one you already logged in with) —
+                    SRMA never sees your institutional password. Use whichever
+                    matches your workflow; they can run concurrently.
                 </div>
+                <ol style="margin:10px 0 0 20px;font-size:12px;color:var(--text-secondary);line-height:1.7">
+                    <li><strong>Manual Mode</strong> — drop PDFs into a watched folder. Maximum privacy.</li>
+                    <li><strong>Zotero</strong> — push the queue as a collection; save PDFs with the Zotero Connector; we pull them back.</li>
+                    <li><strong>Bookmarklet</strong> — one-click upload from any publisher page.</li>
+                </ol>
             </div>
 
             <!-- ============================================================
@@ -1214,6 +1264,89 @@
                 </div>
             </div>
 
+            <!-- ============================================================
+                 ZOTERO INTEGRATION — push queue, poll for user-captured PDFs
+                 ============================================================ -->
+            <div class="card" id="zoteroCard" style="border-left:3px solid #d62d20">
+                <div class="card-header">
+                    <h3>&#128218; Zotero Integration</h3>
+                    <span class="badge" id="zoteroStatusBadge">Not configured</span>
+                </div>
+                <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.6">
+                    <strong>Use the Zotero Connector you already have.</strong>
+                    Push the paywalled-paper queue as a Zotero collection. When
+                    you save PDFs to that collection with the Zotero Connector
+                    (on the publisher page, after your institutional login),
+                    the poller pulls them back and validates each one.
+                </div>
+
+                <div id="zoteroNotConfiguredHint" style="padding:10px;background:#fef3c7;border-radius:var(--radius-sm);font-size:12px;display:none">
+                    Configure your Zotero API key and user ID in
+                    <a href="#" id="zoteroOpenSettingsLink">Settings</a>
+                    first, then return here.
+                </div>
+
+                <div id="zoteroConfiguredPanel" style="display:none">
+                    <div id="zoteroMessage" style="font-size:12px;color:var(--text-secondary);min-height:18px;margin-bottom:12px"></div>
+
+                    <div class="btn-group" style="flex-wrap:wrap;gap:8px">
+                        <button class="btn btn-primary" id="btnZoteroPush"
+                                title="Push all MANUAL_REQUIRED papers (with DOIs) to a Zotero collection.">
+                            Push Queue to Zotero
+                        </button>
+                        <button class="btn btn-success" id="btnZoteroPollerStart" disabled>Start Poller</button>
+                        <button class="btn btn-outline" id="btnZoteroPollerStop" disabled>Stop Poller</button>
+                    </div>
+
+                    <div class="card-grid" style="margin-top:16px">
+                        <div class="metric-card">
+                            <div class="metric-value score-high" id="zoteroIngested">0</div>
+                            <div class="metric-label">Ingested + Validated</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-value score-medium" id="zoteroValFailed">0</div>
+                            <div class="metric-label">Validation Failed</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-value" id="zoteroPollItems">0</div>
+                            <div class="metric-label">Items in Collection</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-value" id="zoteroPushedLast">0</div>
+                            <div class="metric-label">Pushed (last run)</div>
+                        </div>
+                    </div>
+
+                    <div id="zoteroCollectionInfo" style="margin-top:12px;font-size:11px;font-family:var(--mono);color:var(--text-secondary);word-break:break-all"></div>
+                    <div id="zoteroLastPoll" style="margin-top:4px;font-size:11px;color:var(--text-secondary)"></div>
+                </div>
+            </div>
+
+            <!-- ============================================================
+                 BROWSER BOOKMARKLET — one-click upload from publisher page
+                 ============================================================ -->
+            <div class="card" id="bookmarkletCard" style="border-left:3px solid var(--accent)">
+                <div class="card-header">
+                    <h3>&#128278; Browser Bookmarklet</h3>
+                    <span class="badge badge-neutral">One-click upload</span>
+                </div>
+                <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.6">
+                    Install a bookmarklet in your browser once. On any
+                    paywalled paper page (after institutional login), click it
+                    and the PDF is fetched with your session cookies and
+                    uploaded straight to this server. No drop folder needed.
+                </div>
+                <div class="btn-group" style="flex-wrap:wrap;gap:8px">
+                    <a class="btn btn-primary" href="/api/bookmarklet" target="_blank" rel="noopener noreferrer">
+                        Open Install Page
+                    </a>
+                    <a class="btn btn-outline btn-sm" href="/api/bookmarklet.js" target="_blank" rel="noopener noreferrer"
+                       title="Inspect the JS source before you install it.">
+                        View Source
+                    </a>
+                </div>
+            </div>
+
             <!-- Manual Mode Queue — augmented listing with Mark Unobtainable + suggested actions -->
             <div class="card" id="manualQueueCard" style="display:none">
                 <div class="card-header">
@@ -1223,8 +1356,37 @@
                 <div id="manualQueueList" style="max-height:420px;overflow-y:auto;font-size:12px"></div>
             </div>
 
+            <!-- ============================================================
+                 EXPERIMENTAL BATCH MODE — Playwright-driven SSO automation.
+                 Demoted in Part 4 because publisher-side friction (CAPTCHAs,
+                 session-timeouts, consent banners, interstitials) means
+                 single-tab flows (Manual/Zotero/Bookmarklet) are more reliable.
+                 Kept behind a collapsed <details> so it doesn't distract from
+                 the three recommended paths above.
+                 ============================================================ -->
+            <details class="card" id="batchModeWrap" style="border-left:3px solid var(--warning);background:#fffbeb">
+                <summary style="cursor:pointer;padding:2px 0">
+                    <span style="font-weight:600;font-size:15px">&#9888; Experimental Batch Mode</span>
+                    <span class="badge badge-warning" style="margin-left:8px">Legacy</span>
+                </summary>
+                <div style="margin-top:12px;font-size:13px;color:var(--text-secondary);line-height:1.6">
+                    Automated Playwright SSO session. Opens a real browser you
+                    log into once; the system then navigates each paper and
+                    downloads PDFs in sequence. In practice this hits publisher
+                    interstitials, CAPTCHAs, and session timeouts often enough
+                    that the three paths above are faster and more reliable.
+                    Kept for large (&gt; 50-paper) runs where your institution
+                    exposes a well-behaved proxy.
+                </div>
+                <div style="margin-top:10px;padding:10px 12px;background:#fef3c7;border-radius:6px;font-size:12px">
+                    <strong>Before you use this:</strong> make sure Playwright
+                    and a Chromium browser are installed (see Settings &rarr;
+                    Setup Wizard). If Playwright isn't available, this whole
+                    section is inert.
+                </div>
+
             <!-- STEP 1: QUEUE VISIBILITY -->
-            <div class="card">
+            <div class="card" style="margin-top:16px">
                 <div class="card-header">
                     <h3>Step 1 &middot; SSO Queue</h3>
                     <button class="btn btn-outline btn-sm" id="btnSsoReloadQueue">Refresh</button>
@@ -1369,6 +1531,7 @@
                     <div id="ssoAuditFunctionList" style="font-family:var(--mono);font-size:11px"></div>
                 </details>
             </div>
+            </details><!-- /batchModeWrap -->
         </div>
 
         <!-- ============================================================
@@ -1387,6 +1550,8 @@
                     <button class="btn btn-outline btn-sm" id="btnExportIntegration">Export Integration</button>
                     <button class="btn btn-primary btn-sm" id="btnExportBundle"
                             title="Submission bundle: config, audit log, PRISMA, PDFs, supplements, SHA-256 manifest">Download Submission Bundle</button>
+                    <button class="btn btn-success btn-sm" id="btnDownloadQueuePack"
+                            title="Self-contained HTML navigation dashboard for paywalled papers. Open in your own browser; downloads go into Manual Mode drop folder.">Download Queue Pack</button>
                 </div>
             </div>
 
@@ -2064,6 +2229,20 @@ async function loadSettings() {
         // Trigger an initial validation of the loaded value
         validatePathInput(document.getElementById('cfgOutputDir'));
 
+        // Zotero fields — API key comes back masked (e.g. "****abcd") with
+        // a separate boolean `zotero_api_key_set`. Show the masked value in
+        // the password field so the user sees something is set, but the
+        // PUT handler will skip it if the user doesn't retype.
+        document.getElementById('cfgZoteroApiKey').value = c.zotero_api_key || '';
+        document.getElementById('cfgZoteroUserId').value = c.zotero_user_id || '';
+        document.getElementById('cfgZoteroCollectionName').value = c.zotero_collection_name || '';
+        const zBadge = document.getElementById('zoteroCredsBadge');
+        if (zBadge) {
+            const configured = !!(c.zotero_api_key_set && c.zotero_user_id);
+            zBadge.textContent = configured ? 'Configured' : 'Not configured';
+            zBadge.className = 'badge ' + (configured ? 'badge-success' : 'badge-neutral');
+        }
+
         const ocrEl = document.getElementById('settingsOcrStatus');
         ocrEl.textContent = data.ocr_available ? (data.ghostscript_available ? 'Full OCR' : 'Tesseract Only') : 'Disabled';
         ocrEl.className = 'badge ' + (data.ocr_available ? 'badge-success' : 'badge-warning');
@@ -2107,8 +2286,16 @@ document.getElementById('btnSaveSettings').addEventListener('click', async funct
         if (!isNaN(v)) body[f[0]] = v;
     });
     body.min_disk_space_bytes = diskMb * 1048576;
-    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail'],['output_directory','cfgOutputDir']];
+    const strFields = [['sso_proxy_url','cfgEzproxy'],['openathens_url','cfgOpenAthens'],['institutional_resolver_url','cfgResolver'],['unpaywall_email','cfgUnpaywallEmail'],['output_directory','cfgOutputDir'],['zotero_user_id','cfgZoteroUserId'],['zotero_collection_name','cfgZoteroCollectionName']];
     strFields.forEach(function(f) { const v = document.getElementById(f[1]).value; if (v) body[f[0]] = v; });
+
+    // Zotero API key: only send if the user typed something that isn't the
+    // mask. Server also guards against this, but filtering client-side
+    // keeps the audit-log noise down.
+    const zKey = document.getElementById('cfgZoteroApiKey').value || '';
+    if (zKey && !zKey.startsWith('*')) {
+        body.zotero_api_key = zKey;
+    }
 
     try {
         await PUT('/api/settings', body);
@@ -2302,6 +2489,11 @@ function handleStreamEvent(m) {
     // --- Manual Mode: live counters + disambiguation surfacing ---
     if (m.manual_mode && typeof renderManualModeFromStream === 'function') {
         renderManualModeFromStream(m.manual_mode);
+    }
+
+    // --- Zotero: credential presence + poller + push counters ---
+    if (m.zotero && typeof renderZoteroFromStream === 'function') {
+        renderZoteroFromStream(m.zotero);
     }
 
     // --- Current project: keeps sidebar header in sync ---
@@ -3620,6 +3812,159 @@ document.getElementById('btnExportBundle').addEventListener('click', function() 
     }
     toast('Preparing submission bundle — this may take a moment for large runs...', 'info');
     window.location.href = '/api/export/bundle?run_id=' + encodeURIComponent(r);
+});
+
+document.getElementById('btnDownloadQueuePack').addEventListener('click', async function() {
+    // Warn if Manual Mode isn't configured — the queue pack is a
+    // navigation aid ON TOP of FIX 4's watched folder; without that
+    // folder, the user has nowhere to drop their downloaded PDFs.
+    try {
+        const s = await GET('/api/settings');
+        const folder = (s.config && s.config.manual_drop_folder) || '';
+        if (!folder) {
+            if (!confirm(
+                'Manual Mode drop folder is NOT configured.\n\n' +
+                'The Queue Pack is a browser dashboard that opens EZproxy ' +
+                'links for you. Actual PDF ingestion happens through the ' +
+                'Manual Mode watched folder — without one, you have ' +
+                'nowhere to drop your downloads.\n\n' +
+                'Download the Queue Pack anyway? (You can configure ' +
+                'Manual Mode later in the SSO panel.)'
+            )) return;
+        }
+    } catch (e) {}
+
+    const r = document.getElementById('resultsRunFilter').value;
+    const suffix = r ? '?run_id=' + encodeURIComponent(r) : '';
+    toast('Downloading Queue Pack — open it in your own browser', 'info');
+    window.location.href = '/api/export/queue-pack' + suffix;
+});
+
+/* ------------------------------------------------------------------
+   ZOTERO INTEGRATION — credentials card + push/poller card
+   ------------------------------------------------------------------
+   Credentials UI lives in the Settings panel; push/poller controls
+   live in the SSO panel. Both read from the unified SSE stream so
+   there's no polling. All buttons call /api/zotero/* endpoints.
+*/
+function renderZoteroFromStream(z) {
+    const configured = !!z.configured;
+    const running = !!z.poller_running;
+
+    const badge = document.getElementById('zoteroStatusBadge');
+    if (badge) {
+        if (!configured) {
+            badge.textContent = 'Not configured';
+            badge.className = 'badge badge-neutral';
+        } else if (running) {
+            badge.textContent = 'Poller running';
+            badge.className = 'badge badge-success';
+        } else {
+            badge.textContent = 'Idle';
+            badge.className = 'badge badge-warning';
+        }
+    }
+    const hint = document.getElementById('zoteroNotConfiguredHint');
+    const panel = document.getElementById('zoteroConfiguredPanel');
+    if (hint && panel) {
+        hint.style.display = configured ? 'none' : 'block';
+        panel.style.display = configured ? 'block' : 'none';
+    }
+
+    const msg = document.getElementById('zoteroMessage');
+    if (msg) {
+        msg.textContent = z.last_message || '';
+        msg.style.color = z.last_poll_error ? 'var(--danger)' : 'var(--text-secondary)';
+    }
+
+    const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    setText('zoteroIngested', z.ingested_count || 0);
+    setText('zoteroValFailed', z.validation_failed_count || 0);
+    setText('zoteroPollItems', z.last_poll_items || 0);
+    setText('zoteroPushedLast', z.pushed_last_run || 0);
+
+    const info = document.getElementById('zoteroCollectionInfo');
+    if (info) {
+        info.textContent = z.collection_name
+            ? ('Collection: ' + z.collection_name + (z.collection_key ? ' (' + z.collection_key + ')' : ''))
+            : '';
+    }
+    const lp = document.getElementById('zoteroLastPoll');
+    if (lp) {
+        if (z.last_poll_at) {
+            lp.textContent = 'Last poll: ' + z.last_poll_at +
+                ' · version ' + (z.last_poll_version || 0);
+        } else {
+            lp.textContent = '';
+        }
+    }
+
+    // Button enablement: start requires configured + collection_key + not running;
+    // stop requires running. Push only requires configured.
+    const canStart = configured && !!z.collection_key && !running;
+    const canStop = running;
+    const btnPush = document.getElementById('btnZoteroPush');
+    const btnStart = document.getElementById('btnZoteroPollerStart');
+    const btnStop = document.getElementById('btnZoteroPollerStop');
+    if (btnPush) btnPush.disabled = !configured;
+    if (btnStart) btnStart.disabled = !canStart;
+    if (btnStop) btnStop.disabled = !canStop;
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    const btnTest = document.getElementById('btnZoteroTest');
+    if (btnTest) btnTest.addEventListener('click', async function() {
+        const out = document.getElementById('zoteroTestResult');
+        out.textContent = 'Testing...';
+        out.style.color = 'var(--text-secondary)';
+        try {
+            const r = await POST('/api/zotero/test');
+            const u = (r.info && r.info.username) ? r.info.username : '(unknown user)';
+            out.textContent = '✓ Verified as ' + u;
+            out.style.color = 'var(--success)';
+        } catch (err) {
+            out.textContent = '✗ ' + err.message;
+            out.style.color = 'var(--danger)';
+        }
+    });
+
+    const btnPush = document.getElementById('btnZoteroPush');
+    if (btnPush) btnPush.addEventListener('click', async function() {
+        btnPush.disabled = true;
+        try {
+            const r = await POST('/api/zotero/push');
+            if (r.status === 'no_items') {
+                toast('No DOI-bearing papers in the manual queue.', 'info');
+            } else {
+                toast('Pushed ' + (r.created || 0) + ' papers to "' +
+                      r.collection_name + '".', 'success');
+            }
+        } catch (err) { toast('Push failed: ' + err.message, 'error'); }
+        finally { btnPush.disabled = false; }
+    });
+
+    const btnStart = document.getElementById('btnZoteroPollerStart');
+    if (btnStart) btnStart.addEventListener('click', async function() {
+        try {
+            await POST('/api/zotero/poller/start');
+            toast('Zotero poller started.', 'success');
+        } catch (err) { toast(err.message, 'error'); }
+    });
+
+    const btnStop = document.getElementById('btnZoteroPollerStop');
+    if (btnStop) btnStop.addEventListener('click', async function() {
+        try {
+            await POST('/api/zotero/poller/stop');
+            toast('Zotero poller stopped.', 'info');
+        } catch (err) { toast(err.message, 'error'); }
+    });
+
+    const openSettings = document.getElementById('zoteroOpenSettingsLink');
+    if (openSettings) openSettings.addEventListener('click', function(e) {
+        e.preventDefault();
+        const nav = document.querySelector('.nav-item[data-panel="settings"]');
+        if (nav) nav.click();
+    });
 });
 
 /* ------------------------------------------------------------------

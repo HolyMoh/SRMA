@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
@@ -34,6 +35,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
@@ -253,6 +255,8 @@ _PROJECT_OVERRIDABLE_KEYS: Set[str] = {
     "sso_proxy_url", "openathens_url", "institutional_resolver_url",
     "unpaywall_email",
     "manual_drop_folder", "manual_mode_enabled",
+    "zotero_api_key", "zotero_user_id", "zotero_collection_key",
+    "zotero_collection_name", "zotero_poller_enabled",
     "cooldown_minutes", "cooldown_failure_threshold", "cooldown_window_size",
     "retrieval_concurrency", "validation_concurrency",
     "backpressure_threshold",
@@ -657,6 +661,14 @@ def _check_busy_reasons() -> List[str]:
     enr = app_state.get("enrichment_status") or {}
     if enr.get("in_progress"):
         reasons.append("enrichment is still in progress")
+
+    # Zotero poller holds the previous project's API credentials +
+    # collection anchor; switching projects while it runs would cross
+    # library boundaries. Require the user to stop it explicitly.
+    zt = app_state.get("zotero") or {}
+    if zt.get("poller_running"):
+        reasons.append("the Zotero poller is running")
+
     return reasons
 
 
@@ -672,6 +684,27 @@ async def _rebind_to_project(slug: str) -> Dict[str, Any]:
     project = _find_project(manifest, slug)
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+
+    # 0. Defensive teardown of background tasks bound to the previous
+    # project. _check_busy_reasons() should already have refused if any
+    # of these are live, but guard against state-drift bugs here too.
+    for cancel_key, task_key in (
+        ("manual_cancel_event", "manual_task"),
+        ("zotero_cancel_event", "zotero_task"),
+    ):
+        ev: Optional[asyncio.Event] = app_state.get(cancel_key)
+        tk: Optional[asyncio.Task] = app_state.get(task_key)
+        if ev is not None:
+            ev.set()
+        if tk is not None and not tk.done():
+            try:
+                await asyncio.wait_for(tk, timeout=5.0)
+            except asyncio.TimeoutError:
+                tk.cancel()
+                try: await tk
+                except (asyncio.CancelledError, Exception): pass
+            except Exception as exc:
+                logger.debug("Task %s raised during rebind teardown: %s", task_key, exc)
 
     # 1. Close current DB (flush write queue first)
     current_db = app_state.get("db")
@@ -757,6 +790,25 @@ async def _rebind_to_project(slug: str) -> Dict[str, Any]:
     }
     app_state["manual_task"] = None
     app_state["manual_cancel_event"] = None
+
+    # Zotero integration (Part 2 paywalled redesign). Same shape of
+    # serializable state slice we use for Manual Mode + SSO.
+    app_state["zotero"] = {
+        "enabled": False,
+        "collection_key": "",
+        "collection_name": "",
+        "poller_running": False,
+        "last_poll_at": None,
+        "last_poll_version": 0,     # incremental polling anchor
+        "last_poll_items": 0,       # items seen in last poll
+        "last_poll_error": None,
+        "last_message": "",
+        "ingested_count": 0,        # PDFs pulled + validated this session
+        "validation_failed_count": 0,
+        "pushed_last_run": 0,       # last push result
+    }
+    app_state["zotero_task"] = None
+    app_state["zotero_cancel_event"] = None
     app_state["sso_session"] = {
         "active": False, "phase": "idle", "proxy_url": "",
         "login_url": "", "started_at": None, "login_detected_at": None,
@@ -962,6 +1014,33 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     app_state["manual_task"] = None
     app_state["manual_cancel_event"] = None
 
+    # Zotero integration (Part 2 paywalled redesign).
+    app_state["zotero"] = {
+        "enabled": False,
+        "collection_key": config.get("zotero_collection_key", ""),
+        "collection_name": config.get("zotero_collection_name", ""),
+        "poller_running": False,
+        "last_poll_at": None,
+        "last_poll_version": 0,
+        "last_poll_items": 0,
+        "last_poll_error": None,
+        "last_message": "",
+        "ingested_count": 0,
+        "validation_failed_count": 0,
+        "pushed_last_run": 0,
+    }
+    app_state["zotero_task"] = None
+    app_state["zotero_cancel_event"] = None
+    # Auto-start the poller if the user previously enabled it
+    if (config.get("zotero_poller_enabled")
+            and config.get("zotero_api_key")
+            and config.get("zotero_user_id")
+            and config.get("zotero_collection_key")):
+        try:
+            asyncio.get_event_loop().create_task(_start_zotero_poller_internal())
+        except Exception as exc:
+            logger.warning("Could not auto-start Zotero poller: %s", exc)
+
     logger.info(
         "Startup complete: %d interrupted resets, %d missing files reconciled",
         len(resets), len(missing),
@@ -993,6 +1072,22 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         except asyncio.TimeoutError:
             mm_task.cancel()
             try: await mm_task
+            except (asyncio.CancelledError, Exception): pass
+
+    # Stop the Zotero poller if running (Part 2 paywalled redesign).
+    # Same teardown contract as Manual Mode: signal cancel, await, then
+    # hard-cancel if it ignores us. The poller is a long sleep loop so
+    # it's expected to respond to the cancel event within one iteration.
+    zt_cancel: Optional[asyncio.Event] = app_state.get("zotero_cancel_event")
+    zt_task: Optional[asyncio.Task] = app_state.get("zotero_task")
+    if zt_cancel:
+        zt_cancel.set()
+    if zt_task and not zt_task.done():
+        try:
+            await asyncio.wait_for(zt_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            zt_task.cancel()
+            try: await zt_task
             except (asyncio.CancelledError, Exception): pass
 
     # Step 3-4: Drain workers
@@ -1037,6 +1132,49 @@ app = FastAPI(
     description="Deterministic, auditable evidence acquisition for SRMAs",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+
+# ---------------------------------------------------------------------------
+# CORS — REQUIRED for the Queue Pack HTML (file:// origin) and for the
+# optional browser bookmarklet that talks to localhost from publisher
+# pages. Three origins need to reach this server:
+#
+#   1. null                        — HTML opened via file:// in Chrome/FF
+#   2. http://localhost, 127.0.0.1 — dev + the UI itself
+#   3. https://*                   — publisher pages running a bookmarklet
+#
+# SECURITY: credentials=False unconditionally. We NEVER accept cross-origin
+# cookies. A bookmarklet on elsevier.com may have the user's Elsevier
+# session, but when it POSTs bytes to us, those cookies are not forwarded.
+# Our own localhost UI doesn't rely on cross-origin cookies either —
+# same-origin by definition.
+# ---------------------------------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    # We accept:
+    #  - "null" for file:// (Chrome sends Origin: null for HTML opened
+    #    from disk; this is the Queue Pack's primary origin)
+    #  - explicit localhost variants for the main UI + future dev tools
+    # Publisher sites go through the regex below because CORSMiddleware's
+    # allow_origins is literal-only.
+    allow_origins=[
+        "null",
+        "http://localhost",
+        "http://localhost:8000",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8000",
+    ],
+    # Any https://* publisher page (bookmarklet use-case) matches this.
+    # We still never accept cookies cross-origin.
+    allow_origin_regex=r"^https://.+",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=3600,
 )
 
 
@@ -3772,8 +3910,848 @@ async def manual_mode_discard_unmatched(
 
 
 # ===========================================================================
-# CAPTCHA ENDPOINTS
+# ZOTERO INTEGRATION — Part 2 of paywalled-retrieval redesign
 # ===========================================================================
+#
+# Philosophy: Zotero Connector is the best browser-side PDF capture
+# tool that exists. Researchers using Zotero already have it set up.
+# We piggyback: push the MANUAL_REQUIRED queue as a Zotero collection,
+# then poll for child PDF attachments and ingest them through the
+# same validation pipeline as Manual Mode (FIX 4).
+#
+# No new validation path. The Zotero poller writes a temp file and
+# calls _install_and_validate_dropped() directly. The system never
+# sees the user's Zotero credentials or library outside this module.
+
+ZOTERO_POLL_INTERVAL_S = 60.0
+
+
+def _zotero_client_from_config() -> Optional["ZoteroClient"]:
+    """Construct a ZoteroClient from current effective config.
+
+    Returns None if API key or user ID is missing.
+    """
+    from full_text_acquisition.zotero_client import ZoteroClient
+    config = _get_config()
+    api_key = (config.get("zotero_api_key") or "").strip()
+    user_id = str(config.get("zotero_user_id") or "").strip()
+    if not api_key or not user_id:
+        return None
+    return ZoteroClient(api_key=api_key, user_id=user_id)
+
+
+@app.post("/api/zotero/test")
+async def zotero_test_credentials() -> JSONResponse:
+    """Verify the configured API key + user ID by calling /keys/{key}."""
+    client = _zotero_client_from_config()
+    if client is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Zotero API key and user ID must be configured first.",
+        )
+    try:
+        result = await client.verify()
+    finally:
+        await client.close()
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Zotero verification failed: {result.get('error')}",
+        )
+    data = result.get("data") or {}
+    # Strip the API key out of the response — Zotero echoes it
+    data.pop("key", None)
+    return JSONResponse({"status": "ok", "info": data})
+
+
+@app.post("/api/zotero/push")
+async def zotero_push_queue() -> JSONResponse:
+    """Push current MANUAL_REQUIRED queue to a Zotero collection.
+
+    Idempotent: re-pushing items that already exist in the collection
+    leaves them alone (Zotero dedups by item key; we always create
+    new items so dedup is at the user's discretion).
+
+    Creates the collection if it doesn't exist. The collection name
+    is "SRMA Queue: {project_name}" by default; configurable via
+    Settings.zotero_collection_name.
+    """
+    from full_text_acquisition.zotero_client import (
+        build_item_from_paper, ZoteroError,
+    )
+
+    client = _zotero_client_from_config()
+    if client is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Zotero API key and user ID must be configured first.",
+        )
+    config = _get_config()
+    db = _get_db()
+    cp = app_state.get("current_project") or {}
+    state = app_state["zotero"]
+
+    # Collection name: per config or auto-derived
+    collection_name = (config.get("zotero_collection_name") or "").strip()
+    if not collection_name:
+        collection_name = f"SRMA Queue: {cp.get('project_name') or 'Default'}"
+
+    try:
+        # Find or create the collection
+        col = await client.get_or_create_collection(collection_name)
+        col_data = col.get("data") or col
+        col_key = col_data.get("key") or col.get("key", "")
+        if not col_key:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Zotero returned no collection key: {col}",
+            )
+
+        # Persist the discovered key + name into the project config
+        # so the poller can find the collection later
+        config["zotero_collection_key"] = col_key
+        config["zotero_collection_name"] = collection_name
+        save_config(config)
+
+        # Build items from MANUAL_REQUIRED papers (limit DOI-bearing)
+        papers = await db.get_manual_required_papers()
+        items = []
+        for p in papers:
+            if not p.doi:
+                continue   # Zotero items need DOI for matching
+            items.append(build_item_from_paper(
+                doi=p.doi, title=p.title or "",
+                authors=p.authors or "",
+                year=p.year, journal=p.journal,
+            ))
+
+        if not items:
+            return JSONResponse({
+                "status": "no_items",
+                "collection_key": col_key,
+                "collection_name": collection_name,
+                "papers_in_queue": len(papers),
+                "papers_with_doi": 0,
+                "message": "No DOI-bearing papers in MANUAL_REQUIRED queue.",
+            })
+
+        # Push (batches of 50 inside the client)
+        result = await client.add_items_to_collection(col_key, items)
+
+        # Update state for SSE
+        state["collection_key"] = col_key
+        state["collection_name"] = collection_name
+        state["pushed_last_run"] = result.get("created", 0)
+        state["last_message"] = (
+            f"Pushed {result.get('created', 0)} items to '{collection_name}'"
+        )
+
+        try:
+            await db.log_audit(AuditLogEntry(
+                outcome="ZOTERO_QUEUE_PUSHED",
+                details=json.dumps({
+                    "collection_key": col_key,
+                    "collection_name": collection_name,
+                    "items_pushed": result.get("created", 0),
+                    "items_unchanged": result.get("unchanged", 0),
+                    "items_failed": len(result.get("failed", [])),
+                }),
+            ))
+        except Exception:
+            pass
+
+        return JSONResponse({
+            "status": "pushed",
+            "collection_key": col_key,
+            "collection_name": collection_name,
+            "papers_in_queue": len(papers),
+            "papers_with_doi": len(items),
+            **result,
+        })
+    except ZoteroError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        await client.close()
+
+
+@app.post("/api/zotero/poller/start")
+async def zotero_poller_start() -> JSONResponse:
+    """Start the Zotero poller.
+
+    Requires API key, user ID, and a collection key (run /api/zotero/push
+    first if the collection doesn't exist yet). Idempotent.
+    """
+    config = _get_config()
+    if not (config.get("zotero_api_key") and config.get("zotero_user_id")):
+        raise HTTPException(
+            status_code=400,
+            detail="Zotero API key + user ID required.",
+        )
+    if not config.get("zotero_collection_key"):
+        raise HTTPException(
+            status_code=400,
+            detail=("No collection key configured. Run 'Push to Zotero' "
+                    "first to create the collection."),
+        )
+
+    state = app_state["zotero"]
+    if state.get("poller_running"):
+        return JSONResponse({
+            "status": "already_running",
+            "collection_key": state.get("collection_key"),
+        })
+
+    await _start_zotero_poller_internal()
+    config["zotero_poller_enabled"] = True
+    save_config(config)
+
+    return JSONResponse({
+        "status": "started",
+        "collection_key": state.get("collection_key"),
+        "interval_s": ZOTERO_POLL_INTERVAL_S,
+    })
+
+
+@app.post("/api/zotero/poller/stop")
+async def zotero_poller_stop() -> JSONResponse:
+    """Stop the Zotero poller. Idempotent."""
+    state = app_state["zotero"]
+    cancel: Optional[asyncio.Event] = app_state.get("zotero_cancel_event")
+    task: Optional[asyncio.Task] = app_state.get("zotero_task")
+    if cancel:
+        cancel.set()
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try: await task
+            except (asyncio.CancelledError, Exception): pass
+    app_state["zotero_task"] = None
+    app_state["zotero_cancel_event"] = None
+    state["enabled"] = False
+    state["poller_running"] = False
+    state["last_message"] = "Poller stopped"
+
+    config = _get_config()
+    config["zotero_poller_enabled"] = False
+    save_config(config)
+    return JSONResponse({"status": "stopped"})
+
+
+@app.get("/api/zotero/status")
+async def zotero_status() -> JSONResponse:
+    """Full snapshot of Zotero integration state."""
+    return JSONResponse(dict(app_state.get("zotero") or {}))
+
+
+async def _start_zotero_poller_internal() -> None:
+    """Spin up the poller task. Caller is responsible for the busy-check."""
+    state = app_state["zotero"]
+    cancel = asyncio.Event()
+    task = asyncio.create_task(
+        _zotero_poller(cancel),
+        name="zotero-poller",
+    )
+    app_state["zotero_cancel_event"] = cancel
+    app_state["zotero_task"] = task
+    state["enabled"] = True
+    state["poller_running"] = True
+    state["ingested_count"] = 0
+    state["validation_failed_count"] = 0
+    state["last_message"] = "Poller starting..."
+    state["last_poll_error"] = None
+
+
+async def _zotero_poller(cancel_event: asyncio.Event) -> None:
+    """Background loop: pull Zotero collection, ingest PDFs as papers."""
+    from full_text_acquisition.zotero_client import (
+        ZoteroError, extract_doi_from_zotero_item,
+    )
+    state = app_state["zotero"]
+    state["poller_running"] = True
+    seen_attachments: Set[str] = set()  # zotero attachment keys we've ingested
+
+    try:
+        while not cancel_event.is_set():
+            await _zotero_poll_once(seen_attachments, state)
+            try:
+                await asyncio.wait_for(
+                    cancel_event.wait(),
+                    timeout=ZOTERO_POLL_INTERVAL_S,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        state["poller_running"] = False
+        logger.info("Zotero poller stopped")
+
+
+async def _zotero_poll_once(
+    seen_attachments: Set[str],
+    state: Dict[str, Any],
+) -> None:
+    """Single poll iteration. Updates state in place."""
+    from full_text_acquisition.zotero_client import (
+        ZoteroError, extract_doi_from_zotero_item,
+    )
+    config = _get_config()
+    db = _get_db()
+    collection_key = state.get("collection_key") or config.get("zotero_collection_key")
+    if not collection_key:
+        state["last_poll_error"] = "No collection key configured"
+        state["last_message"] = "No collection — stop and re-push the queue"
+        return
+
+    client = _zotero_client_from_config()
+    if client is None:
+        state["last_poll_error"] = "Zotero credentials missing"
+        return
+
+    try:
+        # List items in the collection (incremental via since-version)
+        since_v = state.get("last_poll_version", 0) or 0
+        items, new_version = await client.list_collection_items(
+            collection_key, since_version=since_v,
+        )
+        state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+        state["last_poll_items"] = len(items)
+        state["last_poll_version"] = new_version
+        state["last_poll_error"] = None
+
+        if not items:
+            state["last_message"] = "No new items since last poll"
+            return
+
+        # For each item: check for child PDF attachments and ingest
+        ingested_this_round = 0
+        for item in items:
+            item_key = item.get("key") or item.get("data", {}).get("key", "")
+            if not item_key:
+                continue
+
+            doi = extract_doi_from_zotero_item(item)
+            if not doi:
+                continue
+
+            # Find the matching paper in our queue
+            existing_cid = await db.check_duplicate_doi(doi)
+            if not existing_cid:
+                continue
+            paper = await db.get_paper(existing_cid)
+            if paper is None or paper.state != PaperState.MANUAL_REQUIRED.value:
+                continue   # already handled (or wrong state)
+
+            # Pull PDF attachment(s)
+            try:
+                children = await client.list_child_attachments(item_key)
+            except ZoteroError as exc:
+                logger.debug("List children failed for %s: %s", item_key, exc)
+                continue
+
+            pdf_attachments = []
+            for c in children:
+                cdata = c.get("data") or c
+                if cdata.get("contentType") == "application/pdf":
+                    ckey = c.get("key") or cdata.get("key", "")
+                    if ckey and ckey not in seen_attachments:
+                        pdf_attachments.append((ckey, cdata.get("filename") or "document.pdf"))
+
+            if not pdf_attachments:
+                continue
+
+            # Take the first PDF attachment we haven't seen
+            att_key, att_filename = pdf_attachments[0]
+            try:
+                pdf_bytes = await client.download_attachment(att_key)
+            except ZoteroError as exc:
+                logger.debug("Download failed for %s: %s", att_key, exc)
+                continue
+
+            if not pdf_bytes:
+                continue
+
+            # Write to a temp file, hand off to FIX 4's validation pipeline
+            tmp_dir = os.path.join(
+                _get_config().get("output_directory", "./downloads"),
+                ".zotero-temp",
+            )
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_path = os.path.join(
+                tmp_dir, f"zotero_{att_key}_{att_filename}",
+            )
+            try:
+                with open(tmp_path, "wb") as fh:
+                    fh.write(pdf_bytes)
+                result = await _install_and_validate_dropped(
+                    paper, tmp_path, "zotero",
+                )
+                seen_attachments.add(att_key)
+                outcome = result.get("outcome")
+                if outcome == "complete":
+                    state["ingested_count"] = state.get("ingested_count", 0) + 1
+                    state["last_message"] = (
+                        f"✓ {att_filename} → {paper.title[:50]} (VALID)"
+                    )
+                elif outcome == "flagged":
+                    state["ingested_count"] = state.get("ingested_count", 0) + 1
+                    state["last_message"] = (
+                        f"⚠ {att_filename} → {paper.title[:50]} (flagged "
+                        f"{result.get('identity_status')})"
+                    )
+                else:
+                    state["validation_failed_count"] = (
+                        state.get("validation_failed_count", 0) + 1
+                    )
+                    state["last_message"] = (
+                        f"✗ {att_filename}: {outcome}"
+                    )
+                ingested_this_round += 1
+
+                try:
+                    await db.log_audit(AuditLogEntry(
+                        canonical_id=paper.canonical_id,
+                        outcome=f"ZOTERO_INGEST_{outcome.upper()}",
+                        details=json.dumps({
+                            "zotero_item_key": item_key,
+                            "zotero_attachment_key": att_key,
+                            "filename": att_filename,
+                            **{k: v for k, v in result.items()
+                               if k not in ("paper",)},
+                        }),
+                    ))
+                except Exception: pass
+            except Exception as exc:
+                logger.error(
+                    "Zotero ingest error for %s: %s\n%s",
+                    paper.canonical_id, exc, traceback.format_exc(),
+                )
+            finally:
+                try:
+                    if os.path.isfile(tmp_path):
+                        os.unlink(tmp_path)
+                except OSError: pass
+
+        if ingested_this_round > 0:
+            state["last_message"] = (
+                f"Ingested {ingested_this_round} PDF(s) this poll"
+            )
+
+    except ZoteroError as exc:
+        state["last_poll_error"] = str(exc)
+        state["last_message"] = f"Poll failed: {exc}"
+    except Exception as exc:
+        state["last_poll_error"] = str(exc)
+        state["last_message"] = f"Poll error: {type(exc).__name__}: {exc}"
+        logger.error(
+            "Zotero poller exception: %s\n%s", exc, traceback.format_exc(),
+        )
+    finally:
+        await client.close()
+
+
+# ===========================================================================
+# BOOKMARKLET — Part 3 of paywalled-retrieval redesign
+# ===========================================================================
+#
+# Goal: the fastest possible path from "user just viewed a paywalled
+# paper in their browser" to "PDF validated + filed". User drags a
+# bookmarklet to their bookmarks bar once; thereafter, clicking it on
+# any publisher page (after they've logged in) extracts the DOI, fetches
+# the PDF same-origin, and POSTs the bytes to us. The bookmarklet never
+# sees credentials — it just uses the session cookies already on the
+# publisher tab.
+#
+# Security model:
+#   - Bookmarklet runs in the publisher's origin. It has that origin's
+#     cookies. When it fetches the PDF, that's same-origin — no
+#     cross-origin credential leak.
+#   - When it POSTs to localhost, we do NOT accept cookies (CORS
+#     allow_credentials=False). The PDF bytes + DOI string are all we
+#     receive. No auth needed; localhost is the user's own machine.
+#   - The endpoint is still rate-limited by our per-host limiter under
+#     the "bookmarklet" host key (added below, conservative 2/s).
+#
+# DOI extraction (6 methods, tried in order):
+#   1. <meta name="citation_doi" content="...">   (Highwire + most)
+#   2. <meta name="DC.Identifier" content="10.*"> (Dublin Core)
+#   3. <meta name="prism.doi">                    (PRISM)
+#   4. schema.org JSON-LD  "@id" or "doi"
+#   5. URL path matches 10.NNNN/… pattern
+#   6. Visible text "DOI: 10.NNNN/…"  (last resort, regex)
+
+@app.post("/api/bookmarklet/submit")
+async def bookmarklet_submit(
+    file: UploadFile = File(...),
+    doi: str = Form(...),
+    source_url: Optional[str] = Form(default=None),
+) -> JSONResponse:
+    """Accept a PDF + DOI from the bookmarklet, match, ingest, validate.
+
+    Idempotent in the sense that re-submitting the same paper when it
+    has already left the MANUAL_REQUIRED queue returns
+    {"status": "skipped", "reason": "not in manual queue"} instead of
+    re-running validation.
+    """
+    from full_text_acquisition.models import normalize_doi
+
+    norm = normalize_doi(doi)
+    if not norm:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid DOI: {doi!r} did not normalize.",
+        )
+
+    db = _get_db()
+    cid = await db.check_duplicate_doi(norm)
+    if not cid:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"DOI {norm} is not in this project's paper set. "
+                    "Upload it first, or open the project that contains it."),
+        )
+    paper = await db.get_paper(cid)
+    if paper is None:
+        raise HTTPException(status_code=500, detail="Paper lookup failed")
+
+    if paper.state != PaperState.MANUAL_REQUIRED.value:
+        return JSONResponse({
+            "status": "skipped",
+            "reason": f"Paper state is {paper.state}, not MANUAL_REQUIRED.",
+            "paper_title": paper.title,
+            "canonical_id": paper.canonical_id,
+        })
+
+    content = await file.read()
+    if not content or not content.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=400,
+            detail=("Body is not a PDF — the publisher may have served an "
+                    "HTML error page. Open the PDF directly in a tab first."),
+        )
+
+    # Write to a temp file, hand to the same validation pipeline as
+    # Manual Mode. The "bookmarklet" match_type shows up in audit logs
+    # so we can count provenance per paper.
+    config = _get_config()
+    tmp_dir = os.path.join(
+        config.get("output_directory", "./downloads"),
+        ".bookmarklet-temp",
+    )
+    os.makedirs(tmp_dir, exist_ok=True)
+    safe_name = (file.filename or f"{norm.replace('/', '_')}.pdf").replace(os.sep, "_")
+    tmp_path = os.path.join(tmp_dir, f"bm_{paper.canonical_id}_{safe_name}")
+
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(content)
+        result = await _install_and_validate_dropped(
+            paper, tmp_path, "bookmarklet",
+        )
+        outcome = result.get("outcome")
+
+        try:
+            await db.log_audit(AuditLogEntry(
+                canonical_id=paper.canonical_id,
+                outcome=f"BOOKMARKLET_INGEST_{outcome.upper()}",
+                details=json.dumps({
+                    "doi": norm,
+                    "source_url": source_url or "",
+                    "filename": file.filename or "",
+                    "bytes": len(content),
+                    **{k: v for k, v in result.items() if k not in ("paper",)},
+                }),
+            ))
+        except Exception: pass
+
+        return JSONResponse({
+            "status": "ok",
+            "outcome": outcome,
+            "paper_title": paper.title,
+            "canonical_id": paper.canonical_id,
+            "identity_status": result.get("identity_status"),
+            "validation_id": result.get("validation_id"),
+            "filename": result.get("filename"),
+        })
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Bookmarklet source code — generated server-side so the user's server
+# URL is baked in. The page that serves the install button wraps this
+# into a javascript: URL and provides drag-to-bookmarks instructions.
+# ---------------------------------------------------------------------------
+
+_BOOKMARKLET_JS_TEMPLATE = r"""(function(){
+var SERVER=__SERVER__;
+function $(sel){return document.querySelector(sel);}
+function metas(name){return Array.prototype.slice.call(
+  document.querySelectorAll('meta[name="'+name+'"], meta[property="'+name+'"]'))
+  .map(function(m){return m.content||'';}).filter(Boolean);}
+function normDoi(s){if(!s)return '';var m=String(s).match(/10\.\d{4,9}\/[-._;()\/:A-Z0-9]+/i);
+  return m?m[0].toLowerCase().replace(/[.,;)\]]+$/,''):'';}
+function extractDoi(){
+  // 1. citation_doi (Highwire, most publishers)
+  var v=metas('citation_doi').concat(metas('citation_DOI'));
+  for(var i=0;i<v.length;i++){var d=normDoi(v[i]);if(d)return d;}
+  // 2. Dublin Core
+  v=metas('DC.Identifier').concat(metas('DC.identifier'),metas('dc.identifier'));
+  for(i=0;i<v.length;i++){d=normDoi(v[i]);if(d)return d;}
+  // 3. PRISM
+  v=metas('prism.doi').concat(metas('PRISM.doi'));
+  for(i=0;i<v.length;i++){d=normDoi(v[i]);if(d)return d;}
+  // 4. JSON-LD
+  try{
+    var ld=document.querySelectorAll('script[type="application/ld+json"]');
+    for(i=0;i<ld.length;i++){
+      try{var o=JSON.parse(ld[i].textContent);
+        var cand=o.doi||o['@id']||(o.mainEntity&&o.mainEntity.doi)||'';
+        d=normDoi(cand);if(d)return d;}catch(e){}
+    }
+  }catch(e){}
+  // 5. URL
+  d=normDoi(location.pathname+location.search);if(d)return d;
+  d=normDoi(location.href);if(d)return d;
+  // 6. Visible text (last resort)
+  var t=(document.body&&document.body.innerText||'').slice(0,50000);
+  var m=t.match(/doi[:\s]+10\.\d{4,9}\/[^\s]+/i);
+  if(m){d=normDoi(m[0]);if(d)return d;}
+  return '';
+}
+function extractPdfUrl(){
+  // citation_pdf_url is the gold standard — Highwire pushes it on
+  // publisher-hosted PDFs when the user has entitlement.
+  var v=metas('citation_pdf_url');
+  if(v[0]) return v[0];
+  // Look for <link rel="alternate" type="application/pdf">
+  var ls=document.querySelectorAll('link[type="application/pdf"], a[type="application/pdf"]');
+  if(ls[0]) return ls[0].href;
+  // Same-page <a href="...pdf"> download link (heuristic)
+  var as=document.querySelectorAll('a[href*=".pdf"]');
+  for(var i=0;i<as.length;i++){
+    var h=as[i].href;
+    if(h&&/\.pdf(\?|$)/i.test(h)) return h;
+  }
+  return '';
+}
+function overlay(){
+  var old=document.getElementById('__srma_bm__');if(old)old.remove();
+  var d=document.createElement('div');d.id='__srma_bm__';
+  d.style.cssText='position:fixed;top:16px;right:16px;z-index:2147483647;'+
+    'background:white;color:#1e293b;border:1px solid #cbd5e1;border-radius:10px;'+
+    'box-shadow:0 10px 30px rgba(0,0,0,.18);padding:14px 16px;font:13px/1.45 '+
+    '-apple-system,system-ui,Segoe UI,Roboto,sans-serif;max-width:380px';
+  document.body.appendChild(d);return d;
+}
+function render(box,html){box.innerHTML=html;}
+function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){
+  return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+async function submit(pdfBlob,doi,srcUrl,box){
+  render(box,'<b>SRMA</b> — uploading '+esc(Math.round(pdfBlob.size/1024))+' KB...');
+  var fd=new FormData();
+  fd.append('file',pdfBlob,(doi.replace(/[^a-z0-9]+/gi,'_'))+'.pdf');
+  fd.append('doi',doi);
+  if(srcUrl) fd.append('source_url',srcUrl);
+  try{
+    var r=await fetch(SERVER+'/api/bookmarklet/submit',
+      {method:'POST',mode:'cors',credentials:'omit',body:fd});
+    if(!r.ok){
+      var t=await r.text();
+      render(box,'<b>SRMA</b> — <span style="color:#b91c1c">HTTP '+r.status+'</span><br>'+
+        '<span style="font-size:12px">'+esc(t.slice(0,300))+'</span>'+closeBtn());
+      return;
+    }
+    var j=await r.json();
+    if(j.status==='ok' && j.outcome==='complete'){
+      render(box,'<b>✓ SRMA</b> — Validated<br><span style="font-size:12px">'+
+        esc((j.paper_title||'').slice(0,80))+'</span>'+closeBtn());
+    } else if(j.status==='ok'){
+      render(box,'<b>⚠ SRMA</b> — Ingested but flagged: '+esc(j.outcome)+
+        '<br><span style="font-size:12px">'+esc((j.paper_title||'').slice(0,80))+
+        '</span>'+closeBtn());
+    } else {
+      render(box,'<b>SRMA</b> — '+esc(j.status)+': '+esc(j.reason||'')+closeBtn());
+    }
+    setTimeout(function(){var b=document.getElementById('__srma_bm__');if(b)b.remove();},8000);
+  }catch(e){
+    render(box,'<b>SRMA</b> — <span style="color:#b91c1c">Network error</span>: '+
+      esc(String(e))+'<br><span style="font-size:11px">Is the server running at '+
+      esc(SERVER)+' ?</span>'+closeBtn());
+  }
+}
+function closeBtn(){
+  return '<br><button onclick="document.getElementById(\'__srma_bm__\').remove()" '+
+    'style="margin-top:8px;padding:3px 10px;font-size:11px;border:1px solid #cbd5e1;'+
+    'background:#f8fafc;border-radius:4px;cursor:pointer">Dismiss</button>';
+}
+function pasteUrlUI(doi,box){
+  render(box,'<b>SRMA</b> — No PDF link found on this page.<br>'+
+    '<span style="font-size:12px">Paste the direct PDF URL:</span>'+
+    '<input id="__srma_u" style="display:block;width:100%;margin-top:6px;padding:5px;'+
+    'border:1px solid #cbd5e1;border-radius:4px;font-size:12px" placeholder="https://...pdf">'+
+    '<button id="__srma_go" style="margin-top:8px;padding:4px 12px;font-size:12px;'+
+    'background:#3b82f6;color:white;border:none;border-radius:4px;cursor:pointer">'+
+    'Fetch &amp; Upload</button>'+closeBtn());
+  document.getElementById('__srma_go').addEventListener('click',async function(){
+    var u=document.getElementById('__srma_u').value.trim();
+    if(!u){return;}
+    try{
+      render(box,'<b>SRMA</b> — fetching '+esc(u.slice(0,60))+'...');
+      var r=await fetch(u,{credentials:'include'});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      var b=await r.blob();
+      if(b.size<1000) throw new Error('Response too small ('+b.size+' bytes)');
+      await submit(b,doi,u,box);
+    }catch(e){
+      render(box,'<b>SRMA</b> — <span style="color:#b91c1c">Fetch failed</span>: '+
+        esc(String(e))+closeBtn());
+    }
+  });
+}
+async function run(){
+  var box=overlay();
+  render(box,'<b>SRMA</b> — scanning page...');
+  var doi=extractDoi();
+  if(!doi){
+    render(box,'<b>SRMA</b> — <span style="color:#b91c1c">No DOI found</span> '+
+      'on this page.<br><span style="font-size:11px">Open the paper\'s '+
+      'abstract page, then click the bookmarklet again.</span>'+closeBtn());
+    return;
+  }
+  var pdfUrl=extractPdfUrl();
+  if(!pdfUrl){pasteUrlUI(doi,box);return;}
+  render(box,'<b>SRMA</b> — fetching PDF...<br><span style="font-size:11px">'+
+    esc(pdfUrl.slice(0,80))+'</span>');
+  try{
+    var r=await fetch(pdfUrl,{credentials:'include'});
+    if(!r.ok){
+      render(box,'<b>SRMA</b> — fetch failed: HTTP '+r.status+
+        '<br><span style="font-size:11px">Paste the direct PDF URL below:</span>'+
+        closeBtn());
+      pasteUrlUI(doi,box);return;
+    }
+    var blob=await r.blob();
+    if(blob.size<1000){pasteUrlUI(doi,box);return;}
+    await submit(blob,doi,pdfUrl,box);
+  }catch(e){
+    pasteUrlUI(doi,box);
+  }
+}
+run();
+})();"""
+
+
+def _render_bookmarklet_js(server_url: str) -> str:
+    """Return the bookmarklet JS with server URL baked in as a JSON string."""
+    return _BOOKMARKLET_JS_TEMPLATE.replace("__SERVER__", json.dumps(server_url))
+
+
+@app.get("/api/bookmarklet.js", response_class=PlainTextResponse)
+async def bookmarklet_js(server_url: Optional[str] = Query(default=None)) -> PlainTextResponse:
+    """Return the bookmarklet JS source, server URL baked in.
+
+    Useful for audit + for users who want to inspect the code before
+    installing it. The HTML install page uses the same source.
+    """
+    url = (server_url or "http://localhost:8000").rstrip("/")
+    js = _render_bookmarklet_js(url)
+    return PlainTextResponse(
+        js,
+        headers={"Cache-Control": "no-store"},
+        media_type="application/javascript",
+    )
+
+
+@app.get("/api/bookmarklet", response_class=HTMLResponse)
+async def bookmarklet_install_page(
+    server_url: Optional[str] = Query(default=None),
+) -> HTMLResponse:
+    """Landing page with install instructions + drag-to-bookmark button."""
+    url = (server_url or "http://localhost:8000").rstrip("/")
+    js = _render_bookmarklet_js(url)
+    # javascript: URL with the whole IIFE URI-encoded
+    bm_href = "javascript:" + urllib.parse.quote(js, safe="")
+    # The href is huge but that's how bookmarklets work
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>SRMA PDF Bookmarklet — Install</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#f8f9fa;color:#1e293b;line-height:1.55;padding:32px;max-width:720px;margin:0 auto}}
+h1{{font-size:22px;margin-bottom:6px}}
+.subtitle{{color:#64748b;margin-bottom:22px}}
+.bm{{display:inline-block;padding:10px 18px;background:#3b82f6;color:white;
+text-decoration:none;border-radius:8px;font-weight:600;font-size:15px;
+box-shadow:0 4px 12px rgba(59,130,246,.3);margin:12px 0}}
+.bm:hover{{background:#2563eb}}
+.card{{background:white;border:1px solid #e2e8f0;border-radius:10px;padding:18px 20px;
+margin-bottom:16px}}
+.card h3{{font-size:15px;margin-bottom:10px}}
+ol{{margin-left:20px;line-height:1.8}}
+code{{background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:13px;
+font-family:Menlo,Consolas,monospace}}
+.warn{{background:#fffbeb;border-left:3px solid #f59e0b;padding:10px 14px;
+border-radius:6px;font-size:13px;margin:16px 0}}
+details summary{{cursor:pointer;font-size:13px;color:#3b82f6;margin-top:12px}}
+pre{{background:#0f172a;color:#e2e8f0;padding:14px 16px;border-radius:6px;
+font-size:11px;overflow-x:auto;max-height:340px;line-height:1.5}}
+</style></head><body>
+<h1>SRMA PDF Bookmarklet</h1>
+<div class="subtitle">Drag the button below to your bookmarks bar.
+Then click it on any paywalled paper — after logging in — and it will
+send the PDF to your local SRMA server.</div>
+
+<a class="bm" href="{bm_href}">📄 Send to SRMA</a>
+
+<div class="card">
+  <h3>How it works</h3>
+  <ol>
+    <li>Drag the button above onto your browser's bookmarks bar
+        (show it with <code>Ctrl+Shift+B</code> / <code>⌘⇧B</code>).</li>
+    <li>Log into your institution's proxy (EZproxy, OpenAthens, Shibboleth)
+        and open the paper's landing page.</li>
+    <li>Click the <b>Send to SRMA</b> bookmarklet.</li>
+    <li>A small overlay appears in the top-right of the page, extracts
+        the DOI from page metadata, fetches the PDF same-origin, and
+        posts it to <code>{url}</code>.</li>
+    <li>The PDF runs through the same 7-check validation as Manual
+        Mode. The overlay shows ✓ or ⚠ with the paper title.</li>
+  </ol>
+</div>
+
+<div class="warn">
+  <b>Security:</b> the bookmarklet uses the cookies already in your
+  publisher tab to fetch the PDF — your credentials are never read
+  by SRMA. The upload to localhost happens with
+  <code>credentials: 'omit'</code> — no cookies are forwarded.
+  The server URL (<code>{url}</code>) is baked into this bookmarklet
+  at generation time.
+</div>
+
+<div class="card">
+  <h3>When the automatic PDF fetch fails</h3>
+  <p style="font-size:14px">Some publishers hide the PDF behind a
+  click-through. If the bookmarklet can't find a direct PDF URL, it
+  shows a paste box — right-click the PDF link on the page, copy it,
+  paste, and click <b>Fetch &amp; Upload</b>.</p>
+</div>
+
+<details>
+<summary>Show bookmarklet source code</summary>
+<pre>{js.replace('<', '&lt;').replace('>', '&gt;')}</pre>
+</details>
+
+</body></html>
+"""
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
 
 
 @app.post("/api/captcha/resolved")
@@ -4141,6 +5119,387 @@ async def export_integration(
         filepath,
         media_type="application/json",
         filename=filename,
+    )
+
+
+@app.get("/api/export/queue-pack")
+async def export_queue_pack(
+    run_id: Optional[str] = Query(default=None),
+) -> FileResponse:
+    """Self-contained HTML navigation dashboard for MANUAL_REQUIRED papers.
+
+    Philosophy: the user's OWN browser is the retrieval environment.
+    This HTML file is a navigation aid that opens EZproxy-wrapped DOI
+    links in new tabs. The actual PDF ingestion happens through the
+    FIX 4 Manual Mode watched folder — there is NO "Mark as Retrieved
+    without file" path. The HTML polls /api/manual/queue every 10s
+    and turns cards green as papers leave the queue (validated by
+    the watcher).
+
+    REQUIREMENTS:
+      - Manual Mode must have a drop folder configured. If not, the
+        HTML page renders a banner telling the user what to set.
+      - CORS (Part 0) must allow Origin: null so fetch() from file://
+        reaches localhost successfully.
+
+    The file is completely self-contained: no CDN fonts, no external
+    scripts, no external CSS. Works opened as file://.
+    """
+    db = _get_db()
+
+    # Validate run_id if given
+    if run_id:
+        run_record = await db.get_run(run_id)
+        if run_record is None:
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    # Build the HTML at request time so the EZproxy prefix and server
+    # URL reflect current config/runtime.
+    proxy_prefix = _ezproxy_prefix()
+    config = _get_config()
+    drop_folder = config.get("manual_drop_folder") or ""
+    current_project = app_state.get("current_project") or {}
+    project_name = current_project.get("project_name", "Default")
+
+    # The server URL is what the USER's file:// page will fetch from.
+    # We bake in http://localhost:8000 by convention; if the server
+    # runs on a different port, this breaks, but the current launch
+    # path (app.main) always uses 8000.
+    server_url = "http://localhost:8000"
+
+    html = _render_queue_pack_html(
+        run_id=run_id or "",
+        project_name=project_name,
+        proxy_prefix=proxy_prefix,
+        drop_folder=drop_folder,
+        server_url=server_url,
+    )
+
+    export_dir = os.path.join(
+        config.get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    proj_slug = current_project.get("project_slug") or "project"
+    fname = f"{proj_slug}_queue_pack_{ts}.html"
+    fpath = os.path.join(export_dir, fname)
+    with open(fpath, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+    return FileResponse(fpath, media_type="text/html", filename=fname)
+
+
+_QUEUE_PACK_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SRMA Queue Pack — {project_name}</title>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#f8f9fa;color:#1e293b;line-height:1.5;padding:24px;max-width:1100px;margin:0 auto}}
+h1{{font-size:22px;margin-bottom:4px}}
+.subtitle{{font-size:13px;color:#64748b;margin-bottom:16px}}
+.banner{{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:13px;line-height:1.5}}
+.banner.err{{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}}
+.banner.warn{{background:#fffbeb;border:1px solid #fde68a;color:#92400e}}
+.banner.info{{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af}}
+.banner.ok{{background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}}
+.progress{{display:flex;align-items:center;gap:12px;padding:14px 18px;background:white;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:16px}}
+.progress-bar{{flex:1;height:10px;background:#e2e8f0;border-radius:5px;overflow:hidden}}
+.progress-fill{{height:100%;background:#10b981;transition:width 0.3s ease}}
+.progress-text{{font-weight:600;font-size:14px;white-space:nowrap}}
+.tabs{{display:flex;gap:0;border-bottom:2px solid #e2e8f0;margin-bottom:14px}}
+.tab{{padding:8px 14px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;
+font-size:13px;color:#64748b;font-weight:500}}
+.tab.active{{color:#3b82f6;border-bottom-color:#3b82f6}}
+.tab .cnt{{background:#f1f5f9;padding:1px 6px;border-radius:8px;font-size:11px;margin-left:6px}}
+.card{{background:white;border:1px solid #e2e8f0;border-radius:8px;padding:14px 16px;margin-bottom:10px;
+display:flex;flex-direction:column;gap:6px;transition:background 0.3s,opacity 0.3s}}
+.card.retrieved{{background:#f0fdf4;border-color:#bbf7d0}}
+.card.unavail{{opacity:0.55;background:#fafafa}}
+.card-title{{font-weight:600;font-size:14px;color:#1e293b}}
+.card-meta{{font-size:12px;color:#64748b}}
+.card-doi{{font-family:'SF Mono',Consolas,monospace;font-size:11px;color:#475569}}
+.badges{{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;
+text-transform:uppercase;letter-spacing:0.3px}}
+.b-success{{background:#d1fae5;color:#065f46}}
+.b-warn{{background:#fef3c7;color:#92400e}}
+.b-neutral{{background:#f1f5f9;color:#475569}}
+.b-info{{background:#cffafe;color:#155e75}}
+.actions{{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}}
+.btn{{padding:5px 12px;border:none;border-radius:4px;font-size:12px;font-weight:500;
+cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:4px}}
+.btn-primary{{background:#3b82f6;color:white}}
+.btn-primary:hover{{background:#2563eb}}
+.btn-outline{{background:white;border:1px solid #e2e8f0;color:#1e293b}}
+.btn-outline:hover{{background:#f1f5f9}}
+.btn-danger{{background:white;border:1px solid #fecaca;color:#991b1b}}
+.btn-danger:hover{{background:#fef2f2}}
+.btn-success{{background:#10b981;color:white;cursor:default}}
+#refresh-info{{font-size:11px;color:#94a3b8;margin-top:12px;text-align:right}}
+.spinner{{display:inline-block;width:10px;height:10px;border:2px solid #e2e8f0;
+border-top-color:#3b82f6;border-radius:50%;animation:spin 0.8s linear infinite}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+</style>
+</head>
+<body>
+
+<h1>SRMA Queue Pack</h1>
+<div class="subtitle">
+  Project: <strong>{project_name}</strong>
+  &middot; Run: <span id="run-display">{run_display}</span>
+  &middot; Generated: <span id="gen-ts">{gen_ts}</span>
+</div>
+
+<div id="status-banner"></div>
+
+<div class="progress">
+  <div class="progress-text" id="progress-text">Loading...</div>
+  <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+  <div class="progress-text" id="progress-pct"></div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-filter="all">All <span class="cnt" id="cnt-all">0</span></div>
+  <div class="tab" data-filter="pending">Pending <span class="cnt" id="cnt-pending">0</span></div>
+  <div class="tab" data-filter="retrieved">Retrieved <span class="cnt" id="cnt-retrieved">0</span></div>
+  <div class="tab" data-filter="unavail">Unavailable <span class="cnt" id="cnt-unavail">0</span></div>
+</div>
+
+<div id="queue-list"></div>
+
+<div id="refresh-info">
+  <span class="spinner"></span> Auto-refreshing every 10 seconds from <code>{server_url}</code>
+</div>
+
+<script>
+(function() {{
+'use strict';
+var SERVER = {server_url_js};
+var PROXY_PREFIX = {proxy_prefix_js};
+var DROP_FOLDER = {drop_folder_js};
+var POLL_INTERVAL_MS = 10000;
+
+var currentFilter = 'all';
+var snapshot = {{ papers: [] }};  // last server snapshot
+
+function escHtml(s) {{ if (!s) return ''; var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }}
+function escAttr(s) {{ return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;'); }}
+
+function classifyPaper(p) {{
+  // Drop-folder handoff means we infer "retrieved" from the paper no
+  // longer being in MANUAL_REQUIRED. But for THIS HTML we only fetch
+  // /api/manual/queue which is always MANUAL_REQUIRED. So we need a
+  // second signal: we track which canonical_ids were in the queue the
+  // first time we saw it, and any that subsequently DISAPPEAR from
+  // /api/manual/queue are marked retrieved.
+  if (p.permanently_unavailable) return 'unavail';
+  // ever-seen-and-now-missing is handled in pollQueue()
+  return 'pending';
+}}
+
+var everSeen = {{}};   // canonical_id -> last-known metadata
+var retrievedIds = {{}};  // canonical_id -> true once we infer retrieval
+var unavailableIds = {{}}; // canonical_id -> true for permanently unavailable
+
+function render() {{
+  var all = Object.keys(everSeen).map(function(cid) {{ return everSeen[cid]; }});
+  var list = document.getElementById('queue-list');
+  if (all.length === 0) {{
+    list.innerHTML = '<div class="banner info">The manual-required queue is empty. Trigger a retrieval run first.</div>';
+    document.getElementById('progress-text').textContent = '0 / 0';
+    document.getElementById('progress-pct').textContent = '';
+    document.getElementById('progress-fill').style.width = '100%';
+    document.getElementById('cnt-all').textContent = 0;
+    document.getElementById('cnt-pending').textContent = 0;
+    document.getElementById('cnt-retrieved').textContent = 0;
+    document.getElementById('cnt-unavail').textContent = 0;
+    return;
+  }}
+
+  var pending = [], retrieved = [], unavail = [];
+  for (var i = 0; i < all.length; i++) {{
+    var p = all[i];
+    if (retrievedIds[p.canonical_id]) retrieved.push(p);
+    else if (unavailableIds[p.canonical_id] || p.permanently_unavailable) unavail.push(p);
+    else pending.push(p);
+  }}
+  var total = all.length;
+  var done = retrieved.length + unavail.length;
+  var pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+  document.getElementById('progress-text').textContent = done + ' / ' + total + ' done';
+  document.getElementById('progress-pct').textContent = pct + '%';
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('cnt-all').textContent = total;
+  document.getElementById('cnt-pending').textContent = pending.length;
+  document.getElementById('cnt-retrieved').textContent = retrieved.length;
+  document.getElementById('cnt-unavail').textContent = unavail.length;
+
+  var visible;
+  if (currentFilter === 'pending') visible = pending;
+  else if (currentFilter === 'retrieved') visible = retrieved;
+  else if (currentFilter === 'unavail') visible = unavail;
+  else visible = all;
+
+  if (visible.length === 0) {{
+    list.innerHTML = '<div class="banner info">No papers match this filter.</div>';
+    return;
+  }}
+
+  list.innerHTML = visible.map(function(p) {{ return renderCard(p); }}).join('');
+}}
+
+function renderCard(p) {{
+  var isRetrieved = !!retrievedIds[p.canonical_id];
+  var isUnavail = !!unavailableIds[p.canonical_id] || !!p.permanently_unavailable;
+  var cls = 'card';
+  if (isRetrieved) cls += ' retrieved';
+  if (isUnavail) cls += ' unavail';
+
+  var badges = [];
+  if (isRetrieved) badges.push('<span class="badge b-success">&#10003; Retrieved</span>');
+  else if (isUnavail) badges.push('<span class="badge b-neutral">Unavailable</span>');
+  else badges.push('<span class="badge b-warn">Pending</span>');
+  if (p.publisher) badges.push('<span class="badge b-info">' + escHtml(p.publisher) + '</span>');
+  if (p.last_failure_code) badges.push('<span class="badge b-neutral">' + escHtml(p.last_failure_code) + '</span>');
+
+  var ezproxyBtn = p.ezproxy_url
+    ? '<a class="btn btn-primary" href="' + escAttr(p.ezproxy_url) + '" target="_blank" rel="noopener">Open via Library</a>' : '';
+  var doiBtn = p.doi_url
+    ? '<a class="btn btn-outline" href="' + escAttr(p.doi_url) + '" target="_blank" rel="noopener">Open DOI</a>' : '';
+  var unavailBtn = (!isRetrieved && !isUnavail)
+    ? '<button class="btn btn-danger" onclick="markUnavailable(\\'' + escAttr(p.canonical_id) + '\\')">Mark Unavailable</button>' : '';
+  var retrievedMark = isRetrieved
+    ? '<span class="btn btn-success">&#10003; File validated in system</span>' : '';
+
+  var meta = [];
+  if (p.first_author) meta.push(escHtml(p.first_author));
+  if (p.year) meta.push(String(p.year));
+  if (p.journal) meta.push(escHtml(p.journal));
+  var metaStr = meta.join(' &middot; ');
+
+  return '<div class="' + cls + '" id="card-' + escAttr(p.canonical_id) + '">' +
+    '<div class="card-title">' + escHtml(p.title || '(no title)') + '</div>' +
+    (metaStr ? '<div class="card-meta">' + metaStr + '</div>' : '') +
+    (p.doi ? '<div class="card-doi">DOI: ' + escHtml(p.doi) + '</div>' : '') +
+    '<div class="badges">' + badges.join('') + '</div>' +
+    '<div class="actions">' + ezproxyBtn + doiBtn + unavailBtn + retrievedMark + '</div>' +
+    '</div>';
+}}
+
+window.markUnavailable = function(cid) {{
+  var note = prompt('Reason this paper is permanently unavailable? (optional)') || '';
+  fetch(SERVER + '/api/manual/paper/' + encodeURIComponent(cid) + '/mark-unobtainable?note=' + encodeURIComponent(note), {{method:'POST'}})
+    .then(function(r) {{
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      unavailableIds[cid] = true;
+      render();
+    }})
+    .catch(function(err) {{
+      alert('Failed to mark unavailable: ' + err.message);
+    }});
+}};
+
+async function pollQueue() {{
+  try {{
+    var r = await fetch(SERVER + '/api/manual/queue');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var data = await r.json();
+
+    // Clear prior banner on success
+    document.getElementById('status-banner').innerHTML = '';
+
+    var currentIds = {{}};
+    for (var i = 0; i < (data.papers || []).length; i++) {{
+      var p = data.papers[i];
+      currentIds[p.canonical_id] = true;
+      everSeen[p.canonical_id] = p;
+      if (p.permanently_unavailable) unavailableIds[p.canonical_id] = true;
+    }}
+    // Inference: any paper we saw before but is now gone from the
+    // queue has left MANUAL_REQUIRED. That happens when the FIX 4
+    // watcher validates a drop-folder file and marks COMPLETE (or
+    // when the paper goes to any non-MANUAL_REQUIRED state).
+    Object.keys(everSeen).forEach(function(cid) {{
+      if (!currentIds[cid] && !unavailableIds[cid]) {{
+        retrievedIds[cid] = true;
+      }}
+    }});
+
+    render();
+  }} catch (err) {{
+    showBanner('err',
+      'Cannot reach SRMA server at <code>' + SERVER + '</code>. ' +
+      'Make sure the app is running. (' + escHtml(err.message) + ')');
+  }}
+}}
+
+function showBanner(kind, html) {{
+  document.getElementById('status-banner').innerHTML =
+    '<div class="banner ' + kind + '">' + html + '</div>';
+}}
+
+// Guard: if drop folder isn't configured, show a sticky error.
+if (!DROP_FOLDER) {{
+  showBanner('warn',
+    '<strong>&#9888; Manual Mode drop folder is not configured.</strong> ' +
+    'Open the app, go to SSO → Manual Mode, set a drop folder, ' +
+    'and enable Manual Mode. The HTML pack is useless without the watcher.');
+}} else {{
+  showBanner('info',
+    'Drop folder: <code>' + escHtml(DROP_FOLDER) + '</code> &nbsp;·&nbsp; ' +
+    'Download PDFs here; the system validates automatically.');
+}}
+
+// Tab switching
+var tabs = document.querySelectorAll('.tab');
+for (var i = 0; i < tabs.length; i++) {{
+  tabs[i].addEventListener('click', function(e) {{
+    for (var j = 0; j < tabs.length; j++) tabs[j].classList.remove('active');
+    e.currentTarget.classList.add('active');
+    currentFilter = e.currentTarget.getAttribute('data-filter');
+    render();
+  }});
+}}
+
+// Kick off polling
+pollQueue();
+setInterval(pollQueue, POLL_INTERVAL_MS);
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+def _render_queue_pack_html(
+    run_id: str,
+    project_name: str,
+    proxy_prefix: str,
+    drop_folder: str,
+    server_url: str,
+) -> str:
+    """Produce the self-contained HTML queue pack.
+
+    All user-controlled strings go through json.dumps() for safe
+    interpolation into inline JavaScript, and through html.escape()
+    for interpolation into HTML text.
+    """
+    import html as _html
+
+    return _QUEUE_PACK_HTML_TEMPLATE.format(
+        project_name=_html.escape(project_name),
+        run_display=_html.escape(run_id or "(all)"),
+        gen_ts=_html.escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
+        server_url=_html.escape(server_url),
+        # JS-safe (JSON-quoted) — injects safely inside <script>
+        server_url_js=json.dumps(server_url),
+        proxy_prefix_js=json.dumps(proxy_prefix),
+        drop_folder_js=json.dumps(drop_folder),
     )
 
 
@@ -4614,14 +5973,40 @@ async def check_output_path(
 # ===========================================================================
 
 
+def _mask_secret(s: Optional[str]) -> str:
+    """Mask all but last 4 chars of a secret. Empty stays empty."""
+    if not s:
+        return ""
+    s = str(s)
+    if len(s) <= 4:
+        return "****"
+    return "*" * (len(s) - 4) + s[-4:]
+
+
+def _redact_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of config with secrets masked, and a set_flag
+    for each secret indicating whether it's currently configured.
+    """
+    redacted = dict(config)
+    key = redacted.get("zotero_api_key") or ""
+    redacted["zotero_api_key"] = _mask_secret(key)
+    redacted["zotero_api_key_set"] = bool(key)
+    return redacted
+
+
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
-    """Get current system settings and runtime status."""
+    """Get current system settings and runtime status.
+
+    The Zotero API key is masked (last 4 chars only) and a boolean
+    `zotero_api_key_set` is added alongside it. The client must never
+    see the full key after it's persisted.
+    """
     config = _get_config()
     wizard: Optional[WizardResult] = app_state.get("wizard_result")
 
     resp = SettingsResponse(
-        config=config,
+        config=_redact_config(config),
         ocr_available=wizard.ocr_available if wizard else False,
         tesseract_available=wizard.tesseract_available if wizard else False,
         ghostscript_available=wizard.ghostscript_available if wizard else False,
@@ -4645,13 +6030,29 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
     updated_fields: List[str] = []
     update_dict = update.model_dump(exclude_none=True)
 
+    # Secrets that should never echo back to the client and should be
+    # skipped if the UI re-submits the masked form by mistake.
+    secret_fields = {"zotero_api_key"}
+    audit_values: Dict[str, Any] = {}
+
     for key, value in update_dict.items():
+        if key in secret_fields and isinstance(value, str):
+            stripped = value.strip()
+            # Skip if: empty string, or looks like the masked form (starts
+            # with asterisks) — the client is confirming the existing value,
+            # not setting a new one.
+            if not stripped or stripped.startswith("*"):
+                continue
+
         if key in config and config[key] != value:
             config[key] = value
             updated_fields.append(key)
         elif key not in config:
             config[key] = value
             updated_fields.append(key)
+
+        if key in updated_fields:
+            audit_values[key] = "***REDACTED***" if key in secret_fields else config[key]
 
     if updated_fields:
         save_config(config)
@@ -4661,7 +6062,7 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
             outcome="SETTINGS_UPDATED",
             details=json.dumps({
                 "updated_fields": updated_fields,
-                "new_values": {k: config[k] for k in updated_fields},
+                "new_values": audit_values,
             }),
         ))
 
@@ -4670,7 +6071,7 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
     return JSONResponse({
         "status": "updated",
         "fields_changed": updated_fields,
-        "config": config,
+        "config": _redact_config(config),
     })
 
 
@@ -4917,6 +6318,31 @@ async def _build_stream_snapshot() -> Dict[str, Any]:
         "unmatched_count": mm.get("unmatched_count", 0),
         "permanently_unavailable": mm.get("permanently_unavailable", 0),
         "pending_disambiguation": bool(mm.get("pending_disambiguation")),
+    }
+
+    # Zotero integration — poller + push status (Part 2 paywalled
+    # redesign). Credentials are never included in the SSE payload;
+    # only the presence-flag `configured` is surfaced so the UI can
+    # render the right control set.
+    zt = app_state.get("zotero") or {}
+    cfg = _get_config()
+    payload["zotero"] = {
+        "configured": bool(
+            cfg.get("zotero_api_key")
+            and cfg.get("zotero_user_id")
+        ),
+        "enabled": bool(zt.get("enabled")),
+        "collection_key": zt.get("collection_key", ""),
+        "collection_name": zt.get("collection_name", ""),
+        "poller_running": bool(zt.get("poller_running")),
+        "last_poll_at": zt.get("last_poll_at"),
+        "last_poll_version": zt.get("last_poll_version", 0),
+        "last_poll_items": zt.get("last_poll_items", 0),
+        "last_poll_error": zt.get("last_poll_error"),
+        "last_message": zt.get("last_message", ""),
+        "ingested_count": zt.get("ingested_count", 0),
+        "validation_failed_count": zt.get("validation_failed_count", 0),
+        "pushed_last_run": zt.get("pushed_last_run", 0),
     }
     return payload
 

@@ -46,6 +46,7 @@ DEFAULT_LIMITS: Dict[str, int] = {
     "crossref": 45,          # polite pool
     "europepmc": 5,
     "semantic_scholar": 3,
+    "zotero": 5,             # Zotero Web API v3 recommended ceiling
 }
 
 # Sliding window duration
@@ -77,6 +78,8 @@ def _normalize_host(host_or_url: str) -> Optional[str]:
         return "europepmc"
     if "semanticscholar.org" in key or "semantic_scholar" in key or "semantic-scholar" in key:
         return "semantic_scholar"
+    if "api.zotero.org" in key or "zotero" in key:
+        return "zotero"
 
     return None
 

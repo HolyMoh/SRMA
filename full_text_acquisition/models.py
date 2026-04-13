@@ -274,6 +274,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # the user downloads themselves.
     "manual_mode_enabled": False,
     "manual_drop_folder": "",
+    # Zotero integration (Part 2 of paywalled-retrieval redesign).
+    # When configured, the system can push the MANUAL_REQUIRED queue
+    # to a Zotero collection, then poll for PDFs the user captures via
+    # Zotero Connector on publisher pages. User libraries only in v1.
+    "zotero_api_key": "",
+    "zotero_user_id": "",
+    "zotero_collection_key": "",     # auto-created on first push if blank
+    "zotero_collection_name": "",    # display-only; tracks what the collection is called
+    "zotero_poller_enabled": False,
 }
 
 
@@ -995,6 +1004,11 @@ class SettingsUpdate(BaseModel):
     scholar_max_queries_per_paper: Optional[int] = None
     manual_mode_enabled: Optional[bool] = None
     manual_drop_folder: Optional[str] = None
+    zotero_api_key: Optional[str] = None
+    zotero_user_id: Optional[str] = None
+    zotero_collection_key: Optional[str] = None
+    zotero_collection_name: Optional[str] = None
+    zotero_poller_enabled: Optional[bool] = None
 
     @field_validator("retrieval_concurrency")
     @classmethod
