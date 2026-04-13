@@ -253,6 +253,8 @@ _PROJECT_OVERRIDABLE_KEYS: Set[str] = {
     "sso_proxy_url", "openathens_url", "institutional_resolver_url",
     "unpaywall_email",
     "manual_drop_folder", "manual_mode_enabled",
+    "zotero_api_key", "zotero_user_id", "zotero_collection_key",
+    "zotero_collection_name", "zotero_poller_enabled",
     "cooldown_minutes", "cooldown_failure_threshold", "cooldown_window_size",
     "retrieval_concurrency", "validation_concurrency",
     "backpressure_threshold",
@@ -657,6 +659,14 @@ def _check_busy_reasons() -> List[str]:
     enr = app_state.get("enrichment_status") or {}
     if enr.get("in_progress"):
         reasons.append("enrichment is still in progress")
+
+    # Zotero poller holds the previous project's API credentials +
+    # collection anchor; switching projects while it runs would cross
+    # library boundaries. Require the user to stop it explicitly.
+    zt = app_state.get("zotero") or {}
+    if zt.get("poller_running"):
+        reasons.append("the Zotero poller is running")
+
     return reasons
 
 
@@ -672,6 +682,27 @@ async def _rebind_to_project(slug: str) -> Dict[str, Any]:
     project = _find_project(manifest, slug)
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+
+    # 0. Defensive teardown of background tasks bound to the previous
+    # project. _check_busy_reasons() should already have refused if any
+    # of these are live, but guard against state-drift bugs here too.
+    for cancel_key, task_key in (
+        ("manual_cancel_event", "manual_task"),
+        ("zotero_cancel_event", "zotero_task"),
+    ):
+        ev: Optional[asyncio.Event] = app_state.get(cancel_key)
+        tk: Optional[asyncio.Task] = app_state.get(task_key)
+        if ev is not None:
+            ev.set()
+        if tk is not None and not tk.done():
+            try:
+                await asyncio.wait_for(tk, timeout=5.0)
+            except asyncio.TimeoutError:
+                tk.cancel()
+                try: await tk
+                except (asyncio.CancelledError, Exception): pass
+            except Exception as exc:
+                logger.debug("Task %s raised during rebind teardown: %s", task_key, exc)
 
     # 1. Close current DB (flush write queue first)
     current_db = app_state.get("db")
@@ -757,6 +788,25 @@ async def _rebind_to_project(slug: str) -> Dict[str, Any]:
     }
     app_state["manual_task"] = None
     app_state["manual_cancel_event"] = None
+
+    # Zotero integration (Part 2 paywalled redesign). Same shape of
+    # serializable state slice we use for Manual Mode + SSO.
+    app_state["zotero"] = {
+        "enabled": False,
+        "collection_key": "",
+        "collection_name": "",
+        "poller_running": False,
+        "last_poll_at": None,
+        "last_poll_version": 0,     # incremental polling anchor
+        "last_poll_items": 0,       # items seen in last poll
+        "last_poll_error": None,
+        "last_message": "",
+        "ingested_count": 0,        # PDFs pulled + validated this session
+        "validation_failed_count": 0,
+        "pushed_last_run": 0,       # last push result
+    }
+    app_state["zotero_task"] = None
+    app_state["zotero_cancel_event"] = None
     app_state["sso_session"] = {
         "active": False, "phase": "idle", "proxy_url": "",
         "login_url": "", "started_at": None, "login_detected_at": None,
@@ -962,6 +1012,33 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     app_state["manual_task"] = None
     app_state["manual_cancel_event"] = None
 
+    # Zotero integration (Part 2 paywalled redesign).
+    app_state["zotero"] = {
+        "enabled": False,
+        "collection_key": config.get("zotero_collection_key", ""),
+        "collection_name": config.get("zotero_collection_name", ""),
+        "poller_running": False,
+        "last_poll_at": None,
+        "last_poll_version": 0,
+        "last_poll_items": 0,
+        "last_poll_error": None,
+        "last_message": "",
+        "ingested_count": 0,
+        "validation_failed_count": 0,
+        "pushed_last_run": 0,
+    }
+    app_state["zotero_task"] = None
+    app_state["zotero_cancel_event"] = None
+    # Auto-start the poller if the user previously enabled it
+    if (config.get("zotero_poller_enabled")
+            and config.get("zotero_api_key")
+            and config.get("zotero_user_id")
+            and config.get("zotero_collection_key")):
+        try:
+            asyncio.get_event_loop().create_task(_start_zotero_poller_internal())
+        except Exception as exc:
+            logger.warning("Could not auto-start Zotero poller: %s", exc)
+
     logger.info(
         "Startup complete: %d interrupted resets, %d missing files reconciled",
         len(resets), len(missing),
@@ -993,6 +1070,22 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         except asyncio.TimeoutError:
             mm_task.cancel()
             try: await mm_task
+            except (asyncio.CancelledError, Exception): pass
+
+    # Stop the Zotero poller if running (Part 2 paywalled redesign).
+    # Same teardown contract as Manual Mode: signal cancel, await, then
+    # hard-cancel if it ignores us. The poller is a long sleep loop so
+    # it's expected to respond to the cancel event within one iteration.
+    zt_cancel: Optional[asyncio.Event] = app_state.get("zotero_cancel_event")
+    zt_task: Optional[asyncio.Task] = app_state.get("zotero_task")
+    if zt_cancel:
+        zt_cancel.set()
+    if zt_task and not zt_task.done():
+        try:
+            await asyncio.wait_for(zt_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            zt_task.cancel()
+            try: await zt_task
             except (asyncio.CancelledError, Exception): pass
 
     # Step 3-4: Drain workers
@@ -3815,6 +3908,448 @@ async def manual_mode_discard_unmatched(
 
 
 # ===========================================================================
+# ZOTERO INTEGRATION — Part 2 of paywalled-retrieval redesign
+# ===========================================================================
+#
+# Philosophy: Zotero Connector is the best browser-side PDF capture
+# tool that exists. Researchers using Zotero already have it set up.
+# We piggyback: push the MANUAL_REQUIRED queue as a Zotero collection,
+# then poll for child PDF attachments and ingest them through the
+# same validation pipeline as Manual Mode (FIX 4).
+#
+# No new validation path. The Zotero poller writes a temp file and
+# calls _install_and_validate_dropped() directly. The system never
+# sees the user's Zotero credentials or library outside this module.
+
+ZOTERO_POLL_INTERVAL_S = 60.0
+
+
+def _zotero_client_from_config() -> Optional["ZoteroClient"]:
+    """Construct a ZoteroClient from current effective config.
+
+    Returns None if API key or user ID is missing.
+    """
+    from full_text_acquisition.zotero_client import ZoteroClient
+    config = _get_config()
+    api_key = (config.get("zotero_api_key") or "").strip()
+    user_id = str(config.get("zotero_user_id") or "").strip()
+    if not api_key or not user_id:
+        return None
+    return ZoteroClient(api_key=api_key, user_id=user_id)
+
+
+@app.post("/api/zotero/test")
+async def zotero_test_credentials() -> JSONResponse:
+    """Verify the configured API key + user ID by calling /keys/{key}."""
+    client = _zotero_client_from_config()
+    if client is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Zotero API key and user ID must be configured first.",
+        )
+    try:
+        result = await client.verify()
+    finally:
+        await client.close()
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Zotero verification failed: {result.get('error')}",
+        )
+    data = result.get("data") or {}
+    # Strip the API key out of the response — Zotero echoes it
+    data.pop("key", None)
+    return JSONResponse({"status": "ok", "info": data})
+
+
+@app.post("/api/zotero/push")
+async def zotero_push_queue() -> JSONResponse:
+    """Push current MANUAL_REQUIRED queue to a Zotero collection.
+
+    Idempotent: re-pushing items that already exist in the collection
+    leaves them alone (Zotero dedups by item key; we always create
+    new items so dedup is at the user's discretion).
+
+    Creates the collection if it doesn't exist. The collection name
+    is "SRMA Queue: {project_name}" by default; configurable via
+    Settings.zotero_collection_name.
+    """
+    from full_text_acquisition.zotero_client import (
+        build_item_from_paper, ZoteroError,
+    )
+
+    client = _zotero_client_from_config()
+    if client is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Zotero API key and user ID must be configured first.",
+        )
+    config = _get_config()
+    db = _get_db()
+    cp = app_state.get("current_project") or {}
+    state = app_state["zotero"]
+
+    # Collection name: per config or auto-derived
+    collection_name = (config.get("zotero_collection_name") or "").strip()
+    if not collection_name:
+        collection_name = f"SRMA Queue: {cp.get('project_name') or 'Default'}"
+
+    try:
+        # Find or create the collection
+        col = await client.get_or_create_collection(collection_name)
+        col_data = col.get("data") or col
+        col_key = col_data.get("key") or col.get("key", "")
+        if not col_key:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Zotero returned no collection key: {col}",
+            )
+
+        # Persist the discovered key + name into the project config
+        # so the poller can find the collection later
+        config["zotero_collection_key"] = col_key
+        config["zotero_collection_name"] = collection_name
+        save_config(config)
+
+        # Build items from MANUAL_REQUIRED papers (limit DOI-bearing)
+        papers = await db.get_manual_required_papers()
+        items = []
+        for p in papers:
+            if not p.doi:
+                continue   # Zotero items need DOI for matching
+            items.append(build_item_from_paper(
+                doi=p.doi, title=p.title or "",
+                authors=p.authors or "",
+                year=p.year, journal=p.journal,
+            ))
+
+        if not items:
+            return JSONResponse({
+                "status": "no_items",
+                "collection_key": col_key,
+                "collection_name": collection_name,
+                "papers_in_queue": len(papers),
+                "papers_with_doi": 0,
+                "message": "No DOI-bearing papers in MANUAL_REQUIRED queue.",
+            })
+
+        # Push (batches of 50 inside the client)
+        result = await client.add_items_to_collection(col_key, items)
+
+        # Update state for SSE
+        state["collection_key"] = col_key
+        state["collection_name"] = collection_name
+        state["pushed_last_run"] = result.get("created", 0)
+        state["last_message"] = (
+            f"Pushed {result.get('created', 0)} items to '{collection_name}'"
+        )
+
+        try:
+            await db.log_audit(AuditLogEntry(
+                outcome="ZOTERO_QUEUE_PUSHED",
+                details=json.dumps({
+                    "collection_key": col_key,
+                    "collection_name": collection_name,
+                    "items_pushed": result.get("created", 0),
+                    "items_unchanged": result.get("unchanged", 0),
+                    "items_failed": len(result.get("failed", [])),
+                }),
+            ))
+        except Exception:
+            pass
+
+        return JSONResponse({
+            "status": "pushed",
+            "collection_key": col_key,
+            "collection_name": collection_name,
+            "papers_in_queue": len(papers),
+            "papers_with_doi": len(items),
+            **result,
+        })
+    except ZoteroError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        await client.close()
+
+
+@app.post("/api/zotero/poller/start")
+async def zotero_poller_start() -> JSONResponse:
+    """Start the Zotero poller.
+
+    Requires API key, user ID, and a collection key (run /api/zotero/push
+    first if the collection doesn't exist yet). Idempotent.
+    """
+    config = _get_config()
+    if not (config.get("zotero_api_key") and config.get("zotero_user_id")):
+        raise HTTPException(
+            status_code=400,
+            detail="Zotero API key + user ID required.",
+        )
+    if not config.get("zotero_collection_key"):
+        raise HTTPException(
+            status_code=400,
+            detail=("No collection key configured. Run 'Push to Zotero' "
+                    "first to create the collection."),
+        )
+
+    state = app_state["zotero"]
+    if state.get("poller_running"):
+        return JSONResponse({
+            "status": "already_running",
+            "collection_key": state.get("collection_key"),
+        })
+
+    await _start_zotero_poller_internal()
+    config["zotero_poller_enabled"] = True
+    save_config(config)
+
+    return JSONResponse({
+        "status": "started",
+        "collection_key": state.get("collection_key"),
+        "interval_s": ZOTERO_POLL_INTERVAL_S,
+    })
+
+
+@app.post("/api/zotero/poller/stop")
+async def zotero_poller_stop() -> JSONResponse:
+    """Stop the Zotero poller. Idempotent."""
+    state = app_state["zotero"]
+    cancel: Optional[asyncio.Event] = app_state.get("zotero_cancel_event")
+    task: Optional[asyncio.Task] = app_state.get("zotero_task")
+    if cancel:
+        cancel.set()
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try: await task
+            except (asyncio.CancelledError, Exception): pass
+    app_state["zotero_task"] = None
+    app_state["zotero_cancel_event"] = None
+    state["enabled"] = False
+    state["poller_running"] = False
+    state["last_message"] = "Poller stopped"
+
+    config = _get_config()
+    config["zotero_poller_enabled"] = False
+    save_config(config)
+    return JSONResponse({"status": "stopped"})
+
+
+@app.get("/api/zotero/status")
+async def zotero_status() -> JSONResponse:
+    """Full snapshot of Zotero integration state."""
+    return JSONResponse(dict(app_state.get("zotero") or {}))
+
+
+async def _start_zotero_poller_internal() -> None:
+    """Spin up the poller task. Caller is responsible for the busy-check."""
+    state = app_state["zotero"]
+    cancel = asyncio.Event()
+    task = asyncio.create_task(
+        _zotero_poller(cancel),
+        name="zotero-poller",
+    )
+    app_state["zotero_cancel_event"] = cancel
+    app_state["zotero_task"] = task
+    state["enabled"] = True
+    state["poller_running"] = True
+    state["ingested_count"] = 0
+    state["validation_failed_count"] = 0
+    state["last_message"] = "Poller starting..."
+    state["last_poll_error"] = None
+
+
+async def _zotero_poller(cancel_event: asyncio.Event) -> None:
+    """Background loop: pull Zotero collection, ingest PDFs as papers."""
+    from full_text_acquisition.zotero_client import (
+        ZoteroError, extract_doi_from_zotero_item,
+    )
+    state = app_state["zotero"]
+    state["poller_running"] = True
+    seen_attachments: Set[str] = set()  # zotero attachment keys we've ingested
+
+    try:
+        while not cancel_event.is_set():
+            await _zotero_poll_once(seen_attachments, state)
+            try:
+                await asyncio.wait_for(
+                    cancel_event.wait(),
+                    timeout=ZOTERO_POLL_INTERVAL_S,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        state["poller_running"] = False
+        logger.info("Zotero poller stopped")
+
+
+async def _zotero_poll_once(
+    seen_attachments: Set[str],
+    state: Dict[str, Any],
+) -> None:
+    """Single poll iteration. Updates state in place."""
+    from full_text_acquisition.zotero_client import (
+        ZoteroError, extract_doi_from_zotero_item,
+    )
+    config = _get_config()
+    db = _get_db()
+    collection_key = state.get("collection_key") or config.get("zotero_collection_key")
+    if not collection_key:
+        state["last_poll_error"] = "No collection key configured"
+        state["last_message"] = "No collection — stop and re-push the queue"
+        return
+
+    client = _zotero_client_from_config()
+    if client is None:
+        state["last_poll_error"] = "Zotero credentials missing"
+        return
+
+    try:
+        # List items in the collection (incremental via since-version)
+        since_v = state.get("last_poll_version", 0) or 0
+        items, new_version = await client.list_collection_items(
+            collection_key, since_version=since_v,
+        )
+        state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+        state["last_poll_items"] = len(items)
+        state["last_poll_version"] = new_version
+        state["last_poll_error"] = None
+
+        if not items:
+            state["last_message"] = "No new items since last poll"
+            return
+
+        # For each item: check for child PDF attachments and ingest
+        ingested_this_round = 0
+        for item in items:
+            item_key = item.get("key") or item.get("data", {}).get("key", "")
+            if not item_key:
+                continue
+
+            doi = extract_doi_from_zotero_item(item)
+            if not doi:
+                continue
+
+            # Find the matching paper in our queue
+            existing_cid = await db.check_duplicate_doi(doi)
+            if not existing_cid:
+                continue
+            paper = await db.get_paper(existing_cid)
+            if paper is None or paper.state != PaperState.MANUAL_REQUIRED.value:
+                continue   # already handled (or wrong state)
+
+            # Pull PDF attachment(s)
+            try:
+                children = await client.list_child_attachments(item_key)
+            except ZoteroError as exc:
+                logger.debug("List children failed for %s: %s", item_key, exc)
+                continue
+
+            pdf_attachments = []
+            for c in children:
+                cdata = c.get("data") or c
+                if cdata.get("contentType") == "application/pdf":
+                    ckey = c.get("key") or cdata.get("key", "")
+                    if ckey and ckey not in seen_attachments:
+                        pdf_attachments.append((ckey, cdata.get("filename") or "document.pdf"))
+
+            if not pdf_attachments:
+                continue
+
+            # Take the first PDF attachment we haven't seen
+            att_key, att_filename = pdf_attachments[0]
+            try:
+                pdf_bytes = await client.download_attachment(att_key)
+            except ZoteroError as exc:
+                logger.debug("Download failed for %s: %s", att_key, exc)
+                continue
+
+            if not pdf_bytes:
+                continue
+
+            # Write to a temp file, hand off to FIX 4's validation pipeline
+            tmp_dir = os.path.join(
+                _get_config().get("output_directory", "./downloads"),
+                ".zotero-temp",
+            )
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_path = os.path.join(
+                tmp_dir, f"zotero_{att_key}_{att_filename}",
+            )
+            try:
+                with open(tmp_path, "wb") as fh:
+                    fh.write(pdf_bytes)
+                result = await _install_and_validate_dropped(
+                    paper, tmp_path, "zotero",
+                )
+                seen_attachments.add(att_key)
+                outcome = result.get("outcome")
+                if outcome == "complete":
+                    state["ingested_count"] = state.get("ingested_count", 0) + 1
+                    state["last_message"] = (
+                        f"✓ {att_filename} → {paper.title[:50]} (VALID)"
+                    )
+                elif outcome == "flagged":
+                    state["ingested_count"] = state.get("ingested_count", 0) + 1
+                    state["last_message"] = (
+                        f"⚠ {att_filename} → {paper.title[:50]} (flagged "
+                        f"{result.get('identity_status')})"
+                    )
+                else:
+                    state["validation_failed_count"] = (
+                        state.get("validation_failed_count", 0) + 1
+                    )
+                    state["last_message"] = (
+                        f"✗ {att_filename}: {outcome}"
+                    )
+                ingested_this_round += 1
+
+                try:
+                    await db.log_audit(AuditLogEntry(
+                        canonical_id=paper.canonical_id,
+                        outcome=f"ZOTERO_INGEST_{outcome.upper()}",
+                        details=json.dumps({
+                            "zotero_item_key": item_key,
+                            "zotero_attachment_key": att_key,
+                            "filename": att_filename,
+                            **{k: v for k, v in result.items()
+                               if k not in ("paper",)},
+                        }),
+                    ))
+                except Exception: pass
+            except Exception as exc:
+                logger.error(
+                    "Zotero ingest error for %s: %s\n%s",
+                    paper.canonical_id, exc, traceback.format_exc(),
+                )
+            finally:
+                try:
+                    if os.path.isfile(tmp_path):
+                        os.unlink(tmp_path)
+                except OSError: pass
+
+        if ingested_this_round > 0:
+            state["last_message"] = (
+                f"Ingested {ingested_this_round} PDF(s) this poll"
+            )
+
+    except ZoteroError as exc:
+        state["last_poll_error"] = str(exc)
+        state["last_message"] = f"Poll failed: {exc}"
+    except Exception as exc:
+        state["last_poll_error"] = str(exc)
+        state["last_message"] = f"Poll error: {type(exc).__name__}: {exc}"
+        logger.error(
+            "Zotero poller exception: %s\n%s", exc, traceback.format_exc(),
+        )
+    finally:
+        await client.close()
+
+
+# ===========================================================================
 # CAPTCHA ENDPOINTS
 # ===========================================================================
 
@@ -5038,14 +5573,40 @@ async def check_output_path(
 # ===========================================================================
 
 
+def _mask_secret(s: Optional[str]) -> str:
+    """Mask all but last 4 chars of a secret. Empty stays empty."""
+    if not s:
+        return ""
+    s = str(s)
+    if len(s) <= 4:
+        return "****"
+    return "*" * (len(s) - 4) + s[-4:]
+
+
+def _redact_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of config with secrets masked, and a set_flag
+    for each secret indicating whether it's currently configured.
+    """
+    redacted = dict(config)
+    key = redacted.get("zotero_api_key") or ""
+    redacted["zotero_api_key"] = _mask_secret(key)
+    redacted["zotero_api_key_set"] = bool(key)
+    return redacted
+
+
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
-    """Get current system settings and runtime status."""
+    """Get current system settings and runtime status.
+
+    The Zotero API key is masked (last 4 chars only) and a boolean
+    `zotero_api_key_set` is added alongside it. The client must never
+    see the full key after it's persisted.
+    """
     config = _get_config()
     wizard: Optional[WizardResult] = app_state.get("wizard_result")
 
     resp = SettingsResponse(
-        config=config,
+        config=_redact_config(config),
         ocr_available=wizard.ocr_available if wizard else False,
         tesseract_available=wizard.tesseract_available if wizard else False,
         ghostscript_available=wizard.ghostscript_available if wizard else False,
@@ -5069,13 +5630,29 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
     updated_fields: List[str] = []
     update_dict = update.model_dump(exclude_none=True)
 
+    # Secrets that should never echo back to the client and should be
+    # skipped if the UI re-submits the masked form by mistake.
+    secret_fields = {"zotero_api_key"}
+    audit_values: Dict[str, Any] = {}
+
     for key, value in update_dict.items():
+        if key in secret_fields and isinstance(value, str):
+            stripped = value.strip()
+            # Skip if: empty string, or looks like the masked form (starts
+            # with asterisks) — the client is confirming the existing value,
+            # not setting a new one.
+            if not stripped or stripped.startswith("*"):
+                continue
+
         if key in config and config[key] != value:
             config[key] = value
             updated_fields.append(key)
         elif key not in config:
             config[key] = value
             updated_fields.append(key)
+
+        if key in updated_fields:
+            audit_values[key] = "***REDACTED***" if key in secret_fields else config[key]
 
     if updated_fields:
         save_config(config)
@@ -5085,7 +5662,7 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
             outcome="SETTINGS_UPDATED",
             details=json.dumps({
                 "updated_fields": updated_fields,
-                "new_values": {k: config[k] for k in updated_fields},
+                "new_values": audit_values,
             }),
         ))
 
@@ -5094,7 +5671,7 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
     return JSONResponse({
         "status": "updated",
         "fields_changed": updated_fields,
-        "config": config,
+        "config": _redact_config(config),
     })
 
 
@@ -5341,6 +5918,31 @@ async def _build_stream_snapshot() -> Dict[str, Any]:
         "unmatched_count": mm.get("unmatched_count", 0),
         "permanently_unavailable": mm.get("permanently_unavailable", 0),
         "pending_disambiguation": bool(mm.get("pending_disambiguation")),
+    }
+
+    # Zotero integration — poller + push status (Part 2 paywalled
+    # redesign). Credentials are never included in the SSE payload;
+    # only the presence-flag `configured` is surfaced so the UI can
+    # render the right control set.
+    zt = app_state.get("zotero") or {}
+    cfg = _get_config()
+    payload["zotero"] = {
+        "configured": bool(
+            cfg.get("zotero_api_key")
+            and cfg.get("zotero_user_id")
+        ),
+        "enabled": bool(zt.get("enabled")),
+        "collection_key": zt.get("collection_key", ""),
+        "collection_name": zt.get("collection_name", ""),
+        "poller_running": bool(zt.get("poller_running")),
+        "last_poll_at": zt.get("last_poll_at"),
+        "last_poll_version": zt.get("last_poll_version", 0),
+        "last_poll_items": zt.get("last_poll_items", 0),
+        "last_poll_error": zt.get("last_poll_error"),
+        "last_message": zt.get("last_message", ""),
+        "ingested_count": zt.get("ingested_count", 0),
+        "validation_failed_count": zt.get("validation_failed_count", 0),
+        "pushed_last_run": zt.get("pushed_last_run", 0),
     }
     return payload
 
