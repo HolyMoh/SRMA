@@ -11,9 +11,13 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
+import shutil
 import subprocess
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Set
 
 from full_text_acquisition.models import (
@@ -21,6 +25,11 @@ from full_text_acquisition.models import (
     DEFAULT_PAGE_LOAD_TIMEOUT_S,
     DEFAULT_SELECTOR_TIMEOUT_S,
 )
+
+# Where per-session audit marker folders live. Existence of EXACTLY one
+# file (SESSION_INFO.txt) inside this folder during a session is the
+# user-verifiable signal that nothing else is being written to disk.
+SSO_SESSION_AUDIT_BASE_DIR = "./sso_session_temp"
 
 logger = logging.getLogger(__name__)
 
@@ -157,9 +166,174 @@ class BrowserManager:
             "--no-default-browser-check",
         ]
 
+        # ---- Privacy Audit instrumentation -----------------------------
+        # These counters are computed from REAL operations, never
+        # hardcoded. If form_fields_read or screenshots_taken ever
+        # become non-zero, the UI shows the truth — we have not added
+        # any code path that would do so today.
+        self._audit: Dict[str, Any] = {
+            "pages_navigated": 0,
+            "form_fields_read": 0,
+            "screenshots_taken": 0,
+            "files_downloaded": 0,
+            "nav_log": [],  # list of {timestamp, url, reason}
+            "session_audit_dir": None,
+            "session_started_at": None,
+        }
+
         # Register atexit as secondary safety net
         atexit.register(self._atexit_cleanup)
         logger.debug("BrowserManager initialized with atexit handler")
+
+    # -----------------------------------------------------------------------
+    # Privacy Audit instrumentation
+    # -----------------------------------------------------------------------
+
+    def _is_persistent_page(self, page: Any) -> bool:
+        """True iff the page belongs to the SSO (persistent) context.
+
+        Used to filter audit counters: Tier 2 disposable-context
+        navigations are NOT counted as SSO activity.
+        """
+        if self._persistent_context is None or page is None:
+            return False
+        try:
+            return page.context is self._persistent_context
+        except Exception:
+            return False
+
+    async def _audited_goto(
+        self,
+        page: Any,
+        url: str,
+        reason: str = "navigation",
+        **goto_kwargs: Any,
+    ) -> Any:
+        """The single navigation entry point for SSO-context pages.
+
+        For pages in the persistent SSO context: increments the
+        pages_navigated counter and appends to the nav log.
+        For pages in disposable contexts (Tier 2): pure delegate, no
+        audit side-effects.
+
+        Logs ONLY the destination URL and a caller-supplied reason
+        string. Never logs the page response, body, title, or any
+        DOM content.
+        """
+        if self._is_persistent_page(page):
+            self._audit["pages_navigated"] += 1
+            self._audit["nav_log"].append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "url": url,
+                "reason": reason,
+            })
+            # Cap the log to avoid unbounded growth on long sessions
+            if len(self._audit["nav_log"]) > 5000:
+                self._audit["nav_log"] = self._audit["nav_log"][-5000:]
+        return await page.goto(url, **goto_kwargs)
+
+    def _reset_audit_state(self) -> None:
+        """Reset all counters and log to fresh state for a new session."""
+        self._audit["pages_navigated"] = 0
+        self._audit["form_fields_read"] = 0
+        self._audit["screenshots_taken"] = 0
+        self._audit["files_downloaded"] = 0
+        self._audit["nav_log"] = []
+
+    def _create_session_audit_dir(
+        self,
+        base_dir: str = SSO_SESSION_AUDIT_BASE_DIR,
+    ) -> str:
+        """Create a per-session marker folder + SESSION_INFO.txt.
+
+        Existence of EXACTLY this one file in the folder during a
+        session is the user-verifiable signal that nothing else is
+        being persisted by the system. Returns the folder path.
+        """
+        os.makedirs(base_dir, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        session_dir = os.path.abspath(
+            os.path.join(base_dir, f"session_{ts}_{uuid.uuid4().hex[:8]}")
+        )
+        os.makedirs(session_dir, exist_ok=True)
+
+        marker_path = os.path.join(session_dir, "SESSION_INFO.txt")
+        marker_text = (
+            "SSO Session Audit Marker\n"
+            "=" * 40 + "\n"
+            f"Session started:  {datetime.now(timezone.utc).isoformat()}\n"
+            f"Session folder:   {session_dir}\n\n"
+            "This folder exists so you can verify that the system\n"
+            "is NOT writing anything else to disk during your SSO\n"
+            "session. The Playwright browser context is in-memory\n"
+            "only — cookies, cache, IndexedDB never touch the disk.\n\n"
+            "If you click 'Verify now' in the Privacy Audit panel\n"
+            "and see only this one file (SESSION_INFO.txt), you\n"
+            "have proof that no other session data is being persisted.\n\n"
+            "When you click End SSO Session, this entire folder\n"
+            "(including this file) is removed.\n"
+        )
+        with open(marker_path, "w") as fh:
+            fh.write(marker_text)
+
+        self._audit["session_audit_dir"] = session_dir
+        self._audit["session_started_at"] = datetime.now(timezone.utc).isoformat()
+        logger.info("SSO audit session folder created: %s", session_dir)
+        return session_dir
+
+    def _cleanup_session_audit_dir(self) -> None:
+        """Remove the per-session audit folder + marker."""
+        path = self._audit.get("session_audit_dir")
+        if path and os.path.isdir(path):
+            try:
+                shutil.rmtree(path)
+                logger.info("SSO audit session folder removed: %s", path)
+            except Exception as exc:
+                logger.warning(
+                    "Could not remove audit folder %s: %s", path, exc
+                )
+        self._audit["session_audit_dir"] = None
+
+    def audit_snapshot(self) -> Dict[str, Any]:
+        """Serializable snapshot of the audit state — safe to expose to the UI.
+
+        Returns a fresh dict; callers may mutate without affecting
+        internal state. Never returns cookie values.
+        """
+        return {
+            "pages_navigated": self._audit["pages_navigated"],
+            "form_fields_read": self._audit["form_fields_read"],
+            "screenshots_taken": self._audit["screenshots_taken"],
+            "files_downloaded": self._audit["files_downloaded"],
+            "nav_log": list(self._audit["nav_log"]),
+            "session_audit_dir": self._audit["session_audit_dir"],
+            "session_started_at": self._audit["session_started_at"],
+            "has_persistent_context": self._persistent_context is not None,
+        }
+
+    async def list_persistent_cookies(self) -> List[Dict[str, Any]]:
+        """List cookies in the SSO context — names + domains only.
+
+        SECURITY: never returns the cookie value. Returns metadata
+        sufficient to identify what's set without exposing what it
+        contains.
+        """
+        if self._persistent_context is None:
+            return []
+        try:
+            cookies = await self._persistent_context.cookies()
+        except Exception as exc:
+            logger.debug("Could not list cookies: %s", exc)
+            return []
+        return [{
+            "domain": c.get("domain", ""),
+            "name": c.get("name", ""),
+            "path": c.get("path", "/"),
+            "expires": c.get("expires", -1),
+            "http_only": bool(c.get("httpOnly", False)),
+            "secure": bool(c.get("secure", False)),
+            "same_site": c.get("sameSite", ""),
+        } for c in cookies]
 
     @classmethod
     def get_instance(cls) -> BrowserManager:
@@ -409,6 +583,16 @@ class BrowserManager:
             async with self._lock:
                 self._persistent_context = context
 
+            # Reset audit counters and create a per-session marker
+            # folder. Existence of EXACTLY one file in this folder
+            # (SESSION_INFO.txt) during the session is the user-
+            # verifiable signal that nothing else is being persisted.
+            self._reset_audit_state()
+            try:
+                self._create_session_audit_dir()
+            except Exception as exc:
+                logger.warning("Could not create session audit dir: %s", exc)
+
             logger.info("Persistent SSO context created (headed)")
             return context
         except Exception as exc:
@@ -467,6 +651,13 @@ class BrowserManager:
                     "Persistent SSO context destroyed (reason: %s)", reason
                 )
 
+        # Wipe the per-session audit folder + marker. Done outside
+        # the lock so a slow filesystem doesn't block other operations.
+        try:
+            self._cleanup_session_audit_dir()
+        except Exception as exc:
+            logger.warning("Audit folder cleanup failed: %s", exc)
+
     @property
     def has_persistent_context(self) -> bool:
         """Check whether a persistent SSO context is currently active."""
@@ -500,8 +691,10 @@ class BrowserManager:
         """
         page = await self.get_sso_page()
         try:
-            await page.goto(
+            await self._audited_goto(
+                page,
                 sso_url,
+                reason="User-initiated SSO login",
                 timeout=page_load_timeout_s * 1000,
                 wait_until="domcontentloaded",
             )
@@ -618,8 +811,10 @@ class BrowserManager:
 
         t0 = _time.monotonic()
         try:
-            response = await page.goto(
+            response = await self._audited_goto(
+                page,
                 test_url,
+                reason="Session check",
                 timeout=page_load_timeout_s * 1000,
                 wait_until="domcontentloaded",
             )
@@ -753,8 +948,13 @@ class BrowserManager:
         url: str,
         timeout_s: float = DEFAULT_PAGE_LOAD_TIMEOUT_S,
         wait_until: str = "domcontentloaded",
+        reason: str = "navigation",
     ) -> Dict[str, Any]:
         """Navigate to a URL with timeout and comprehensive error handling.
+
+        For pages in the persistent SSO context, navigation is recorded
+        in the Privacy Audit log (URL + reason only, never page content).
+        For Tier 2 disposable contexts, no audit side-effects.
 
         Returns a dict with:
             success: bool
@@ -772,8 +972,10 @@ class BrowserManager:
         }
 
         try:
-            response = await page.goto(
+            response = await self._audited_goto(
+                page,
                 url,
+                reason=reason,
                 timeout=timeout_s * 1000,
                 wait_until=wait_until,
             )

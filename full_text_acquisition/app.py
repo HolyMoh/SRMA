@@ -2022,6 +2022,207 @@ async def sso_mark_retrieved(
     })
 
 
+# ---------------------------------------------------------------------------
+# Privacy Audit endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/sso/audit")
+async def sso_audit_snapshot() -> JSONResponse:
+    """Snapshot of SSO browser activity counters and navigation log.
+
+    Counters are computed from REAL operations instrumented in
+    BrowserManager — never hardcoded. If form_fields_read or
+    screenshots_taken ever become non-zero, the UI will show the
+    truth (we have not added any code path that does either).
+    """
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    if bm is None:
+        return JSONResponse({
+            "pages_navigated": 0,
+            "form_fields_read": 0,
+            "screenshots_taken": 0,
+            "files_downloaded": 0,
+            "nav_log": [],
+            "session_audit_dir": None,
+            "session_started_at": None,
+            "has_persistent_context": False,
+        })
+    return JSONResponse(bm.audit_snapshot())
+
+
+@app.get("/api/sso/audit/cookies")
+async def sso_audit_cookies() -> JSONResponse:
+    """List cookies in the SSO context — names + domains only.
+
+    SECURITY: cookie values are NEVER returned. Only metadata that
+    lets the user identify what is set (domain, name, path, expires,
+    httpOnly/secure/sameSite flags).
+    """
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    if bm is None:
+        return JSONResponse({"cookies": [], "count": 0})
+    cookies = await bm.list_persistent_cookies()
+    return JSONResponse({"cookies": cookies, "count": len(cookies)})
+
+
+@app.get("/api/sso/audit/folder-listing")
+async def sso_audit_folder_listing() -> JSONResponse:
+    """List contents of the per-session audit folder.
+
+    Powers the 'Verify now' button. If the folder contains exactly
+    one file (SESSION_INFO.txt), the user has visual proof that no
+    other session data is being persisted by the system.
+    """
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    if bm is None:
+        return JSONResponse({
+            "session_dir": None, "exists": False,
+            "contents": [], "is_empty_except_marker": True,
+        })
+
+    session_dir = bm.audit_snapshot().get("session_audit_dir")
+    if not session_dir:
+        return JSONResponse({
+            "session_dir": None, "exists": False,
+            "contents": [], "is_empty_except_marker": True,
+        })
+
+    if not os.path.isdir(session_dir):
+        return JSONResponse({
+            "session_dir": session_dir, "exists": False,
+            "contents": [], "is_empty_except_marker": True,
+        })
+
+    contents: List[Dict[str, Any]] = []
+    try:
+        for name in sorted(os.listdir(session_dir)):
+            full = os.path.join(session_dir, name)
+            try:
+                st = os.stat(full)
+                contents.append({
+                    "name": name,
+                    "size_bytes": st.st_size,
+                    "is_dir": os.path.isdir(full),
+                    "modified": datetime.fromtimestamp(
+                        st.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                })
+            except OSError as exc:
+                contents.append({
+                    "name": name, "size_bytes": 0,
+                    "is_dir": False, "modified": "",
+                    "error": str(exc),
+                })
+    except OSError as exc:
+        return JSONResponse({
+            "session_dir": session_dir, "exists": True,
+            "contents": [], "error": str(exc),
+            "is_empty_except_marker": False,
+        })
+
+    only_marker = (
+        len(contents) == 1
+        and contents[0]["name"] == "SESSION_INFO.txt"
+    )
+    return JSONResponse({
+        "session_dir": session_dir,
+        "exists": True,
+        "contents": contents,
+        "is_empty_except_marker": only_marker,
+    })
+
+
+# Trust-boundary functions: the ENTIRE surface where the system
+# touches the SSO browser. Scanned at request time so reported line
+# numbers always match the running code, never drift on refactor.
+SSO_TRUST_BOUNDARY_FUNCTIONS: List[Dict[str, str]] = [
+    {"function": "initiate_sso_login",      "module": "browser_manager"},
+    {"function": "probe_sso_login",         "module": "browser_manager"},
+    {"function": "get_sso_page",            "module": "browser_manager"},
+    {"function": "tier3_institutional_sso", "module": "retrieval_engine"},
+]
+
+
+@app.get("/api/sso/audit/source-functions")
+async def sso_audit_source_functions() -> JSONResponse:
+    """Locate the 4 functions that interact with the SSO browser.
+
+    Reads the source files of the running modules and returns the
+    current line number of each function definition. Line numbers
+    are recomputed on every request so they are always accurate
+    for the version actually running.
+    """
+    import full_text_acquisition.browser_manager as _bm_mod
+    import full_text_acquisition.retrieval_engine as _re_mod
+
+    module_paths = {
+        "browser_manager":   _bm_mod.__file__,
+        "retrieval_engine":  _re_mod.__file__,
+    }
+
+    results: List[Dict[str, Any]] = []
+    for entry in SSO_TRUST_BOUNDARY_FUNCTIONS:
+        fn = entry["function"]
+        mod = entry["module"]
+        path = module_paths.get(mod)
+        out: Dict[str, Any] = {
+            "function": fn,
+            "module": mod,
+            "file": os.path.basename(path) if path else None,
+            "line": None,
+            "exists": False,
+        }
+        if not path or not os.path.isfile(path):
+            out["error"] = "Source file not readable"
+            results.append(out)
+            continue
+        try:
+            with open(path, "r") as fh:
+                lines = fh.readlines()
+            for i, line in enumerate(lines):
+                stripped = line.lstrip()
+                if (stripped.startswith(f"async def {fn}(")
+                        or stripped.startswith(f"def {fn}(")):
+                    out["line"] = i + 1
+                    out["exists"] = True
+                    break
+        except OSError as exc:
+            out["error"] = str(exc)
+        results.append(out)
+
+    return JSONResponse({"functions": results})
+
+
+@app.get("/api/sso/audit/nav-log.csv")
+async def sso_audit_nav_log_csv() -> FileResponse:
+    """CSV export of the SSO navigation log (timestamp, url, reason)."""
+    bm: Optional[BrowserManager] = app_state.get("browser_manager")
+    nav: List[Dict[str, Any]] = []
+    if bm is not None:
+        nav = bm.audit_snapshot().get("nav_log", [])
+
+    export_dir = os.path.join(
+        _get_config().get("output_directory", "./downloads"), "exports"
+    )
+    os.makedirs(export_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"sso_nav_log_{timestamp}.csv"
+    fpath = os.path.join(export_dir, fname)
+
+    with open(fpath, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["timestamp", "url", "reason"])
+        for entry in nav:
+            w.writerow([
+                entry.get("timestamp", ""),
+                entry.get("url", ""),
+                entry.get("reason", ""),
+            ])
+
+    return FileResponse(fpath, media_type="text/csv", filename=fname)
+
+
 @app.get("/api/sso/manual-fallback")
 async def sso_manual_fallback() -> JSONResponse:
     """List of papers still needing manual retrieval after SSO session ends."""

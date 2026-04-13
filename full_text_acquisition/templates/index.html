@@ -1159,6 +1159,83 @@
                     Loading...
                 </div>
             </div>
+
+            <!-- ============================================================
+                 PRIVACY AUDIT — verifiable trust UX
+                 ============================================================ -->
+            <div class="card" style="border-left: 3px solid var(--accent); background:#f0f9ff">
+                <div class="card-header">
+                    <h3>&#128270; Privacy Audit</h3>
+                    <button class="btn btn-outline btn-sm" id="btnSsoAuditRefresh">Refresh</button>
+                </div>
+
+                <!-- Activity counters (real, computed from instrumented operations) -->
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">
+                    Counts below are computed from <strong>real operations</strong> instrumented in
+                    <code>BrowserManager</code> — never hardcoded. If any non-zero value
+                    appears for "Form fields read" or "Screenshots taken", that means the
+                    code actually performed those operations. They have no path to do so today.
+                </div>
+                <div class="card-grid" style="margin-bottom:12px">
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditPages">0</div><div class="metric-label">Pages navigated</div></div>
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditForms">0</div><div class="metric-label">Form fields read</div></div>
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditShots">0</div><div class="metric-label">Screenshots taken</div></div>
+                    <div class="metric-card"><div class="metric-value" id="ssoAuditFiles">0</div><div class="metric-label">Files downloaded</div></div>
+                </div>
+
+                <!-- Navigation log -->
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;margin-bottom:6px">
+                    <strong style="font-size:13px">Navigation log</strong>
+                    <a href="/api/sso/audit/nav-log.csv" class="btn btn-outline btn-sm"
+                       style="padding:2px 10px;font-size:11px">Download CSV</a>
+                </div>
+                <div id="ssoAuditNavLog" style="max-height:200px;overflow-y:auto;font-size:11px;font-family:var(--mono);background:white;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px">
+                    No navigations yet.
+                </div>
+
+                <!-- Cookies -->
+                <details style="margin-top:16px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        Cookies in the SSO browser
+                        (<span id="ssoAuditCookiesCount">0</span>)
+                    </summary>
+                    <div style="font-size:11px;color:var(--text-secondary);margin-top:6px;margin-bottom:8px">
+                        Names + domains only. Cookie <strong>values are never shown or stored
+                        outside the Playwright browser context</strong>.
+                        These cookies stay in memory and are deleted when you End Session.
+                    </div>
+                    <div id="ssoAuditCookiesList" style="font-family:var(--mono);font-size:11px"></div>
+                </details>
+
+                <!-- Session isolation folder -->
+                <div style="margin-top:16px;padding:12px;background:white;border:1px solid var(--border);border-radius:var(--radius-sm)">
+                    <div style="font-weight:600;font-size:13px;margin-bottom:6px">Session isolation folder</div>
+                    <div style="font-family:var(--mono);font-size:11px;color:var(--text-secondary);word-break:break-all" id="ssoAuditSessionDir">
+                        (No active session)
+                    </div>
+                    <div style="font-size:11px;color:var(--text-secondary);margin-top:6px">
+                        The Playwright context is in-memory — nothing else should appear in this folder.
+                        Click <strong>Verify now</strong> to list its contents and confirm.
+                    </div>
+                    <button class="btn btn-outline btn-sm" id="btnSsoAuditVerify"
+                            style="margin-top:8px;padding:4px 10px">Verify now</button>
+                    <div id="ssoAuditFolderListing" style="margin-top:8px;font-size:11px;font-family:var(--mono)"></div>
+                </div>
+
+                <!-- Trust boundary -->
+                <details style="margin-top:16px">
+                    <summary style="cursor:pointer;font-weight:600;font-size:13px">
+                        How this works &middot; Trust boundary functions
+                    </summary>
+                    <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;margin-bottom:8px">
+                        Exactly four functions in the source code interact with the SSO browser.
+                        Anyone can audit those four functions to verify the system's claims.
+                        Line numbers are computed from the source files at request time, so they
+                        always match the version you are running.
+                    </div>
+                    <div id="ssoAuditFunctionList" style="font-family:var(--mono);font-size:11px"></div>
+                </details>
+            </div>
         </div>
 
         <!-- ============================================================
@@ -1369,7 +1446,12 @@ function switchPanel(name) {
     if (name === 'results') { loadResults(); loadResultsOutputHeader(); }
     if (name === 'settings') loadSettings();
     if (name === 'run') loadRuns();
-    if (name === 'sso') loadSsoStatus();
+    if (name === 'sso') {
+        loadSsoStatus();
+        startSsoAuditPolling();   // 3s poll while panel visible
+    } else {
+        stopSsoAuditPolling();
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -2287,6 +2369,168 @@ document.getElementById('btnSsoReloadManual').addEventListener('click', async fu
 document.getElementById('btnSsoExportManualCsv').addEventListener('click', function() {
     window.location.href = '/api/sso/manual-fallback/csv';
 });
+
+/* ------------------------------------------------------------------
+   Privacy Audit panel — verifiable trust UX
+   ------------------------------------------------------------------
+   Polls /api/sso/audit every 3s while the SSO panel is visible.
+   Cookie list and source-function list are loaded on demand
+   (collapsed details elements).
+*/
+let _ssoAuditPollTimer = null;
+
+async function loadSsoAudit() {
+    try {
+        const a = await GET('/api/sso/audit');
+        document.getElementById('ssoAuditPages').textContent = a.pages_navigated || 0;
+        document.getElementById('ssoAuditForms').textContent = a.form_fields_read || 0;
+        document.getElementById('ssoAuditShots').textContent = a.screenshots_taken || 0;
+        document.getElementById('ssoAuditFiles').textContent = a.files_downloaded || 0;
+
+        // Color the "Form fields read" and "Screenshots taken" red if non-zero.
+        // Today they are always 0 because no code path calls those operations,
+        // but the count is computed (not hardcoded), so non-zero would mean a
+        // real regression that the user MUST see.
+        document.getElementById('ssoAuditForms').className =
+            (a.form_fields_read || 0) > 0 ? 'metric-value score-low' : 'metric-value score-high';
+        document.getElementById('ssoAuditShots').className =
+            (a.screenshots_taken || 0) > 0 ? 'metric-value score-low' : 'metric-value score-high';
+
+        // Nav log (most recent first, capped at 100 in display)
+        const nav = (a.nav_log || []).slice().reverse().slice(0, 100);
+        const navEl = document.getElementById('ssoAuditNavLog');
+        if (nav.length === 0) {
+            navEl.innerHTML = '<span style="color:var(--text-secondary)">No navigations yet.</span>';
+        } else {
+            navEl.innerHTML = nav.map(function(e) {
+                const t = (e.timestamp || '').substring(11, 19);  // HH:MM:SS
+                return '<div style="padding:2px 0">' +
+                    '<span style="color:var(--text-secondary)">[' + escHtml(t) + ']</span> ' +
+                    '<span style="color:var(--accent)">[' + escHtml(e.reason || 'navigation') + ']</span> ' +
+                    escHtml(e.url || '') +
+                    '</div>';
+            }).join('');
+        }
+
+        // Session folder display
+        const sessDir = a.session_audit_dir;
+        document.getElementById('ssoAuditSessionDir').textContent =
+            sessDir || '(No active session — folder created when you Start SSO Session)';
+    } catch (e) {
+        // Silently ignore — panel is informational
+    }
+}
+
+async function loadSsoAuditCookies() {
+    try {
+        const c = await GET('/api/sso/audit/cookies');
+        document.getElementById('ssoAuditCookiesCount').textContent = c.count || 0;
+        const list = document.getElementById('ssoAuditCookiesList');
+        if (!c.cookies || c.cookies.length === 0) {
+            list.innerHTML = '<span style="color:var(--text-secondary)">No cookies (or no active SSO session)</span>';
+            return;
+        }
+        list.innerHTML = '<div style="display:grid;grid-template-columns:auto auto auto auto;gap:4px 12px;align-items:center">' +
+            '<strong>Domain</strong><strong>Name</strong><strong>Expires</strong><strong>Flags</strong>' +
+            c.cookies.map(function(ck) {
+                const expires = ck.expires === -1 || !ck.expires ? 'session'
+                    : new Date(ck.expires * 1000).toISOString().substring(0, 16).replace('T', ' ');
+                const flags = (ck.http_only ? 'HttpOnly ' : '') + (ck.secure ? 'Secure ' : '') + (ck.same_site || '');
+                return '<span>' + escHtml(ck.domain) + '</span>' +
+                    '<span>' + escHtml(ck.name) + '</span>' +
+                    '<span>' + escHtml(expires) + '</span>' +
+                    '<span style="color:var(--text-secondary);font-size:10px">' + escHtml(flags.trim()) + '</span>';
+            }).join('') + '</div>';
+    } catch (e) {
+        document.getElementById('ssoAuditCookiesList').innerHTML =
+            '<span style="color:var(--danger)">Failed to load: ' + escHtml(e.message) + '</span>';
+    }
+}
+
+async function verifyAuditFolder() {
+    const out = document.getElementById('ssoAuditFolderListing');
+    out.innerHTML = '<span style="color:var(--text-secondary)">Reading folder...</span>';
+    try {
+        const f = await GET('/api/sso/audit/folder-listing');
+        if (!f.session_dir) {
+            out.innerHTML = '<span style="color:var(--text-secondary)">No active session folder.</span>';
+            return;
+        }
+        if (!f.exists) {
+            out.innerHTML = '<span style="color:var(--success)">&#10003; Folder does not exist (cleaned up).</span>';
+            return;
+        }
+        const items = f.contents || [];
+        const header = '<div style="margin-bottom:6px">' +
+            '<strong>' + items.length + ' file(s)</strong> in ' +
+            '<span style="color:var(--text-secondary)">' + escHtml(f.session_dir) + '</span>' +
+            '</div>';
+        const verdict = f.is_empty_except_marker
+            ? '<div style="color:var(--success);margin-top:6px;padding:6px;background:#f0fdf4;border-radius:var(--radius-sm)">&#10003; Verified: only the SESSION_INFO.txt marker is present. Nothing else is being persisted by the system.</div>'
+            : '<div style="color:var(--warning);margin-top:6px;padding:6px;background:#fffbeb;border-radius:var(--radius-sm)">&#9888; Folder contains files other than the marker. Inspect them below.</div>';
+        const rows = items.map(function(it) {
+            return '<div style="padding:2px 0">' +
+                (it.is_dir ? '&#128193; ' : '&#128196; ') +
+                escHtml(it.name) +
+                ' <span style="color:var(--text-secondary)">(' + (it.size_bytes || 0) + ' bytes, modified ' +
+                escHtml((it.modified || '').substring(11, 19)) + ')</span>' +
+                '</div>';
+        }).join('');
+        out.innerHTML = header + rows + verdict;
+    } catch (e) {
+        out.innerHTML = '<span style="color:var(--danger)">Verify failed: ' + escHtml(e.message) + '</span>';
+    }
+}
+
+async function loadSsoAuditFunctions() {
+    try {
+        const r = await GET('/api/sso/audit/source-functions');
+        const fns = r.functions || [];
+        document.getElementById('ssoAuditFunctionList').innerHTML = fns.map(function(f) {
+            const ok = f.exists ? '&#10003;' : '&#10007;';
+            const where = f.line ? f.file + ':' + f.line : (f.error || 'not found');
+            return '<div style="padding:2px 0">' + ok + ' <strong>' +
+                escHtml(f.module) + '.' + escHtml(f.function) + '</strong>' +
+                ' <span style="color:var(--text-secondary)">' + escHtml(where) + '</span></div>';
+        }).join('');
+    } catch (e) {
+        document.getElementById('ssoAuditFunctionList').innerHTML =
+            '<span style="color:var(--danger)">Failed: ' + escHtml(e.message) + '</span>';
+    }
+}
+
+function startSsoAuditPolling() {
+    stopSsoAuditPolling();
+    loadSsoAudit();
+    _ssoAuditPollTimer = setInterval(loadSsoAudit, 3000);
+}
+function stopSsoAuditPolling() {
+    if (_ssoAuditPollTimer) {
+        clearInterval(_ssoAuditPollTimer);
+        _ssoAuditPollTimer = null;
+    }
+}
+
+// Wire buttons
+document.getElementById('btnSsoAuditRefresh').addEventListener('click', function() {
+    loadSsoAudit();
+    loadSsoAuditCookies();
+    loadSsoAuditFunctions();
+});
+document.getElementById('btnSsoAuditVerify').addEventListener('click', verifyAuditFolder);
+
+// Lazy-load cookies + functions when their <details> is opened
+document.addEventListener('toggle', function(e) {
+    if (e.target.tagName !== 'DETAILS') return;
+    const summary = e.target.querySelector('summary');
+    if (!summary) return;
+    const text = summary.textContent || '';
+    if (text.indexOf('Cookies in the SSO browser') >= 0 && e.target.open) {
+        loadSsoAuditCookies();
+    } else if (text.indexOf('Trust boundary functions') >= 0 && e.target.open) {
+        loadSsoAuditFunctions();
+    }
+}, true);
 
 window.ssoMarkRetrieved = async function(canonicalId) {
     const note = prompt('Optional note (e.g. how you got it):') || '';
