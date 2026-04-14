@@ -1,1 +1,663 @@
-"""\nSRMA Extraction Engine — Streamlit application.\n\nResponsibilities:\n- Catches SchemaCycleError from template_manager.py → st.error()\n- Split-screen: 55% PDF viewer, 45% data editor\n- Click-to-highlight with table-bbox fallback\n- Design override UI → propagates through StudyMetadata, ROB_TOOL_MAP,\n  DESIGN_OVERRIDE audit event\n- Multi-sheet export: Extraction_{pdf}, Appraisal_{pdf}, NOS_{pdf},\n  StudyMetadata, Audit_Summary\n- Does NOT import from utils.errors.PDFUnreadableError in production flow\n\nImport rule: app.py may import from all project modules.\n             No module other than app.py may import streamlit.\n"""\nfrom __future__ import annotations\n\nimport asyncio\nimport concurrent.futures\nimport io\nimport json\nimport os\nimport tempfile\nfrom pathlib import Path\nfrom typing import Any, Optional\n\nimport pandas as pd\nimport streamlit as st\n\nimport config\nfrom models.extraction_schema import (\n    StudyDesign, StudyMetadata, DesignCandidate,\n    TreatmentArm, CostTracker, PDFQuality,\n    ExtractedVariable, RoBAssessment, NOSResult,\n)\nfrom utils.errors import SchemaCycleError, CostCapExceededError\nfrom utils.audit_logger import get_logger, AuditLogger\nfrom utils.rob_framework import get_tools_for_design\nfrom engine.template_manager import TemplateManager, ParsedSchema\nfrom engine.pdf_processor import PDFProcessor, ParsedPDF\nfrom engine.llm_orchestrator import LLMOrchestrator\n\n# ── Page configuration ─────────────────────────────────────────────────────────\n\nst.set_page_config(\n    page_title=\"SRMA Extraction Engine\",\n    page_icon=\"🔬\",\n    layout=\"wide\",\n    initial_sidebar_state=\"expanded\",\n)\n\n# ── Session state initialisation ───────────────────────────────────────────────\n\ndef _init_session_state() -> None:\n    defaults: dict[str, Any] = {\n        \"api_key\": \"\",\n        \"schema\": None,              # ParsedSchema\n        \"schema_warnings\": [],\n        \"pdf_parsed\": {},            # {filename: ParsedPDF}\n        \"pdf_bytes\": {},             # {filename: bytes}  ← raw bytes for viewer\n        \"extracted_data\": {},        # {filename: list[ExtractedVariable]}\n        \"rob_assessments\": {},       # {filename: RoBAssessment}\n        \"study_metadata\": {},        # {filename: StudyMetadata}\n        \"design_overrides\": {},      # {filename: StudyDesign}\n        \"highlighted_location\": {},  # {filename: ExtractionLocation}\n        \"active_pdf\": None,\n        \"cost_trackers\": {},         # {filename: CostTracker}\n        \"audit_logger\": get_logger(\"audit_log.jsonl\"),\n        \"extraction_running\": False,\n    }\n    for key, val in defaults.items():\n        if key not in st.session_state:\n            st.session_state[key] = val\n\n\n_init_session_state()\n\n\n# ── Helper: run a coroutine from synchronous Streamlit code ───────────────────\n# Streamlit Cloud runs inside a tornado/asyncio event loop. Calling\n# asyncio.run() or asyncio.new_event_loop().run_until_complete() from\n# within that loop raises RuntimeError. The safe approach is to submit\n# the coroutine to a fresh thread that has its own event loop.\n\ndef _run_async(coro) -> Any:\n    \"\"\"Run a coroutine synchronously from a Streamlit callback.\"\"\"\n    def _thread_target():\n        return asyncio.run(coro)\n    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:\n        future = pool.submit(_thread_target)\n        return future.result()\n\n\n# ── FUNCTION DEFINITIONS — must precede any call site ─────────────────────────\n# Python does not hoist function definitions. Both _run_extraction_batch and\n# _build_export_xlsx are called from inside the sidebar block below, so they\n# MUST be defined here, before that block.\n\ndef _run_extraction_batch() -> None:\n    \"\"\"Run extraction for all loaded PDFs.\"\"\"\n    schema: Optional[ParsedSchema] = st.session_state.schema\n    if schema is None:\n        st.error(\"No schema loaded.\")\n        return\n\n    orchestrator = LLMOrchestrator(\n        api_key=st.session_state.api_key,\n        model=\"claude-opus-4-6\",\n    )\n    logger: AuditLogger = st.session_state.audit_logger\n    processor = PDFProcessor()\n\n    for fname, parsed_pdf in st.session_state.pdf_parsed.items():\n        if parsed_pdf.quality == PDFQuality.UNREADABLE:\n            logger.log_pdf_skipped(fname, \"UNREADABLE quality\")\n            continue\n\n        cost_tracker = CostTracker(pdf_filename=fname)\n        st.session_state.cost_trackers[fname] = cost_tracker\n\n        try:\n            # Pass 0: design detection\n            pass0_input = (\n                parsed_pdf.abstract_text + \"\\n\\n\" + parsed_pdf.methods_text\n            )[:config.PASS0_MAX_INPUT_TOKENS]\n\n            design, confidence, alternatives, warnings = _run_async(\n                orchestrator.run_pass0(\n                    abstract_and_methods=pass0_input,\n                    pdf_filename=fname,\n                    cost_tracker=cost_tracker,\n                )\n            )\n\n            # Apply user design override if set\n            override = st.session_state.design_overrides.get(fname)\n            design_overridden = False\n            if override is not None and override != design:\n                logger.log_design_override(\n                    pdf_filename=fname,\n                    original_design=design.value,\n                    overridden_design=override.value,\n                )\n                design = override\n                design_overridden = True\n\n            candidate_rob_tools = get_tools_for_design(design)\n            metadata = StudyMetadata(\n                study_id=fname,\n                treatment_arms=[],\n                primary_outcomes=[],\n                population_description=\"\",\n                detected_study_design=design,\n                design_confidence=confidence,\n                design_alternatives=alternatives,\n                design_overridden_by_user=design_overridden,\n                candidate_rob_tools=candidate_rob_tools,\n                pass0_confidence=confidence,\n                pass0_warnings=warnings,\n            )\n            st.session_state.study_metadata[fname] = metadata\n\n            # Mode A: variable extraction\n            # approx 4 chars per token\n            llm_input = processor.format_for_llm(\n                parsed_pdf,\n                max_chars=config.EXTRACTION_MAX_INPUT_TOKENS * 4,\n            )\n            extracted_vars: list[ExtractedVariable] = []\n\n            for var_spec in schema.variables:\n                var_context = (\n                    f\"variable: {var_spec.raw_header}\\n\"\n                    f\"canonical_name: {var_spec.canonical_name}\\n\"\n                    f\"expected_unit: {var_spec.expected_unit or 'not specified'}\"\n                )\n                result = _run_async(\n                    orchestrator.extract_variable(\n                        variable_context=var_context,\n                        pdf_text=llm_input,\n                        pdf_filename=fname,\n                        cost_tracker=cost_tracker,\n                        study_metadata=metadata,\n                    )\n                )\n                if result is not None:\n                    extracted_vars.append(result)\n                    logger.log_extraction(\n                        pdf_filename=fname,\n                        variable=result.variable,\n                        canonical_name=result.canonical_name,\n                        status=result.status,\n                        value=result.value,\n                        confidence=result.confidence,\n                    )\n\n            st.session_state.extracted_data[fname] = extracted_vars\n\n        except CostCapExceededError as e:\n            logger.log_cost_cap_hit(\n                fname,\n                cost_tracker.estimated_usd,\n                config.COST_HARD_STOP_USD,\n            )\n            st.warning(f\"{fname}: Cost cap hit — skipping. ({e})\")\n        except Exception as e:\n            logger.log_parser_error(fname, None, str(e))\n            st.error(f\"{fname}: Extraction error — {e}\")\n\n\ndef _build_export_xlsx() -> bytes:\n    \"\"\"Build a multi-sheet Excel export and return bytes.\"\"\"\n    output = io.BytesIO()\n    with pd.ExcelWriter(output, engine=\"openpyxl\") as writer:\n        # Per-PDF extraction sheets\n        for fname, vars_list in st.session_state.extracted_data.items():\n            sheet_name = f\"Extraction_{Path(fname).stem}\"[:31]\n            if vars_list:\n                rows = []\n                for v in vars_list:\n                    row: dict[str, Any] = {\n                        \"variable\": v.variable,\n                        \"canonical_name\": v.canonical_name,\n                        \"value\": v.value,\n                        \"unit\": v.unit,\n                        \"status\": v.status,\n                        \"confidence\": v.confidence,\n                        \"study_arm\": v.study_arm,\n                        \"arm_role\": v.arm_role,\n                        \"evidence_quote\": v.evidence_quote,\n                        \"uncertainty_note\": v.uncertainty_note,\n                        \"source_type\": v.source_type,\n                        \"verification_flag\": v.verification_flag,\n                        \"calculation_trace\": v.calculation_trace,\n                        \"page\": v.location.page if v.location else None,\n                        \"table_id\": v.location.table_id if v.location else None,\n                        \"outcome_name\": v.context.outcome_name if v.context else None,\n                        \"timepoint\": v.context.timepoint if v.context else None,\n                        \"analysis_population\": v.context.analysis_population if v.context else None,\n                    }\n                    rows.append(row)\n                pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)\n            else:\n                pd.DataFrame().to_excel(writer, sheet_name=sheet_name, index=False)\n\n        # Per-PDF appraisal sheets\n        for fname, assessment in st.session_state.rob_assessments.items():\n            sheet_name = f\"Appraisal_{Path(fname).stem}\"[:31]\n            rows = []\n            for tool, signals_list in assessment.signals.items():\n                for sig in signals_list:\n                    rows.append({\n                        \"tool\": tool,\n                        \"domain_id\": sig.domain_id,\n                        \"domain_name\": sig.domain_name,\n                        \"signalling_question\": sig.signalling_question,\n                        \"signal_answer\": sig.signal_answer,\n                        \"status\": sig.status,\n                        \"evidence_quote\": sig.evidence_quote,\n                        \"source_type\": sig.source_type,\n                    })\n            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)\n\n            # NOS sheet if applicable\n            if assessment.nos_result is not None:\n                nos = assessment.nos_result\n                nos_sheet = f\"NOS_{Path(fname).stem}\"[:31]\n                nos_rows = [\n                    {\"item_id\": k, \"evidence\": v}\n                    for k, v in nos.item_evidence.items()\n                ]\n                if nos.item_stars:\n                    for row in nos_rows:\n                        row[\"stars\"] = nos.item_stars.get(row[\"item_id\"])\n                pd.DataFrame(nos_rows).to_excel(writer, sheet_name=nos_sheet, index=False)\n\n        # StudyMetadata sheet\n        meta_rows = []\n        for fname, meta in st.session_state.study_metadata.items():\n            rob = st.session_state.rob_assessments.get(fname)\n            meta_rows.append({\n                \"study_id\": meta.study_id,\n                \"detected_study_design\": meta.detected_study_design.value,\n                \"design_confidence\": meta.design_confidence,\n                \"design_overridden_by_user\": meta.design_overridden_by_user,\n                \"candidate_rob_tools\": json.dumps(meta.candidate_rob_tools),\n                \"design_alternatives\": json.dumps([\n                    {\"design\": c.design.value, \"confidence\": c.confidence}\n                    for c in meta.design_alternatives\n                ]),\n                \"tool_mismatch_warning\": rob.tool_mismatch_warning if rob else None,\n                \"pass0_confidence\": meta.pass0_confidence,\n                \"pass0_warnings\": \"; \".join(meta.pass0_warnings),\n            })\n        if meta_rows:\n            pd.DataFrame(meta_rows).to_excel(\n                writer, sheet_name=\"StudyMetadata\", index=False\n            )\n\n        # Audit Summary sheet\n        audit_logger: AuditLogger = st.session_state.audit_logger\n        cost_df = audit_logger.get_cost_summary()\n        if not cost_df.empty:\n            cost_df.to_excel(writer, sheet_name=\"Audit_Summary\", index=False)\n\n    output.seek(0)\n    return output.read()\n\n\n# ── Sidebar ────────────────────────────────────────────────────────────────────\n\nwith st.sidebar:\n    st.title(\"SRMA Extraction Engine\")\n    st.caption(\"PRISMA 2020-compliant data extraction\")\n\n    st.divider()\n\n    # API key\n    api_key_input = st.text_input(\n        \"Anthropic API Key\",\n        value=st.session_state.api_key,\n        type=\"password\",\n        help=\"Required for LLM extraction. Never stored persistently.\",\n    )\n    if api_key_input != st.session_state.api_key:\n        st.session_state.api_key = api_key_input\n\n    st.divider()\n\n    # Schema upload\n    st.subheader(\"1. Upload Schema\")\n    schema_file = st.file_uploader(\n        \"Excel extraction schema (.xlsx)\",\n        type=[\"xlsx\"],\n        help=\"Upload your variable extraction schema. \"\n             \"First row = variable headers. \"\n             \"Optional unit row: first cell = 'unit' or 'units'.\",\n    )\n\n    if schema_file is not None:\n        with tempfile.NamedTemporaryFile(suffix=\".xlsx\", delete=False) as tmp:\n            tmp.write(schema_file.getbuffer())\n            tmp_path = tmp.name\n\n        try:\n            mgr = TemplateManager(tmp_path)\n            schema = mgr.load()\n            st.session_state.schema = schema\n            st.session_state.schema_warnings = schema.warnings\n            st.success(\n                f\"Schema loaded: {len(schema.variables)} variables \"\n                f\"across {len(schema.sheet_names)} sheet(s)\"\n            )\n            if schema.warnings:\n                with st.expander(f\"Schema warnings ({len(schema.warnings)})\", expanded=False):\n                    for w in schema.warnings:\n                        st.warning(w)\n        except SchemaCycleError as e:\n            st.error(f\"Schema cycle error: {e}\")\n            st.session_state.schema = None\n        except Exception as e:\n            st.error(f\"Failed to load schema: {e}\")\n            st.session_state.schema = None\n        finally:\n            os.unlink(tmp_path)\n\n    st.divider()\n\n    # PDF upload\n    st.subheader(\"2. Upload PDFs\")\n    pdf_files = st.file_uploader(\n        \"PDF study files\",\n        type=[\"pdf\"],\n        accept_multiple_files=True,\n        help=\"Upload one or more study PDFs for extraction.\",\n    )\n\n    if pdf_files:\n        processor = PDFProcessor()\n        for pdf_file in pdf_files:\n            fname = pdf_file.name\n            if fname not in st.session_state.pdf_parsed:\n                raw_bytes = pdf_file.getbuffer().tobytes()\n                # Store bytes for the PDF viewer before writing temp file\n                st.session_state.pdf_bytes[fname] = raw_bytes\n\n                with tempfile.NamedTemporaryFile(suffix=\".pdf\", delete=False) as tmp:\n                    tmp.write(raw_bytes)\n                    tmp_path = tmp.name\n                with st.spinner(f\"Parsing {fname}…\"):\n                    parsed = processor.process(tmp_path, fname)\n                st.session_state.pdf_parsed[fname] = parsed\n                os.unlink(tmp_path)\n\n                if parsed.quality == PDFQuality.UNREADABLE:\n                    st.error(f\"{fname}: UNREADABLE (possible scanned PDF)\")\n                elif parsed.quality == PDFQuality.LOW_DENSITY:\n                    st.warning(f\"{fname}: LOW DENSITY — extraction may be incomplete\")\n                else:\n                    st.success(\n                        f\"{fname}: OK — {parsed.total_pages} pages, \"\n                        f\"{len(parsed.tables)} tables\"\n                    )\n\n    st.divider()\n\n    # Run extraction\n    st.subheader(\"3. Run Extraction\")\n    run_disabled = (\n        not st.session_state.api_key\n        or st.session_state.schema is None\n        or not st.session_state.pdf_parsed\n        or st.session_state.extraction_running\n    )\n\n    if st.button(\n        \"Extract All PDFs\",\n        disabled=run_disabled,\n        type=\"primary\",\n        help=\"Requires API key, schema, and at least one PDF.\",\n    ):\n        st.session_state.extraction_running = True\n        _run_extraction_batch()\n        st.session_state.extraction_running = False\n        st.rerun()\n\n    if st.session_state.extraction_running:\n        st.info(\"Extraction in progress…\")\n\n    st.divider()\n\n    # Export\n    st.subheader(\"4. Export Results\")\n    if st.session_state.extracted_data:\n        xlsx_bytes = _build_export_xlsx()\n        st.download_button(\n            label=\"Download Excel Export\",\n            data=xlsx_bytes,\n            file_name=\"srma_extraction_results.xlsx\",\n            mime=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\",\n        )\n    else:\n        st.caption(\"No extracted data yet.\")\n\n\n# ── Main view ──────────────────────────────────────────────────────────────────\n\npdf_names = list(st.session_state.pdf_parsed.keys())\n\nif not pdf_names:\n    st.info(\n        \"Upload an Excel schema and one or more PDF files using the sidebar to begin.\"\n    )\n    st.stop()\n\n# PDF selector\nactive_pdf = st.selectbox(\n    \"Select active PDF\",\n    options=pdf_names,\n    index=0,\n    key=\"active_pdf_selector\",\n)\nst.session_state.active_pdf = active_pdf\nif active_pdf is None or active_pdf not in st.session_state.pdf_parsed:\n    st.info(\"Select a PDF to continue.\")\n    st.stop()\nparsed_pdf: ParsedPDF = st.session_state.pdf_parsed[active_pdf]\n\n# Design override UI\nst.subheader(\"Study Design\")\nmeta = st.session_state.study_metadata.get(active_pdf)\nif meta is not None:\n    current_design = st.session_state.design_overrides.get(\n        active_pdf, meta.detected_study_design\n    )\n    col_design, col_conf = st.columns([3, 1])\n    with col_design:\n        design_options = list(StudyDesign)\n        design_labels = [d.value for d in design_options]\n        current_idx = design_options.index(current_design) if current_design in design_options else 0\n        new_design_label = st.selectbox(\n            \"Study design (override auto-detection)\",\n            options=design_labels,\n            index=current_idx,\n            help=(\n                f\"Auto-detected: {meta.detected_study_design.value} \"\n                f\"(confidence={meta.design_confidence:.2f}). \"\n                \"Override only if auto-detection is wrong.\"\n            ),\n        )\n        new_design = StudyDesign(new_design_label)\n    with col_conf:\n        st.metric(\n            \"Detection confidence\",\n            f\"{meta.design_confidence:.0%}\",\n            delta=None,\n        )\n    if new_design != current_design:\n        st.session_state.design_overrides[active_pdf] = new_design\n        _logger: AuditLogger = st.session_state.audit_logger\n        _logger.log_design_override(\n            pdf_filename=active_pdf,\n            original_design=current_design.value,\n            overridden_design=new_design.value,\n        )\n        st.warning(\n            f\"Design overridden: {current_design.value} → {new_design.value}. \"\n            \"Re-run extraction to apply.\"\n        )\n    if meta.pass0_warnings:\n        with st.expander(\"Pass 0 warnings\", expanded=False):\n            for w in meta.pass0_warnings:\n                st.warning(w)\nelse:\n    st.caption(\"Run extraction to see design detection results.\")\n\nst.divider()\n\n# Split-screen: 55% PDF viewer, 45% data editor\nviewer_col, data_col = st.columns([55, 45])\n\nwith viewer_col:\n    st.subheader(\"PDF Viewer\")\n\n    if parsed_pdf.quality == PDFQuality.UNREADABLE:\n        st.error(\n            f\"{active_pdf} is UNREADABLE. \"\n            \"Possible scanned/image PDF. Consider OCR preprocessing.\"\n        )\n    else:\n        try:\n            from streamlit_pdf_viewer import pdf_viewer  # type: ignore\n            # Bytes were stored at upload time — never None if file was uploaded\n            pdf_bytes = st.session_state.pdf_bytes.get(active_pdf)\n            if pdf_bytes:\n                highlighted_loc = st.session_state.highlighted_location.get(active_pdf)\n                annotations = []\n                if highlighted_loc:\n                    from utils.coordinate_utils import build_highlight_annotation\n                    ann = build_highlight_annotation(highlighted_loc, color=(1.0, 1.0, 0.0))\n                    if ann.get(\"has_bbox\"):\n                        annotations.append({\n                            \"page\": ann[\"page\"],\n                            \"x\": ann[\"x0\"],\n                            \"y\": ann[\"y0\"],\n                            \"width\": ann[\"x1\"] - ann[\"x0\"],\n                            \"height\": ann[\"y1\"] - ann[\"y0\"],\n                            \"color\": \"rgba(255, 255, 0, 0.4)\",\n                        })\n                pdf_viewer(pdf_bytes, annotations=annotations, height=700)\n            else:\n                st.info(\"PDF preview: re-upload the file to enable the viewer.\")\n        except ImportError:\n            st.info(\"streamlit-pdf-viewer not installed — PDF highlighting unavailable.\")\n\n        with st.expander(\"Page text preview\", expanded=False):\n            max_page = max(parsed_pdf.total_pages, 1)\n            page_num = st.number_input(\n                \"Page\", min_value=1, max_value=max_page, value=1\n            )\n            page_text = parsed_pdf.page_texts.get(page_num, \"\")\n            st.text_area(\n                f\"Page {page_num} text\",\n                value=page_text[:4000],\n                height=400,\n                disabled=True,\n            )\n\nwith data_col:\n    st.subheader(\"Extracted Data\")\n\n    extracted = st.session_state.extracted_data.get(active_pdf, [])\n    if not extracted:\n        st.info(\"No extracted data yet. Run extraction from the sidebar.\")\n    else:\n        rows = []\n        for v in extracted:\n            rows.append({\n                \"variable\": v.variable,\n                \"canonical\": v.canonical_name,\n                \"value\": v.value,\n                \"unit\": v.unit,\n                \"status\": v.status,\n                \"conf\": f\"{v.confidence:.2f}\",\n                \"arm\": v.study_arm,\n                \"page\": v.location.page if v.location else None,\n                \"evidence\": (v.evidence_quote or \"\")[:80],\n            })\n        df = pd.DataFrame(rows)\n\n        # Colour-code by status — use .map() (applymap deprecated in pandas 2.1)\n        def _status_style(val: str) -> str:\n            colours = {\n                \"EXTRACTED\": \"background-color: #d4edda\",\n                \"CALCULATED\": \"background-color: #cce5ff\",\n                \"NOT_REPORTED\": \"background-color: #f8d7da\",\n                \"AMBIGUOUS\": \"background-color: #fff3cd\",\n                \"EXTRACTION_FAILED\": \"background-color: #f8d7da; color: #721c24\",\n            }\n            return colours.get(val, \"\")\n\n        styled = df.style.map(_status_style, subset=[\"status\"])\n        selected = st.dataframe(\n            styled,\n            use_container_width=True,\n            height=500,\n            on_select=\"rerun\",\n            selection_mode=\"single-row\",\n        )\n\n        # DataframeState is an object, not a dict — access via .selection.rows\n        try:\n            selected_rows = selected.selection.rows\n        except AttributeError:\n            selected_rows = []\n\n        if selected_rows:\n            row_idx = selected_rows[0]\n            if row_idx < len(extracted):\n                clicked_var = extracted[row_idx]\n                st.session_state.highlighted_location[active_pdf] = clicked_var.location\n                with st.expander(\"Variable detail\", expanded=True):\n                    st.json(clicked_var.model_dump())\n\n    # RoB assessment panel\n    st.subheader(\"Risk of Bias\")\n    assessment = st.session_state.rob_assessments.get(active_pdf)\n    if assessment is None:\n        st.info(\"No RoB assessment yet.\")\n    else:\n        st.write(f\"**Tool(s) applied:** {', '.join(assessment.tools_applied)}\")\n        st.write(f\"**Assessment source:** {assessment.assessment_source}\")\n        if assessment.tool_mismatch_warning:\n            st.warning(assessment.tool_mismatch_warning)\n        if assessment.overall_judgements:\n            st.write(\"**Overall judgements:**\")\n            for tool, jdg in assessment.overall_judgements.items():\n                st.write(f\"- {tool}: {jdg}\")\n\n    # Cost tracker\n    cost = st.session_state.cost_trackers.get(active_pdf)\n    if cost:\n        st.divider()\n        cost_col1, cost_col2 = st.columns(2)\n        with cost_col1:\n            st.metric(\"Estimated cost (USD)\", f\"${cost.estimated_usd:.4f}\")\n            if cost.estimated_usd >= config.COST_WARN_USD:\n                st.warning(f\"Cost warning: >${config.COST_WARN_USD:.2f}\")\n        with cost_col2:\n            st.metric(\"Input tokens\", f\"{cost.total_input_tokens:,}\")\n            st.metric(\"Output tokens\", f\"{cost.total_output_tokens:,}\")\n\n# ── Audit log viewer ───────────────────────────────────────────────────────────\n\nwith st.expander(\"Audit log\", expanded=False):\n    audit_logger_inst: AuditLogger = st.session_state.audit_logger\n    if active_pdf:\n        audit_df = audit_logger_inst.get_audit_dataframe(active_pdf)\n        if not audit_df.empty:\n            st.dataframe(audit_df, use_container_width=True, height=300)\n        else:\n            st.info(\"No audit events for this PDF yet.\")\n
+"""
+SRMA Extraction Engine — Streamlit application.
+
+Responsibilities:
+- Catches SchemaCycleError from template_manager.py → st.error()
+- Split-screen: 55% PDF viewer, 45% data editor
+- Click-to-highlight with table-bbox fallback
+- Design override UI → propagates through StudyMetadata, ROB_TOOL_MAP,
+  DESIGN_OVERRIDE audit event
+- Multi-sheet export: Extraction_{pdf}, Appraisal_{pdf}, NOS_{pdf},
+  StudyMetadata, Audit_Summary
+- Does NOT import from utils.errors.PDFUnreadableError in production flow
+
+Import rule: app.py may import from all project modules.
+             No module other than app.py may import streamlit.
+"""
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import io
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any, Optional
+
+import pandas as pd
+import streamlit as st
+
+import config
+from models.extraction_schema import (
+    StudyDesign, StudyMetadata, DesignCandidate,
+    TreatmentArm, CostTracker, PDFQuality,
+    ExtractedVariable, RoBAssessment, NOSResult,
+)
+from utils.errors import SchemaCycleError, CostCapExceededError
+from utils.audit_logger import get_logger, AuditLogger
+from utils.rob_framework import get_tools_for_design
+from engine.template_manager import TemplateManager, ParsedSchema
+from engine.pdf_processor import PDFProcessor, ParsedPDF
+from engine.llm_orchestrator import LLMOrchestrator
+
+# ── Page configuration ─────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="SRMA Extraction Engine",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Session state initialisation ───────────────────────────────────────────────
+
+def _init_session_state() -> None:
+    defaults: dict[str, Any] = {
+        "api_key": "",
+        "schema": None,              # ParsedSchema
+        "schema_warnings": [],
+        "pdf_parsed": {},            # {filename: ParsedPDF}
+        "pdf_bytes": {},             # {filename: bytes}  ← raw bytes for viewer
+        "extracted_data": {},        # {filename: list[ExtractedVariable]}
+        "rob_assessments": {},       # {filename: RoBAssessment}
+        "study_metadata": {},        # {filename: StudyMetadata}
+        "design_overrides": {},      # {filename: StudyDesign}
+        "highlighted_location": {},  # {filename: ExtractionLocation}
+        "active_pdf": None,
+        "cost_trackers": {},         # {filename: CostTracker}
+        "audit_logger": get_logger("audit_log.jsonl"),
+        "extraction_running": False,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+_init_session_state()
+
+
+# ── Helper: run a coroutine from synchronous Streamlit code ───────────────────
+# Streamlit Cloud runs inside a tornado/asyncio event loop. Calling
+# asyncio.run() or asyncio.new_event_loop().run_until_complete() from
+# within that loop raises RuntimeError. The safe approach is to submit
+# the coroutine to a fresh thread that has its own event loop.
+
+def _run_async(coro) -> Any:
+    """Run a coroutine synchronously from a Streamlit callback."""
+    def _thread_target():
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_thread_target)
+        return future.result()
+
+
+# ── FUNCTION DEFINITIONS — must precede any call site ─────────────────────────
+# Python does not hoist function definitions. Both _run_extraction_batch and
+# _build_export_xlsx are called from inside the sidebar block below, so they
+# MUST be defined here, before that block.
+
+def _run_extraction_batch() -> None:
+    """Run extraction for all loaded PDFs."""
+    schema: Optional[ParsedSchema] = st.session_state.schema
+    if schema is None:
+        st.error("No schema loaded.")
+        return
+
+    orchestrator = LLMOrchestrator(
+        api_key=st.session_state.api_key,
+        model="claude-opus-4-6",
+    )
+    logger: AuditLogger = st.session_state.audit_logger
+    processor = PDFProcessor()
+
+    for fname, parsed_pdf in st.session_state.pdf_parsed.items():
+        if parsed_pdf.quality == PDFQuality.UNREADABLE:
+            logger.log_pdf_skipped(fname, "UNREADABLE quality")
+            continue
+
+        cost_tracker = CostTracker(pdf_filename=fname)
+        st.session_state.cost_trackers[fname] = cost_tracker
+
+        try:
+            # Pass 0: design detection
+            pass0_input = (
+                parsed_pdf.abstract_text + "\n\n" + parsed_pdf.methods_text
+            )[:config.PASS0_MAX_INPUT_TOKENS]
+
+            design, confidence, alternatives, warnings = _run_async(
+                orchestrator.run_pass0(
+                    abstract_and_methods=pass0_input,
+                    pdf_filename=fname,
+                    cost_tracker=cost_tracker,
+                )
+            )
+
+            # Apply user design override if set
+            override = st.session_state.design_overrides.get(fname)
+            design_overridden = False
+            if override is not None and override != design:
+                logger.log_design_override(
+                    pdf_filename=fname,
+                    original_design=design.value,
+                    overridden_design=override.value,
+                )
+                design = override
+                design_overridden = True
+
+            candidate_rob_tools = get_tools_for_design(design)
+            metadata = StudyMetadata(
+                study_id=fname,
+                treatment_arms=[],
+                primary_outcomes=[],
+                population_description="",
+                detected_study_design=design,
+                design_confidence=confidence,
+                design_alternatives=alternatives,
+                design_overridden_by_user=design_overridden,
+                candidate_rob_tools=candidate_rob_tools,
+                pass0_confidence=confidence,
+                pass0_warnings=warnings,
+            )
+            st.session_state.study_metadata[fname] = metadata
+
+            # Mode A: variable extraction
+            # approx 4 chars per token
+            llm_input = processor.format_for_llm(
+                parsed_pdf,
+                max_chars=config.EXTRACTION_MAX_INPUT_TOKENS * 4,
+            )
+            extracted_vars: list[ExtractedVariable] = []
+
+            for var_spec in schema.variables:
+                var_context = (
+                    f"variable: {var_spec.raw_header}\n"
+                    f"canonical_name: {var_spec.canonical_name}\n"
+                    f"expected_unit: {var_spec.expected_unit or 'not specified'}"
+                )
+                result = _run_async(
+                    orchestrator.extract_variable(
+                        variable_context=var_context,
+                        pdf_text=llm_input,
+                        pdf_filename=fname,
+                        cost_tracker=cost_tracker,
+                        study_metadata=metadata,
+                    )
+                )
+                if result is not None:
+                    extracted_vars.append(result)
+                    logger.log_extraction(
+                        pdf_filename=fname,
+                        variable=result.variable,
+                        canonical_name=result.canonical_name,
+                        status=result.status,
+                        value=result.value,
+                        confidence=result.confidence,
+                    )
+
+            st.session_state.extracted_data[fname] = extracted_vars
+
+        except CostCapExceededError as e:
+            logger.log_cost_cap_hit(
+                fname,
+                cost_tracker.estimated_usd,
+                config.COST_HARD_STOP_USD,
+            )
+            st.warning(f"{fname}: Cost cap hit — skipping. ({e})")
+        except Exception as e:
+            logger.log_parser_error(fname, None, str(e))
+            st.error(f"{fname}: Extraction error — {e}")
+
+
+def _build_export_xlsx() -> bytes:
+    """Build a multi-sheet Excel export and return bytes."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Per-PDF extraction sheets
+        for fname, vars_list in st.session_state.extracted_data.items():
+            sheet_name = f"Extraction_{Path(fname).stem}"[:31]
+            if vars_list:
+                rows = []
+                for v in vars_list:
+                    row: dict[str, Any] = {
+                        "variable": v.variable,
+                        "canonical_name": v.canonical_name,
+                        "value": v.value,
+                        "unit": v.unit,
+                        "status": v.status,
+                        "confidence": v.confidence,
+                        "study_arm": v.study_arm,
+                        "arm_role": v.arm_role,
+                        "evidence_quote": v.evidence_quote,
+                        "uncertainty_note": v.uncertainty_note,
+                        "source_type": v.source_type,
+                        "verification_flag": v.verification_flag,
+                        "calculation_trace": v.calculation_trace,
+                        "page": v.location.page if v.location else None,
+                        "table_id": v.location.table_id if v.location else None,
+                        "outcome_name": v.context.outcome_name if v.context else None,
+                        "timepoint": v.context.timepoint if v.context else None,
+                        "analysis_population": v.context.analysis_population if v.context else None,
+                    }
+                    rows.append(row)
+                pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)
+            else:
+                pd.DataFrame().to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # Per-PDF appraisal sheets
+        for fname, assessment in st.session_state.rob_assessments.items():
+            sheet_name = f"Appraisal_{Path(fname).stem}"[:31]
+            rows = []
+            for tool, signals_list in assessment.signals.items():
+                for sig in signals_list:
+                    rows.append({
+                        "tool": tool,
+                        "domain_id": sig.domain_id,
+                        "domain_name": sig.domain_name,
+                        "signalling_question": sig.signalling_question,
+                        "signal_answer": sig.signal_answer,
+                        "status": sig.status,
+                        "evidence_quote": sig.evidence_quote,
+                        "source_type": sig.source_type,
+                    })
+            pd.DataFrame(rows).to_excel(writer, sheet_name=sheet_name, index=False)
+
+            # NOS sheet if applicable
+            if assessment.nos_result is not None:
+                nos = assessment.nos_result
+                nos_sheet = f"NOS_{Path(fname).stem}"[:31]
+                nos_rows = [
+                    {"item_id": k, "evidence": v}
+                    for k, v in nos.item_evidence.items()
+                ]
+                if nos.item_stars:
+                    for row in nos_rows:
+                        row["stars"] = nos.item_stars.get(row["item_id"])
+                pd.DataFrame(nos_rows).to_excel(writer, sheet_name=nos_sheet, index=False)
+
+        # StudyMetadata sheet
+        meta_rows = []
+        for fname, meta in st.session_state.study_metadata.items():
+            rob = st.session_state.rob_assessments.get(fname)
+            meta_rows.append({
+                "study_id": meta.study_id,
+                "detected_study_design": meta.detected_study_design.value,
+                "design_confidence": meta.design_confidence,
+                "design_overridden_by_user": meta.design_overridden_by_user,
+                "candidate_rob_tools": json.dumps(meta.candidate_rob_tools),
+                "design_alternatives": json.dumps([
+                    {"design": c.design.value, "confidence": c.confidence}
+                    for c in meta.design_alternatives
+                ]),
+                "tool_mismatch_warning": rob.tool_mismatch_warning if rob else None,
+                "pass0_confidence": meta.pass0_confidence,
+                "pass0_warnings": "; ".join(meta.pass0_warnings),
+            })
+        if meta_rows:
+            pd.DataFrame(meta_rows).to_excel(
+                writer, sheet_name="StudyMetadata", index=False
+            )
+
+        # Audit Summary sheet
+        audit_logger: AuditLogger = st.session_state.audit_logger
+        cost_df = audit_logger.get_cost_summary()
+        if not cost_df.empty:
+            cost_df.to_excel(writer, sheet_name="Audit_Summary", index=False)
+
+    output.seek(0)
+    return output.read()
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.title("SRMA Extraction Engine")
+    st.caption("PRISMA 2020-compliant data extraction")
+
+    st.divider()
+
+    # API key
+    api_key_input = st.text_input(
+        "Anthropic API Key",
+        value=st.session_state.api_key,
+        type="password",
+        help="Required for LLM extraction. Never stored persistently.",
+    )
+    if api_key_input != st.session_state.api_key:
+        st.session_state.api_key = api_key_input
+
+    st.divider()
+
+    # Schema upload
+    st.subheader("1. Upload Schema")
+    schema_file = st.file_uploader(
+        "Excel extraction schema (.xlsx)",
+        type=["xlsx"],
+        help="Upload your variable extraction schema. "
+             "First row = variable headers. "
+             "Optional unit row: first cell = 'unit' or 'units'.",
+    )
+
+    if schema_file is not None:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp.write(schema_file.getbuffer())
+            tmp_path = tmp.name
+
+        try:
+            mgr = TemplateManager(tmp_path)
+            schema = mgr.load()
+            st.session_state.schema = schema
+            st.session_state.schema_warnings = schema.warnings
+            st.success(
+                f"Schema loaded: {len(schema.variables)} variables "
+                f"across {len(schema.sheet_names)} sheet(s)"
+            )
+            if schema.warnings:
+                with st.expander(f"Schema warnings ({len(schema.warnings)})", expanded=False):
+                    for w in schema.warnings:
+                        st.warning(w)
+        except SchemaCycleError as e:
+            st.error(f"Schema cycle error: {e}")
+            st.session_state.schema = None
+        except Exception as e:
+            st.error(f"Failed to load schema: {e}")
+            st.session_state.schema = None
+        finally:
+            os.unlink(tmp_path)
+
+    st.divider()
+
+    # PDF upload
+    st.subheader("2. Upload PDFs")
+    pdf_files = st.file_uploader(
+        "PDF study files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Upload one or more study PDFs for extraction.",
+    )
+
+    if pdf_files:
+        processor = PDFProcessor()
+        for pdf_file in pdf_files:
+            fname = pdf_file.name
+            if fname not in st.session_state.pdf_parsed:
+                raw_bytes = pdf_file.getbuffer().tobytes()
+                # Store bytes for the PDF viewer before writing temp file
+                st.session_state.pdf_bytes[fname] = raw_bytes
+
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp.write(raw_bytes)
+                    tmp_path = tmp.name
+                with st.spinner(f"Parsing {fname}…"):
+                    parsed = processor.process(tmp_path, fname)
+                st.session_state.pdf_parsed[fname] = parsed
+                os.unlink(tmp_path)
+
+                if parsed.quality == PDFQuality.UNREADABLE:
+                    st.error(f"{fname}: UNREADABLE (possible scanned PDF)")
+                elif parsed.quality == PDFQuality.LOW_DENSITY:
+                    st.warning(f"{fname}: LOW DENSITY — extraction may be incomplete")
+                else:
+                    st.success(
+                        f"{fname}: OK — {parsed.total_pages} pages, "
+                        f"{len(parsed.tables)} tables"
+                    )
+
+    st.divider()
+
+    # Run extraction
+    st.subheader("3. Run Extraction")
+    run_disabled = (
+        not st.session_state.api_key
+        or st.session_state.schema is None
+        or not st.session_state.pdf_parsed
+        or st.session_state.extraction_running
+    )
+
+    if st.button(
+        "Extract All PDFs",
+        disabled=run_disabled,
+        type="primary",
+        help="Requires API key, schema, and at least one PDF.",
+    ):
+        st.session_state.extraction_running = True
+        _run_extraction_batch()
+        st.session_state.extraction_running = False
+        st.rerun()
+
+    if st.session_state.extraction_running:
+        st.info("Extraction in progress…")
+
+    st.divider()
+
+    # Export
+    st.subheader("4. Export Results")
+    if st.session_state.extracted_data:
+        xlsx_bytes = _build_export_xlsx()
+        st.download_button(
+            label="Download Excel Export",
+            data=xlsx_bytes,
+            file_name="srma_extraction_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.caption("No extracted data yet.")
+
+
+# ── Main view ──────────────────────────────────────────────────────────────────
+
+pdf_names = list(st.session_state.pdf_parsed.keys())
+
+if not pdf_names:
+    st.info(
+        "Upload an Excel schema and one or more PDF files using the sidebar to begin."
+    )
+    st.stop()
+
+# PDF selector
+active_pdf = st.selectbox(
+    "Select active PDF",
+    options=pdf_names,
+    index=0,
+    key="active_pdf_selector",
+)
+st.session_state.active_pdf = active_pdf
+if active_pdf is None or active_pdf not in st.session_state.pdf_parsed:
+    st.info("Select a PDF to continue.")
+    st.stop()
+parsed_pdf: ParsedPDF = st.session_state.pdf_parsed[active_pdf]
+
+# Design override UI
+st.subheader("Study Design")
+meta = st.session_state.study_metadata.get(active_pdf)
+if meta is not None:
+    current_design = st.session_state.design_overrides.get(
+        active_pdf, meta.detected_study_design
+    )
+    col_design, col_conf = st.columns([3, 1])
+    with col_design:
+        design_options = list(StudyDesign)
+        design_labels = [d.value for d in design_options]
+        current_idx = design_options.index(current_design) if current_design in design_options else 0
+        new_design_label = st.selectbox(
+            "Study design (override auto-detection)",
+            options=design_labels,
+            index=current_idx,
+            help=(
+                f"Auto-detected: {meta.detected_study_design.value} "
+                f"(confidence={meta.design_confidence:.2f}). "
+                "Override only if auto-detection is wrong."
+            ),
+        )
+        new_design = StudyDesign(new_design_label)
+    with col_conf:
+        st.metric(
+            "Detection confidence",
+            f"{meta.design_confidence:.0%}",
+            delta=None,
+        )
+    if new_design != current_design:
+        st.session_state.design_overrides[active_pdf] = new_design
+        _logger: AuditLogger = st.session_state.audit_logger
+        _logger.log_design_override(
+            pdf_filename=active_pdf,
+            original_design=current_design.value,
+            overridden_design=new_design.value,
+        )
+        st.warning(
+            f"Design overridden: {current_design.value} → {new_design.value}. "
+            "Re-run extraction to apply."
+        )
+    if meta.pass0_warnings:
+        with st.expander("Pass 0 warnings", expanded=False):
+            for w in meta.pass0_warnings:
+                st.warning(w)
+else:
+    st.caption("Run extraction to see design detection results.")
+
+st.divider()
+
+# Split-screen: 55% PDF viewer, 45% data editor
+viewer_col, data_col = st.columns([55, 45])
+
+with viewer_col:
+    st.subheader("PDF Viewer")
+
+    if parsed_pdf.quality == PDFQuality.UNREADABLE:
+        st.error(
+            f"{active_pdf} is UNREADABLE. "
+            "Possible scanned/image PDF. Consider OCR preprocessing."
+        )
+    else:
+        try:
+            from streamlit_pdf_viewer import pdf_viewer  # type: ignore
+            # Bytes were stored at upload time — never None if file was uploaded
+            pdf_bytes = st.session_state.pdf_bytes.get(active_pdf)
+            if pdf_bytes:
+                highlighted_loc = st.session_state.highlighted_location.get(active_pdf)
+                annotations = []
+                if highlighted_loc:
+                    from utils.coordinate_utils import build_highlight_annotation
+                    ann = build_highlight_annotation(highlighted_loc, color=(1.0, 1.0, 0.0))
+                    if ann.get("has_bbox"):
+                        annotations.append({
+                            "page": ann["page"],
+                            "x": ann["x0"],
+                            "y": ann["y0"],
+                            "width": ann["x1"] - ann["x0"],
+                            "height": ann["y1"] - ann["y0"],
+                            "color": "rgba(255, 255, 0, 0.4)",
+                        })
+                pdf_viewer(pdf_bytes, annotations=annotations, height=700)
+            else:
+                st.info("PDF preview: re-upload the file to enable the viewer.")
+        except ImportError:
+            st.info("streamlit-pdf-viewer not installed — PDF highlighting unavailable.")
+
+        with st.expander("Page text preview", expanded=False):
+            max_page = max(parsed_pdf.total_pages, 1)
+            page_num = st.number_input(
+                "Page", min_value=1, max_value=max_page, value=1
+            )
+            page_text = parsed_pdf.page_texts.get(page_num, "")
+            st.text_area(
+                f"Page {page_num} text",
+                value=page_text[:4000],
+                height=400,
+                disabled=True,
+            )
+
+with data_col:
+    st.subheader("Extracted Data")
+
+    extracted = st.session_state.extracted_data.get(active_pdf, [])
+    if not extracted:
+        st.info("No extracted data yet. Run extraction from the sidebar.")
+    else:
+        rows = []
+        for v in extracted:
+            rows.append({
+                "variable": v.variable,
+                "canonical": v.canonical_name,
+                "value": v.value,
+                "unit": v.unit,
+                "status": v.status,
+                "conf": f"{v.confidence:.2f}",
+                "arm": v.study_arm,
+                "page": v.location.page if v.location else None,
+                "evidence": (v.evidence_quote or "")[:80],
+            })
+        df = pd.DataFrame(rows)
+
+        # Colour-code by status — use .map() (applymap deprecated in pandas 2.1)
+        def _status_style(val: str) -> str:
+            colours = {
+                "EXTRACTED": "background-color: #d4edda",
+                "CALCULATED": "background-color: #cce5ff",
+                "NOT_REPORTED": "background-color: #f8d7da",
+                "AMBIGUOUS": "background-color: #fff3cd",
+                "EXTRACTION_FAILED": "background-color: #f8d7da; color: #721c24",
+            }
+            return colours.get(val, "")
+
+        styled = df.style.map(_status_style, subset=["status"])
+        selected = st.dataframe(
+            styled,
+            use_container_width=True,
+            height=500,
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+
+        # DataframeState is an object, not a dict — access via .selection.rows
+        try:
+            selected_rows = selected.selection.rows
+        except AttributeError:
+            selected_rows = []
+
+        if selected_rows:
+            row_idx = selected_rows[0]
+            if row_idx < len(extracted):
+                clicked_var = extracted[row_idx]
+                st.session_state.highlighted_location[active_pdf] = clicked_var.location
+                with st.expander("Variable detail", expanded=True):
+                    st.json(clicked_var.model_dump())
+
+    # RoB assessment panel
+    st.subheader("Risk of Bias")
+    assessment = st.session_state.rob_assessments.get(active_pdf)
+    if assessment is None:
+        st.info("No RoB assessment yet.")
+    else:
+        st.write(f"**Tool(s) applied:** {', '.join(assessment.tools_applied)}")
+        st.write(f"**Assessment source:** {assessment.assessment_source}")
+        if assessment.tool_mismatch_warning:
+            st.warning(assessment.tool_mismatch_warning)
+        if assessment.overall_judgements:
+            st.write("**Overall judgements:**")
+            for tool, jdg in assessment.overall_judgements.items():
+                st.write(f"- {tool}: {jdg}")
+
+    # Cost tracker
+    cost = st.session_state.cost_trackers.get(active_pdf)
+    if cost:
+        st.divider()
+        cost_col1, cost_col2 = st.columns(2)
+        with cost_col1:
+            st.metric("Estimated cost (USD)", f"${cost.estimated_usd:.4f}")
+            if cost.estimated_usd >= config.COST_WARN_USD:
+                st.warning(f"Cost warning: >${config.COST_WARN_USD:.2f}")
+        with cost_col2:
+            st.metric("Input tokens", f"{cost.total_input_tokens:,}")
+            st.metric("Output tokens", f"{cost.total_output_tokens:,}")
+
+# ── Audit log viewer ───────────────────────────────────────────────────────────
+
+with st.expander("Audit log", expanded=False):
+    audit_logger_inst: AuditLogger = st.session_state.audit_logger
+    if active_pdf:
+        audit_df = audit_logger_inst.get_audit_dataframe(active_pdf)
+        if not audit_df.empty:
+            st.dataframe(audit_df, use_container_width=True, height=300)
+        else:
+            st.info("No audit events for this PDF yet.")
