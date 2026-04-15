@@ -66,8 +66,12 @@ def _init_session_state() -> None:
         "highlighted_location": {},  # {filename: ExtractionLocation}
         "active_pdf": None,
         "cost_trackers": {},         # {filename: CostTracker}
-        "audit_logger": get_logger("audit_log.jsonl"),
+        # Write audit log to /tmp so it works on read-only filesystems (Cloud).
+        "audit_logger": get_logger(
+            os.path.join(tempfile.gettempdir(), "srma_audit_log.jsonl")
+        ),
         "extraction_running": False,
+        "data_exported": False,   # flips True when user downloads the xlsx
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -97,8 +101,17 @@ def _run_async(coro) -> Any:
 # _build_export_xlsx are called from inside the sidebar block below, so they
 # MUST be defined here, before that block.
 
-def _run_extraction_batch() -> None:
-    """Run extraction for all loaded PDFs."""
+def _run_extraction_batch(
+    progress_bar: Any = None,
+    status_text: Any = None,
+    rerun_all: bool = False,
+) -> None:
+    """Run extraction for all loaded PDFs.
+
+    Skips PDFs that already have extracted data unless rerun_all=True.
+    progress_bar: an st.progress() widget to update (0.0–1.0).
+    status_text:  an st.empty() widget to write per-step captions.
+    """
     schema: Optional[ParsedSchema] = st.session_state.schema
     if schema is None:
         st.error("No schema loaded.")
@@ -111,9 +124,41 @@ def _run_extraction_batch() -> None:
     logger: AuditLogger = st.session_state.audit_logger
     processor = PDFProcessor()
 
-    for fname, parsed_pdf in st.session_state.pdf_parsed.items():
+    # Fix 5: skip PDFs already extracted, unless the user forced a re-run
+    if rerun_all:
+        pending = dict(st.session_state.pdf_parsed)
+    else:
+        pending = {
+            fname: pdf
+            for fname, pdf in st.session_state.pdf_parsed.items()
+            if fname not in st.session_state.extracted_data
+        }
+
+    if not pending:
+        st.info("All PDFs already extracted. Tick 'Re-run all' to force re-extraction.")
+        return
+
+    n_vars = len(schema.variables)
+    # total steps = 1 (pass-0) + n_vars per PDF
+    total_steps = len(pending) * (1 + n_vars)
+    done_steps = 0
+
+    def _tick(label: str) -> None:
+        """Advance progress bar and status text by one step."""
+        nonlocal done_steps
+        done_steps += 1
+        if status_text is not None:
+            status_text.caption(label)
+        if progress_bar is not None:
+            progress_bar.progress(min(done_steps / total_steps, 1.0))
+
+    for fname, parsed_pdf in pending.items():
         if parsed_pdf.quality == PDFQuality.UNREADABLE:
             logger.log_pdf_skipped(fname, "UNREADABLE quality")
+            # consume the steps so the bar doesn't stall
+            done_steps += 1 + n_vars
+            if progress_bar is not None:
+                progress_bar.progress(min(done_steps / total_steps, 1.0))
             continue
 
         cost_tracker = CostTracker(pdf_filename=fname)
@@ -121,6 +166,7 @@ def _run_extraction_batch() -> None:
 
         try:
             # Pass 0: design detection
+            _tick(f"Detecting study design — {fname}")
             pass0_input = (
                 parsed_pdf.abstract_text + "\n\n" + parsed_pdf.methods_text
             )[:config.PASS0_MAX_INPUT_TOKENS]
@@ -161,8 +207,7 @@ def _run_extraction_batch() -> None:
             )
             st.session_state.study_metadata[fname] = metadata
 
-            # Mode A: variable extraction
-            # approx 4 chars per token
+            # Mode A: variable extraction — approx 4 chars per token
             llm_input = processor.format_for_llm(
                 parsed_pdf,
                 max_chars=config.EXTRACTION_MAX_INPUT_TOKENS * 4,
@@ -170,6 +215,7 @@ def _run_extraction_batch() -> None:
             extracted_vars: list[ExtractedVariable] = []
 
             for var_spec in schema.variables:
+                _tick(f"{fname} → {var_spec.raw_header}")
                 var_context = (
                     f"variable: {var_spec.raw_header}\n"
                     f"canonical_name: {var_spec.canonical_name}\n"
@@ -196,6 +242,7 @@ def _run_extraction_batch() -> None:
                     )
 
             st.session_state.extracted_data[fname] = extracted_vars
+            st.session_state.data_exported = False  # new data → mark unsaved
 
         except CostCapExceededError as e:
             logger.log_cost_cap_hit(
@@ -414,6 +461,13 @@ with st.sidebar:
         or st.session_state.extraction_running
     )
 
+    rerun_all = st.checkbox(
+        "Re-run already-extracted PDFs",
+        value=False,
+        help="By default, PDFs with existing results are skipped.",
+        disabled=run_disabled,
+    )
+
     if st.button(
         "Extract All PDFs",
         disabled=run_disabled,
@@ -421,12 +475,19 @@ with st.sidebar:
         help="Requires API key, schema, and at least one PDF.",
     ):
         st.session_state.extraction_running = True
-        _run_extraction_batch()
+        if rerun_all:
+            st.session_state.extracted_data = {}
+        _pb = st.progress(0.0)
+        _status = st.empty()
+        _run_extraction_batch(
+            progress_bar=_pb,
+            status_text=_status,
+            rerun_all=rerun_all,
+        )
+        _pb.empty()
+        _status.empty()
         st.session_state.extraction_running = False
         st.rerun()
-
-    if st.session_state.extraction_running:
-        st.info("Extraction in progress…")
 
     st.divider()
 
@@ -434,17 +495,32 @@ with st.sidebar:
     st.subheader("4. Export Results")
     if st.session_state.extracted_data:
         xlsx_bytes = _build_export_xlsx()
+
+        def _mark_exported():
+            st.session_state.data_exported = True
+
         st.download_button(
             label="Download Excel Export",
             data=xlsx_bytes,
             file_name="srma_extraction_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click=_mark_exported,
         )
     else:
         st.caption("No extracted data yet.")
 
 
 # ── Main view ──────────────────────────────────────────────────────────────────
+
+# Unsaved-data warning: show whenever there are extractions that haven't been
+# downloaded yet.  Refreshing or closing the tab will wipe session state.
+if st.session_state.extracted_data and not st.session_state.data_exported:
+    st.warning(
+        "**Unsaved results** — extracted data lives in memory only. "
+        "Refreshing or closing this tab will lose it. "
+        "Use **4. Export Results** in the sidebar to download now.",
+        icon="⚠️",
+    )
 
 pdf_names = list(st.session_state.pdf_parsed.keys())
 
